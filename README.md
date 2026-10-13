@@ -77,6 +77,9 @@ Exactly one scheduler ticks a profile:
   `gateway.parked` marker, so the Hermes gateway stops ticking it;
   `gateway run` then ticks it.
 - `profile release <p>` reverses both.
+- `profile refresh-bundle <p>` recomputes the CID after files change without
+  replacing the rest of `itonami.edn` (including custom bundle directories and
+  scheduler ownership).
 
 Hy cron scripts use the first configured interpreter among the job's
 `interpreter`, `cron.script_python`, `ITONAMI_PYTHON`, `HERMES_PYTHON`, then
