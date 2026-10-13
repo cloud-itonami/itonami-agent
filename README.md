@@ -22,14 +22,24 @@ the two can be swapped per profile.
 | `SOUL.md`, `profile.yaml`, `config.yaml`, `.env`, `secrets.command` | read the same way. YAML reader is checked against PyYAML on all 1,954 host files: 0 differences |
 | `model` / `providers` / `fallback_providers`, job pin disables fallback | same resolution order (`cron/scheduler.py`, `runtime_provider_custom.py`) |
 | `agent.max_turns`, `agent.run_budget_seconds` (80 % wrap-up notice, hop timeout ≤ ½ remaining budget) | same; plus up to 3 rounds over the chain with backoff when every hop failed transiently (429 / 5xx / transport) |
-| tools `terminal read_file write_file patch search_files web_search web_extract skill_view memory`; toolsets `hermes-cli`, `hermes-cron`, `terminal`, `file`, `web`, `skills`, `memory` | same names and argument shapes; results are JSON strings |
+| tools `terminal read_file write_file patch search_files web_search web_extract skills_list skill_view skill_manage todo_list delegate_task cronjob_manage memory`; toolsets `terminal`, `file`, `web`, `search`, `skills`, `todo`, `memory` | these names have Kotoba handlers and JSON-string results; some semantics remain partial. `hermes-cli`/`hermes-cron` retain Hermes' full core inventory and refuse to start when any selected tool is unsupported, rather than silently presenting a reduced bundle |
 | `cron/jobs.json` (all fields), 5-field cron / interval / once schedules | read and written in Hermes' format; Hermes' own `cron.jobs.load_jobs()` / `get_due_jobs()` read what itonami writes |
 | Pre-run script extensions `.sh`/`.bash`, `.cljk`, `.js`/`.mjs`, `.py`, `.hy` | extension dispatch; `.hy` runs through `hy.cmdline.hy_main` with the job/config-selected Python, which must have Hy installed |
 | cron prompt: `_CRON_HINT`, `## Script Output` / `## Script Error` block, empty stdout and `{"wakeAgent": false}` skip, `[SILENT]`, `[CRON_FAILURE]` | identical text and semantics |
 | `cron/output/<id>/<YYYY-MM-DD_HH-MM-SS>.md`, newest 50, mode 0600 | identical layout (adds `**Engine:**` / `**Peer:**` lines) |
 | `usage_audit.jsonl`, `ticker_heartbeat`, `ticker_last_success` | written |
 | `-p`, `-z` (stdout = final text, exit 1 + `… -z: reason` on stderr), `-m`, `--provider`, `-t`, `cron list/create/run/tick/runs/status`, `profile list/show`, `chat` | same flags |
-| `executions.db`, incidents, notepad, messaging gateway adapters, `delegate_task`, browser tools, MCP | **not implemented**; itonami logs runs to `cron/itonami-runs.jsonl` |
+| `executions.db`, incidents, notepad, messaging gateway adapters, browser tools, MCP | **not implemented**; itonami logs runs to `cron/itonami-runs.jsonl` |
+
+`delegate_task` is currently limited to up to three parallel foreground turns.
+Hermes background/list/steer/stop controls, image inputs, and output-schema
+validation are not implemented. This is partial tool-contract coverage, not
+full Hermes agent parity.
+
+`terminal(background=true)` is explicitly rejected until process management is implemented;
+`skill_manage` accepts one operation at a time (not Hermes' atomic batch), and
+cron delivery adapters are not wired. These limitations must be closed before
+claiming full agent parity or adopting profiles that depend on them.
 
 The CLJK turn API accepts prior user/assistant history and per-request
 instructions, in addition to the current prompt. Tool rows remain scoped to the
@@ -68,7 +78,9 @@ Hy cron scripts use the first configured interpreter among the job's
 `interpreter`, `cron.script_python`, `ITONAMI_PYTHON`, `HERMES_PYTHON`, then
 `python3`. That interpreter must provide `hy` (the fleet target is Hy 1.3.1).
 The dispatcher inserts the script directory into `sys.path` and preserves
-arguments after the script path, matching the `.py` job contract.
+arguments after the script path, matching the `.py` job contract. When launched
+by Kotoba Gateway, the scheduler also supplies its vendored Hy dependency via
+`KOTOBA_HY_DEPS`; direct CLI runs still require Hy in the selected interpreter.
 
 ## Peer-to-peer execution
 

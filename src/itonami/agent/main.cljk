@@ -64,9 +64,10 @@
     (println (str "[itonami-agent] " (name (:event e)) " "
                   (pr-str (dissoc e :event :content))))))
 
-(defn- run-opts [opts]
+(defn- run-opts [opts prof]
   (cond-> {:model (:model opts) :provider (:provider opts) :pinned? (boolean (:model opts))
-           :toolsets (:toolsets opts) :platform "cli" :load-context? true :cwd (js/process.cwd)}
+           :toolsets (:toolsets opts) :platform "cli" :load-context? true :cwd (js/process.cwd)
+           :tool-overrides {"cronjob_manage" (fn [_ args] (cron/manage prof args))}}
     (:verbose opts) (assoc :on-event log-event)))
 
 (defn bridge
@@ -113,6 +114,7 @@
                        :max-turns (get request "max_turns")
                        :budget-s (get request "budget_s")
                        :before-tool ask-before-tool
+                       :tool-overrides {"cronjob_manage" (fn [_ args] (cron/manage prof args))}
                        :on-event (fn [event]
                                    (send-row {"type" "event" "event" event}))}]
           (-> (agent-loop/run prof prompt options)
@@ -160,7 +162,7 @@
 
 (defn oneshot [opts]
   (p/let [prof (profile/load-profile (:profile opts))
-          r ((executor opts) prof (:oneshot opts) (run-opts opts))]
+          r ((executor opts) prof (:oneshot opts) (run-opts opts prof))]
     (if (and (= "completed" (:exit-reason r)) (not (str/blank? (:final r))))
       (do (println (:final r))
           (when (:verbose opts)
@@ -183,7 +185,7 @@
                              (let [prompt (if @history
                                             (str "Conversation so far:\n" @history "\n\nUser: " line)
                                             line)]
-                               (-> ((executor opts) prof prompt (run-opts opts))
+                               (-> ((executor opts) prof prompt (run-opts opts prof))
                                    (p/then (fn [r]
                                              (println (or (:final r) (str "[" (:exit-reason r) "] " (get-in r [:error :error]))))
                                              (swap! history #(str % "\nUser: " line "\nAssistant: " (:final r)))
