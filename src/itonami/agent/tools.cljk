@@ -82,7 +82,15 @@
 (defn tool-names
   "Toolset names -> distinct tool names, unknown toolsets ignored."
   [sets]
-  (vec (distinct (mapcat #(get toolsets % []) sets))))
+  (vec (distinct (mapcat #(or (get toolsets %)
+                               (when (contains? schemas %) [%])
+                               []) sets))))
+
+(defn unsupported-tools
+  "Tool names this Kotoba agent cannot execute. Callers at compatibility
+  boundaries should fail closed instead of silently dropping these tools."
+  [names]
+  (vec (distinct (remove (set (keys schemas)) names))))
 
 (defn enabled-tool-names
   "Requested toolsets minus the profile's `agent.disabled_toolsets` (Hermes

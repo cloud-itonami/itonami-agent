@@ -4,6 +4,7 @@
   Hermes-compatible surface (same profile homes, same files):
     itonami-agent [-p P] -z PROMPT [-m MODEL] [--provider P] [-t toolsets]
     itonami-agent [-p P] chat
+    itonami-agent bridge < request.json   one JSON request in; JSONL events/result out
     itonami-agent [-p P] cron list | create <schedule> [prompt] [--name n --script s --deliver d]
                               | run <id> | tick [--force] | runs [--limit n] | status
     itonami-agent profile list | show <p>
@@ -27,6 +28,7 @@
             [itonami.agent.host :as h]
             [itonami.agent.profile :as profile]
             [itonami.agent.loop :as agent-loop]
+            [itonami.agent.tools :as tools]
             [itonami.agent.cron :as cron]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.rails :as rails]
@@ -65,6 +67,45 @@
   (cond-> {:model (:model opts) :provider (:provider opts) :pinned? (boolean (:model opts))
            :toolsets (:toolsets opts) :platform "cli" :load-context? true :cwd (js/process.cwd)}
     (:verbose opts) (assoc :on-event log-event)))
+
+(defn bridge
+  "Read one JSON request and emit JSONL agent events plus a terminal result.
+  Unsupported requested tools fail before provider or tool execution."
+  []
+  (p/let [input (js/Promise. (fn [resolve]
+                               (let [chunks #js []]
+                                 (.on js/process.stdin "data" #(.push chunks %))
+                                 (.on js/process.stdin "end"
+                                      #(resolve (.toString (js/Buffer.concat chunks) "utf8"))))))
+          request (h/json-parse input)]
+    (let [profile-name (or (get request "profile") "default")
+          prompt (get request "prompt")
+          requested-tools (get request "tool_names")
+          unsupported (tools/unsupported-tools requested-tools)]
+      (when-not (string? prompt)
+        (throw (ex-info "bridge request requires a string prompt" {})))
+      (when-not (vector? requested-tools)
+        (throw (ex-info "bridge request requires an explicit tool_names array" {})))
+      (when (seq unsupported)
+        (throw (ex-info (str "Kotoba agent does not implement requested tools: "
+                             (str/join ", " unsupported))
+                        {:unsupported-tools unsupported})))
+      (let [prof (profile/load-profile profile-name)
+            options {:model (get request "model")
+                     :provider (get request "provider")
+                     :pinned? (boolean (get request "model"))
+                     :tool-names requested-tools
+                     :history (get request "history")
+                     :instructions (get request "instructions")
+                     :cwd (or (get request "cwd") (js/process.cwd))
+                     :platform "api_server"
+                     :load-context? true
+                     :max-turns (get request "max_turns")
+                     :budget-s (get request "budget_s")
+                     :on-event (fn [event]
+                                 (println (h/json-str {"type" "event" "event" event})))}]
+        (p/let [result (agent-loop/run prof prompt options)]
+          (println (h/json-str {"type" "result" "result" result})))))))
 
 ;; ---------------------------------------------------------------- -z / chat
 
@@ -325,6 +366,7 @@
             (and (:oneshot opts) (not= "peer" (first pos))) (oneshot opts)
             :else
             (case (first pos)
+              "bridge" (bridge)
               "chat" (chat opts)
               "cron" (cron-cmd opts (rest pos))
               "profile" (profile-cmd opts (rest pos))

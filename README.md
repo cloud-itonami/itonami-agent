@@ -36,6 +36,11 @@ instructions, in addition to the current prompt. Tool rows remain scoped to the
 turn that produced them; only the user/assistant transcript is carried into the
 next request, matching the current Kotoba Desktop gateway's normalized history.
 
+`itonami-agent bridge` exposes this turn API to a local host over stdin/stdout:
+one JSON request containing an explicit `tool_names` array, then JSONL event rows
+and one terminal result row. It refuses any requested tool the Kotoba agent
+does not implement; it never silently narrows a caller's requested tool set.
+
 ## itonami profile
 
 `profile itonamify <p>|--all` adds `itonami.edn` (schema
