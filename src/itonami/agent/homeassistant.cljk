@@ -48,6 +48,10 @@
                       (throw (ex-info "Home Assistant redirects are refused" {:status status})))
                     (when-not (.-ok response)
                       (throw (ex-info (str "Home Assistant returned HTTP " status) {:status status})))
+                    (let [content-length (.get (.-headers response) "content-length")]
+                      (when (and content-length
+                                 (> (js/parseInt content-length 10) max-response-bytes))
+                        (throw (ex-info "Home Assistant response exceeds 2 MiB" {}))))
                     (p/then (.text response)
                             (fn [body]
                               (when (> (js/Buffer.byteLength body "utf8") max-response-bytes)
