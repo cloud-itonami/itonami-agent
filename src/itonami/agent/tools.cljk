@@ -110,14 +110,15 @@
                                  "required" ["goal"]}}}
               ["tasks"])
    "cronjob_manage"
-   (fn-schema "cronjob_manage" "Manage this profile's scheduled Kotoba jobs. List, create, update, pause, resume, remove, or run a job. Mutations require approval."
+   (fn-schema "cronjob_manage" "Manage this profile's scheduled Kotoba jobs, including monitor_script and monitor_url pre-run checks. List, create, update, pause, resume, remove, or run a job. Mutations require approval."
               {"action" {"type" "string" "enum" ["create" "list" "update" "pause" "resume" "remove" "run"]}
                "job_id" {"type" "string"}
                "prompt" {"type" "string"}
                "schedule" {"type" "string" "description" "Use a duration such as 30m or every 2 hours, a phrase such as every weekday at 9am, a 5-field cron expression, an ISO timestamp, or a one-shot such as in 30m."}
                "name" {"type" "string"}
                "repeat" {"type" "integer"} "deliver" {"type" "string"} "failure_deliver" {"type" "string"}
-               "script" {"type" "string"} "context_from" {"type" "array" "items" {"type" "string"}}
+               "script" {"type" "string"} "monitor_script" {"type" "string"} "monitor_url" {"type" "string"}
+               "context_from" {"type" "array" "items" {"type" "string"}}
                "continuity" {"type" "boolean"} "enabled_toolsets" {"type" "array" "items" {"type" "string"}}
                "workdir" {"type" "string"} "no_agent" {"type" "boolean"}
                "paused" {"type" "boolean"} "paused_reason" {"type" "string"} "pinned" {"type" "boolean"}

@@ -208,7 +208,7 @@
 (defn manage
   "Hermes cronjob_manage actions over this profile's jobs.json. Mutating actions are
   approval-gated by the agent bridge; `run` executes the selected Kotoba cron job inline."
-  [prof {:strs [action job_id prompt schedule name repeat deliver failure_deliver script
+  [prof {:strs [action job_id prompt schedule name repeat deliver failure_deliver script monitor_script monitor_url
                 context_from continuity enabled_toolsets workdir no_agent paused paused_reason
                 skills skill pinned include_disabled]}]
   (let [home (:home prof)
@@ -221,7 +221,8 @@
       (respond {"jobs" (vec (for [j jobs :when (or (not (false? include_disabled)) (active? j))]
                                (select-keys j ["id" "name" "prompt" "schedule" "schedule_display" "next_run_at"
                                                "enabled" "state" "last_run_at" "last_status" "last_error"
-                                               "last_delivery_error" "deliver" "script" "enabled_toolsets" "repeat"])))})
+                                               "last_delivery_error" "deliver" "script" "monitor_script" "monitor_url"
+                                               "enabled_toolsets" "repeat"])))})
 
       "create"
       (try
@@ -237,6 +238,7 @@
               _ (when (and pinned (str/blank? (str pin-model)))
                   (throw (ex-info "Cannot pin this cron job because the profile has no default model configured." {})))
               j (new-job {:schedule schedule :prompt (or prompt "") :name name :script script
+                          :monitor-script monitor_script :monitor-url monitor_url :no-agent (boolean no_agent)
                           :deliver deliver :toolsets enabled_toolsets :workdir workdir
                           :model pin-model :provider pin-provider})
               skill-list (vec (or skills (when skill [skill]) []))
@@ -298,6 +300,8 @@
                             (some? deliver) (assoc "deliver" deliver)
                             (some? failure_deliver) (assoc "failure_deliver" failure_deliver)
                             (some? script) (assoc "script" script)
+                            (some? monitor_script) (assoc "monitor_script" monitor_script)
+                            (some? monitor_url) (assoc "monitor_url" monitor_url)
                             (some? context_from) (assoc "context_from" context_from)
                             (some? continuity) (assoc "continuity" continuity)
                             (some? enabled_toolsets) (assoc "enabled_toolsets" enabled_toolsets)
@@ -323,13 +327,17 @@
   (and (active? job)
        (when-let [t (h/parse-time (get job "next_run_at"))] (<= (.getTime t) (.getTime now)))))
 
-(defn new-job [{:keys [schedule prompt name script deliver model provider toolsets workdir]}]
+(defn new-job [{:keys [schedule prompt name script monitor-script monitor-url no-agent deliver model provider toolsets workdir]}]
   (let [sched (parse-schedule schedule)
+        job-name (or name
+                     (if (str/blank? (str prompt))
+                       (or script monitor-script monitor-url "cron job")
+                       (subs (str prompt) 0 (min 40 (count (str prompt))))))
         now (js/Date.)]
-    (cond-> {"id" (h/random-hex 6) "name" (or name (subs (str prompt) 0 (min 40 (count (str prompt)))))
+    (cond-> {"id" (h/random-hex 6) "name" job-name
              "prompt" (or prompt "") "skills" [] "skill" nil
              "model" model "provider" provider "base_url" nil
-             "script" script "no_agent" false "context_from" nil
+             "script" script "no_agent" (boolean no-agent) "context_from" nil
              "schedule" sched "schedule_display" (get sched "display")
              "repeat" {"times" (when (= "once" (get sched "kind")) 1) "completed" 0}
              "enabled" true "state" "scheduled" "paused_at" nil "paused_reason" nil
@@ -337,7 +345,8 @@
              "next_run_at" (some-> (next-run {"schedule" sched} now) h/iso-local)
              "last_run_at" nil "last_status" nil "last_error" nil "last_delivery_error" nil
              "failure_streak" 0 "deliver" (or deliver "local") "origin" nil
-             "enabled_toolsets" toolsets "workdir" workdir}
+             "enabled_toolsets" toolsets "workdir" workdir
+             "monitor_script" monitor-script "monitor_url" monitor-url}
       true identity)))
 
 ;; ---------------------------------------------------------------- one run

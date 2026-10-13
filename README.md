@@ -23,12 +23,12 @@ the two can be swapped per profile.
 | `model` / `providers` / `fallback_providers`, job pin disables fallback | same resolution order (`cron/scheduler.py`, `runtime_provider_custom.py`) |
 | `agent.max_turns`, `agent.run_budget_seconds` (80 % wrap-up notice, hop timeout ≤ ½ remaining budget) | same; plus up to 3 rounds over the chain with backoff when every hop failed transiently (429 / 5xx / transport) |
 | tools `terminal read_file write_file patch search_files web_search web_extract skills_list skill_view skill_manage todo_list delegate_task cronjob_manage memory`; toolsets `terminal`, `file`, `web`, `search`, `skills`, `todo`, `memory` | these names have Kotoba handlers and JSON-string results; some semantics remain partial. `hermes-cli`/`hermes-cron` retain Hermes' full core inventory and refuse to start when any selected tool is unsupported, rather than silently presenting a reduced bundle |
-| `cron/jobs.json` (all fields), 5-field cron / interval / once schedules | read and written in Hermes' format; Hermes' own `cron.jobs.load_jobs()` / `get_due_jobs()` read what itonami writes |
+| `cron/jobs.json` (including `monitor_script` / `monitor_url`), 5-field cron / interval / once schedules | read and written in Hermes' format; Kotoba can create, list, and update monitor jobs, then evaluates the monitor before the agent turn |
 | Pre-run script extensions `.sh`/`.bash`, `.cljk`, `.js`/`.mjs`, `.py`, `.hy` | extension dispatch; `.hy` runs through `hy.cmdline.hy_main` with the job/config-selected Python, which must have Hy installed |
 | cron prompt: `_CRON_HINT`, `## Script Output` / `## Script Error` block, empty stdout and `{"wakeAgent": false}` skip, `[SILENT]`, `[CRON_FAILURE]` | identical text and semantics |
 | `cron/output/<id>/<YYYY-MM-DD_HH-MM-SS>.md`, newest 50, mode 0600 | identical layout (adds `**Engine:**` / `**Peer:**` lines) |
 | `usage_audit.jsonl`, `ticker_heartbeat`, `ticker_last_success` | written |
-| `-p`, `-z` (stdout = final text, exit 1 + `… -z: reason` on stderr), `-m`, `--provider`, `-t`, `cron list/create/run/tick/runs/status`, `profile list/show`, `chat` | same flags |
+| `-p`, `-z` (stdout = final text, exit 1 + `… -z: reason` on stderr), `-m`, `--provider`, `-t`, `cron list/create/run/tick/runs/status`, `profile list/show`, `chat` | same commands; `cron create` also accepts `--no-agent`, `--monitor-script`, and `--monitor-url` |
 | `executions.db`, incidents, notepad, messaging gateway adapters, browser tools, MCP | **not implemented**; itonami logs runs to `cron/itonami-runs.jsonl` |
 
 `delegate_task` is currently limited to up to three parallel foreground turns.

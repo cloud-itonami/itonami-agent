@@ -5,7 +5,8 @@
     itonami-agent [-p P] -z PROMPT [-m MODEL] [--provider P] [-t toolsets]
     itonami-agent [-p P] chat
     itonami-agent bridge < request.json   one JSON request in; JSONL events/result out
-    itonami-agent [-p P] cron list | create <schedule> [prompt] [--name n --script s --deliver d]
+    itonami-agent [-p P] cron list | create <schedule> [prompt] [--name n --script s --no-agent]
+                              [--monitor-script s --monitor-url u --deliver d]
                               | run <id> | tick [--force] | runs [--limit n] | status
     itonami-agent profile list | show <p>
 
@@ -219,7 +220,14 @@
 
       ("create" "add")
       (let [[schedule prompt] args
+            no-agent (boolean (:no-agent opts))
+            _ (when (or (str/blank? (str schedule))
+                        (and no-agent (str/blank? (str (:script opts))))
+                        (and (not no-agent) (str/blank? (str prompt))))
+                (die 2 "create requires a schedule and either a prompt or --no-agent with --script"))
             j (cron/new-job {:schedule schedule :prompt prompt :name (:name opts) :script (:script opts)
+                             :monitor-script (:monitor-script opts) :monitor-url (:monitor-url opts)
+                             :no-agent no-agent
                              :deliver (:deliver opts) :model (:model opts) :provider (:provider opts)
                              :toolsets (:toolsets opts) :workdir (:workdir opts)})]
         (cron/write-jobs! home (conj (cron/read-jobs home) j))
