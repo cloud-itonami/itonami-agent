@@ -156,23 +156,44 @@
 
 ;; ---------------------------------------------------------------- one run
 
-(defn- script-command [path]
-  (cond
-    (re-find #"\.(sh|bash)$" path) ["bash" path]
-    (re-find #"\.cljk$" path) ["kbb" "--backend" "sci" path]
-    (re-find #"\.(m?js)$" path) ["node" path]
-    :else ["python3" path]))
+(def hy-script-bootstrap
+  "Run a Hy script with its selected Python, preserving script-local imports and argv."
+  (str "import os, sys; script = sys.argv[1]; "
+       "sys.path.insert(0, os.path.dirname(os.path.abspath(script))); "
+       "sys.argv = ['hy', script, *sys.argv[2:]]; "
+       "from hy.cmdline import hy_main; hy_main()"))
+
+(defn script-command
+  "Choose the runner from the script extension. Hy uses the job interpreter,
+  cron.script_python, ITONAMI_PYTHON/HERMES_PYTHON, then python3. The chosen
+  Python must have Hy installed; failures are reported as ordinary script errors."
+  [prof job path]
+  (let [ext (some-> path str/lower-case)
+        python (or (not-empty (get job "interpreter"))
+                   (not-empty (get-in prof [:config "cron" "script_python"]))
+                   (not-empty (get (:env prof) "ITONAMI_PYTHON"))
+                   (not-empty (get (:env prof) "HERMES_PYTHON"))
+                   (not-empty (h/env "ITONAMI_PYTHON"))
+                   (not-empty (h/env "HERMES_PYTHON"))
+                   "python3")]
+    (cond
+      (re-find #"\.(sh|bash)$" ext) ["bash" path]
+      (re-find #"\.cljk$" ext) ["kbb" "--backend" "sci" path]
+      (re-find #"\.(m?js)$" ext) ["node" path]
+      (re-find #"\.hy$" ext) [python "-c" hy-script-bootstrap path]
+      :else [python path])))
 
 (defn run-script
   "[ok? output] like Hermes _run_job_script. Paths must resolve inside scripts/."
-  [{:keys [home config env]} job]
-  (let [scripts (h/join home "scripts")
+  [prof job]
+  (let [{:keys [home config env]} prof
+        scripts (h/join home "scripts")
         abs (h/join scripts (get job "script"))]
     (cond
       (not (str/starts-with? abs (str scripts "/"))) [false (str "script path escapes scripts/: " (get job "script"))]
       (not (h/file? abs)) [false (str "script not found: " abs)]
       :else
-      (let [r (h/run-process (script-command abs)
+      (let [r (h/run-process (script-command prof job abs)
                              {:cwd (or (some-> (get job "workdir") h/expand) scripts)
                               :env (assoc env "HERMES_HOME" home "ITONAMI_PROFILE_HOME" home)
                               :timeout-ms (* 1000 (or (get-in config ["cron" "script_timeout_seconds"])

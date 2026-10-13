@@ -1,8 +1,8 @@
 # itonami-agent
 
 A Hermes-compatible agent written in kotoba (`.cljk` on kbb), with peer-to-peer
-execution of agent turns. No dependencies beyond the kbb engine; no JVM, no
-Python, no npm packages.
+execution of agent turns. The agent core needs only the kbb engine; no JVM or
+npm packages. Cron jobs written in Hy additionally need Python with Hy installed.
 
 ```
 bin/itonami-agent -p hiraku-soudan -z "質問"            # one turn, like `hermes -p … -z`
@@ -24,6 +24,7 @@ the two can be swapped per profile.
 | `agent.max_turns`, `agent.run_budget_seconds` (80 % wrap-up notice, hop timeout ≤ ½ remaining budget) | same; plus up to 3 rounds over the chain with backoff when every hop failed transiently (429 / 5xx / transport) |
 | tools `terminal read_file write_file patch search_files web_search web_extract skill_view memory`; toolsets `hermes-cli`, `hermes-cron`, `terminal`, `file`, `web`, `skills`, `memory` | same names and argument shapes; results are JSON strings |
 | `cron/jobs.json` (all fields), 5-field cron / interval / once schedules | read and written in Hermes' format; Hermes' own `cron.jobs.load_jobs()` / `get_due_jobs()` read what itonami writes |
+| Pre-run script extensions `.sh`/`.bash`, `.cljk`, `.js`/`.mjs`, `.py`, `.hy` | extension dispatch; `.hy` runs through `hy.cmdline.hy_main` with the job/config-selected Python, which must have Hy installed |
 | cron prompt: `_CRON_HINT`, `## Script Output` / `## Script Error` block, empty stdout and `{"wakeAgent": false}` skip, `[SILENT]`, `[CRON_FAILURE]` | identical text and semantics |
 | `cron/output/<id>/<YYYY-MM-DD_HH-MM-SS>.md`, newest 50, mode 0600 | identical layout (adds `**Engine:**` / `**Peer:**` lines) |
 | `usage_audit.jsonl`, `ticker_heartbeat`, `ticker_last_success` | written |
@@ -52,6 +53,12 @@ Exactly one scheduler ticks a profile:
   `gateway.parked` marker, so the Hermes gateway stops ticking it;
   `gateway run` then ticks it.
 - `profile release <p>` reverses both.
+
+Hy cron scripts use the first configured interpreter among the job's
+`interpreter`, `cron.script_python`, `ITONAMI_PYTHON`, `HERMES_PYTHON`, then
+`python3`. That interpreter must provide `hy` (the fleet target is Hy 1.3.1).
+The dispatcher inserts the script directory into `sys.path` and preserves
+arguments after the script path, matching the `.py` job contract.
 
 ## Peer-to-peer execution
 

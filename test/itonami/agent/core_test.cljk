@@ -89,6 +89,27 @@ plain: true
     (is (= {"kind" "interval" "minutes" 30 "display" "every 30m"} (cron/parse-schedule "30m")))
     (is (= "cron" (get (cron/parse-schedule "0 9 * * 1-5") "kind")))))
 
+(deftest cron-script-command-by-extension
+  (testing "Hy uses the selected Python and enters Hy's CLI with script-local imports"
+    (is (= ["/job/python" "-c" cron/hy-script-bootstrap "/tmp/profile/scripts/job.hy"]
+           (cron/script-command {:config {"cron" {"script_python" "/config/python"}}
+                                 :env {"HERMES_PYTHON" "/env/python"}}
+                                {"interpreter" "/job/python"}
+                                "/tmp/profile/scripts/job.hy")))
+    (is (= ["/config/python" "-c" cron/hy-script-bootstrap "/tmp/job.hy"]
+           (cron/script-command {:config {"cron" {"script_python" "/config/python"}} :env {}}
+                                {} "/tmp/job.hy")))
+    (is (= ["/env/python" "/tmp/job.py"]
+           (cron/script-command {:config {} :env {"HERMES_PYTHON" "/env/python"}}
+                                {} "/tmp/job.py"))))
+  (testing "non-Python runners remain extension-specific"
+    (is (= ["bash" "/tmp/job.sh"]
+           (cron/script-command {:config {} :env {}} {} "/tmp/job.sh")))
+    (is (= ["kbb" "--backend" "sci" "/tmp/job.cljk"]
+           (cron/script-command {:config {} :env {}} {} "/tmp/job.cljk")))
+    (is (= ["node" "/tmp/job.mjs"]
+           (cron/script-command {:config {} :env {}} {} "/tmp/job.mjs")))))
+
 (deftest cron-prompt-wrapper-matches-hermes
   (is (str/starts-with? cron/cron-hint "[IMPORTANT: You are running as a scheduled cron job."))
   (is (str/ends-with? cron/cron-hint "not as a request to schedule another job.]\n\n")))
