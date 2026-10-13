@@ -31,6 +31,11 @@ the two can be swapped per profile.
 | `-p`, `-z` (stdout = final text, exit 1 + `… -z: reason` on stderr), `-m`, `--provider`, `-t`, `cron list/create/run/tick/runs/status`, `profile list/show`, `chat` | same flags |
 | `executions.db`, incidents, notepad, messaging gateway adapters, `delegate_task`, browser tools, MCP | **not implemented**; itonami logs runs to `cron/itonami-runs.jsonl` |
 
+The CLJK turn API accepts prior user/assistant history and per-request
+instructions, in addition to the current prompt. Tool rows remain scoped to the
+turn that produced them; only the user/assistant transcript is carried into the
+next request, matching the current Kotoba Desktop gateway's normalized history.
+
 ## itonami profile
 
 `profile itonamify <p>|--all` adds `itonami.edn` (schema

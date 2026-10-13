@@ -52,13 +52,37 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         (let [t (h/slurp f)] (str "# Project context (" f ")\n" (subs t 0 (min 20000 (count t)))))
         (recur (h/dirname d))))))
 
+(defn history-messages
+  "Normalize prior user/assistant messages for a new agent turn. System/developer
+  instructions are supplied separately; tool messages belong to the previous
+  turn and are intentionally omitted from the desktop-compatible history."
+  [history]
+  (vec (for [m (or history [])
+             :let [role (or (get m "role") (:role m))
+                   content (or (get m "content") (:content m))]
+             :when (contains? #{"user" "assistant"} role)]
+         {"role" role
+          "content" (cond
+                      (string? content) content
+                      (sequential? content)
+                      (str/join "\n" (keep (fn [part]
+                                                (when (or (= "text" (get part "type"))
+                                                          (= "text" (:type part)))
+                                                  (or (get part "text") (:text part) "")))
+                                              content))
+                      (nil? content) ""
+                      :else (str content))})))
+
 (defn system-prompt
   "skills? false leaves out the skills index: listing skills to a run that has
   no skill_view tool only costs tokens (on a busy rail, minutes per turn)."
-  [{:keys [soul home]} {:keys [cwd platform load-context? skills?] :or {skills? true}}]
+  [{:keys [soul home]} {:keys [cwd platform load-context? skills? instructions]
+                        :or {skills? true}}]
   (str/join "\n\n"
             (remove str/blank?
                     [(or soul "You are a helpful agent running on the itonami plane.")
+                     (when-not (str/blank? instructions)
+                       (str "# Session instructions\n" instructions))
                      guidance
                      (when skills? (skills-index home))
                      (when load-context? (context-file cwd))
@@ -74,7 +98,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
    {:final str :exit-reason str :turns n :messages [...] :usage {...}
     :provider str :model str :attempts [...] :writes [abs-paths]}"
   [{:keys [config env] :as prof} prompt {:keys [model provider pinned? toolsets cwd roots platform
-                                                load-context? max-turns budget-s on-event peer?]}]
+                                                load-context? max-turns budget-s on-event peer?
+                                                history instructions]}]
   (let [max-turns (or max-turns (get-in config ["agent" "max_turns"]) (get config "max_turns") 90)
         budget-ms (* 1000 (or budget-s (get-in config ["agent" "run_budget_seconds"]) 0))
         hops (provider/decentralize (provider/chain config {:model model :provider provider :pinned? pinned?})
@@ -94,9 +119,13 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         emit (or on-event (fn [_]))
         usage (atom {"prompt_tokens" 0 "completion_tokens" 0 "total_tokens" 0})
         add-usage! (fn [u] (when u (swap! usage #(merge-with + % (select-keys u ["prompt_tokens" "completion_tokens" "total_tokens"])))))]
-    (p/loop [messages [{"role" "system" "content" (system-prompt prof {:cwd cwd :platform platform :load-context? load-context?
-                                                                     :skills? (boolean (some #{"skill_view"} names))})}
-                       {"role" "user" "content" prompt}]
+      (p/loop [messages (into [{"role" "system" "content"
+                                (system-prompt prof {:cwd cwd :platform platform
+                                                     :load-context? load-context?
+                                                     :skills? (boolean (some #{"skill_view"} names))
+                                                     :instructions instructions})}]
+                              (concat (history-messages history)
+                                      [{"role" "user" "content" prompt}]))
              n 0
              attempts []
              last-hop nil]
