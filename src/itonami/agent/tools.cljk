@@ -16,6 +16,7 @@
             [itonami.agent.host :as h]
             [itonami.agent.confine :as confine]
             [itonami.agent.webguard :as webguard]
+            [itonami.agent.process :as process]
             [itonami.agent.yaml :as yaml]))
 
 (defn- fn-schema [name desc props required]
@@ -29,8 +30,17 @@
               {"command" {"type" "string" "description" "The command to execute"}
                "timeout" {"type" "integer" "description" "Seconds before the command is killed (default 180)"}
                "workdir" {"type" "string" "description" "Working directory (default: the profile's terminal cwd)"}
-               "background" {"type" "boolean" "description" "Not yet supported; true returns an explicit unsupported-operation error"}}
+               "background" {"type" "boolean" "description" "Start a background process; use process_manage to poll, wait, read output, send stdin, or terminate it"}}
               ["command"])
+   "process_manage"
+   (fn-schema "process_manage" "Poll, wait on, read, or control a background terminal process started in this Kotoba agent runtime. Completed results are retained for up to 7 days, newest 64 per profile, while the agent runtime is alive."
+              {"action" {"type" "string" "enum" ["list" "poll" "log" "wait" "kill" "write" "submit" "close" "handoff"]}
+               "session_id" {"type" "string" "description" "Exact id or unique prefix returned by terminal(background=true). Required except for list."}
+               "data" {"type" "string" "description" "Text to write or submit to stdin."}
+               "timeout" {"type" "integer" "minimum" 1 "description" "Seconds to wait, capped at 1800."}
+               "offset" {"type" "integer" "description" "Zero-based log line offset; omitted reads the tail."}
+               "limit" {"type" "integer" "minimum" 1 "description" "Maximum log lines (capped at 2000)."}}
+              ["action"])
    "read_file"
    (fn-schema "read_file" "Read a text file with line numbers (LINE_NUM|CONTENT)."
               {"path" {"type" "string"} "offset" {"type" "integer" "description" "1-based first line"}
@@ -165,7 +175,7 @@
                          "hermes-mattermost" "hermes-matrix" "hermes-dingtalk"
                          "hermes-wecom" "hermes-wecom-callback" "hermes-weixin" "hermes-qqbot"]]
     (merge
-     {"terminal" ["terminal"] "process_manage" ["process_manage"]
+     {"terminal" ["terminal" "process_manage"]
       "file" file-tools "files" file-tools "web" web-tools "search" ["web_search"]
       "x_search" ["x_search"] "vision" ["vision_analyze"] "video" ["video_analyze"]
       "image_gen" ["image_generate"] "video_gen" ["video_generate" "xai_video_edit" "xai_video_extend"]
@@ -292,9 +302,7 @@
   itonami.agent.confine): writes only inside the run's roots (or its cwd),
   no secret stores, no network unless granted, only the env it names."
   [ctx {:strs [command timeout workdir background]}]
-  (if background
-    (err "terminal background execution is not implemented by itonami-agent; run foreground or use Hermes until process_manage parity is available")
-    (let [cwd (if workdir (resolve-path ctx workdir) (:cwd ctx))
+  (let [cwd (if workdir (resolve-path ctx workdir) (:cwd ctx))
         pol (policy ctx)]
     (if (and (:roots ctx) (not (writable? ctx cwd)))
       (err (str "workdir outside this run's roots: " cwd))
@@ -306,16 +314,23 @@
                                     :backend (backend ctx)})]
         (if-let [why (:refused c)]
           (err (str "terminal refused: " why))
-          (let [r (try (h/run-process (:argv c) {:cwd cwd :exact-env? true :env (:env c)
-                                                 :timeout-ms (* 1000 (or timeout (:terminal-timeout-s ctx) 180))})
-                       (finally (when (:tmpdir c) (h/rm (:tmpdir c)))))]
-            (confine/audit! {:profile (:profile ctx) :peer? (:peer? pol) :sandbox (:sandbox c)
-                             :cmd (str command) :exit (:exit r) :stderr (:stderr r)
-                             :timed-out? (:timed-out? r)})
-            (ok {"output" (clip (str (:stdout r) (when-not (str/blank? (:stderr r)) (str "\n[stderr]\n" (:stderr r)))) 50000)
-                 "exit_code" (:exit r)
-                 "sandbox" (name (:sandbox c))
-                 "error" (when (:timed-out? r) "timeout")}))))))))
+          (if background
+            (process/spawn! ctx {:argv (:argv c) :env (:env c) :cwd cwd :tmpdir (:tmpdir c)
+                                 :command (str command)
+                                 :on-exit (fn [exit stderr]
+                                            (confine/audit! {:profile (:profile ctx) :peer? (:peer? pol)
+                                                             :sandbox (:sandbox c) :cmd (str command)
+                                                             :exit exit :stderr stderr :timed-out? false}))})
+            (let [r (try (h/run-process (:argv c) {:cwd cwd :exact-env? true :env (:env c)
+                                                   :timeout-ms (* 1000 (or timeout (:terminal-timeout-s ctx) 180))})
+                         (finally (when (:tmpdir c) (h/rm (:tmpdir c)))))]
+              (confine/audit! {:profile (:profile ctx) :peer? (:peer? pol) :sandbox (:sandbox c)
+                               :cmd (str command) :exit (:exit r) :stderr (:stderr r)
+                               :timed-out? (:timed-out? r)})
+              (ok {"output" (clip (str (:stdout r) (when-not (str/blank? (:stderr r)) (str "\n[stderr]\n" (:stderr r)))) 50000)
+                   "exit_code" (:exit r)
+                   "sandbox" (name (:sandbox c))
+                   "error" (when (:timed-out? r) "timeout")}))))))))
 
 (defn read-file [ctx {:strs [path offset limit]}]
   (let [abs (resolve-path ctx path)]
@@ -865,7 +880,7 @@
           (ok {"entries" (count entries')})))))
 
 (def impls
-  {"terminal" terminal "read_file" read-file "write_file" write-file "patch" patch
+  {"terminal" terminal "process_manage" process/manage "read_file" read-file "write_file" write-file "patch" patch
    "search_files" search-files "web_extract" web-extract "web_search" web-search
    "skills_list" skills-list "skill_view" skill-view "skill_manage" skill-manage
    "todo_list" todo-list "memory" memory})
