@@ -99,7 +99,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
     :provider str :model str :attempts [...] :writes [abs-paths]}"
   [{:keys [config env] :as prof} prompt {:keys [model provider pinned? toolsets tool-names cwd roots platform
                                                 load-context? max-turns budget-s on-event peer?
-                                                history instructions]}]
+                                                history instructions before-tool]}]
   (let [max-turns (or max-turns (get-in config ["agent" "max_turns"]) (get config "max_turns") 90)
         budget-ms (* 1000 (or budget-s (get-in config ["agent" "run_budget_seconds"]) 0))
         hops (provider/decentralize (provider/chain config {:model model :provider provider :pinned? pinned?})
@@ -167,10 +167,18 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                     (if (nil? c)
                                       acc
                                       (p/let [nm (get-in c ["function" "name"])
+                                              args (get-in c ["function" "arguments"])
+                                              approved? (if (and before-tool (tools/approval-required? nm))
+                                                          (before-tool {:id (get c "id") :name nm :arguments args})
+                                                          true)
                                               t1 (h/now-ms)
-                                              _ (emit {:event :tool-start :name nm :args (subs (str (get-in c ["function" "arguments"])) 0 (min 160 (count (str (get-in c ["function" "arguments"])))))})
-                                              out (tools/call ctx names nm (get-in c ["function" "arguments"]))]
-                                        (emit {:event :tool :name nm :bytes (count out) :ms (- (h/now-ms) t1)})
+                                              _ (emit {:event :tool-start :name nm
+                                                       :args (subs (str args) 0 (min 160 (count (str args))))})
+                                              out (if approved?
+                                                    (tools/call ctx names nm args)
+                                                    (h/json-str {"error" "Tool call denied by user."}))]
+                                        (emit {:event :tool :name nm :bytes (count out)
+                                               :ms (- (h/now-ms) t1) :denied (not approved?)})
                                         (p/recur more (conj acc {"role" "tool" "tool_call_id" (get c "id") "content" out})))))
                           results (if (and (pos? budget-ms) (> (- (h/now-ms) t0) (* 0.8 budget-ms)) (seq results))
                                     (update-in results [(dec (count results)) "content"] str wrapup-notice)

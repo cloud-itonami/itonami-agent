@@ -33,7 +33,8 @@
             [itonami.agent.p2p :as p2p]
             [itonami.agent.rails :as rails]
             [itonami.agent.provider :as provider]
-            ["node:readline" :as readline]))
+            ["node:readline" :as readline]
+            ["node:crypto" :as crypto]))
 
 (defn- parse-args
   "Hermes-style: -p/--profile anywhere, flags with values, the rest positional."
@@ -69,43 +70,91 @@
     (:verbose opts) (assoc :on-event log-event)))
 
 (defn bridge
-  "Read one JSON request and emit JSONL agent events plus a terminal result.
-  Unsupported requested tools fail before provider or tool execution."
+  "JSONL local-host protocol. First line is the request; later approval lines
+  resolve tool calls before execution. Unsupported tools fail closed."
   []
-  (p/let [input (js/Promise. (fn [resolve]
-                               (let [chunks #js []]
-                                 (.on js/process.stdin "data" #(.push chunks %))
-                                 (.on js/process.stdin "end"
-                                      #(resolve (.toString (js/Buffer.concat chunks) "utf8"))))))
-          request (h/json-parse input)]
-    (let [profile-name (or (get request "profile") "default")
-          prompt (get request "prompt")
-          requested-tools (get request "tool_names")
-          unsupported (tools/unsupported-tools requested-tools)]
-      (when-not (string? prompt)
-        (throw (ex-info "bridge request requires a string prompt" {})))
-      (when-not (vector? requested-tools)
-        (throw (ex-info "bridge request requires an explicit tool_names array" {})))
-      (when (seq unsupported)
-        (throw (ex-info (str "Kotoba agent does not implement requested tools: "
-                             (str/join ", " unsupported))
-                        {:unsupported-tools unsupported})))
-      (let [prof (profile/load-profile profile-name)
-            options {:model (get request "model")
-                     :provider (get request "provider")
-                     :pinned? (boolean (get request "model"))
-                     :tool-names requested-tools
-                     :history (get request "history")
-                     :instructions (get request "instructions")
-                     :cwd (or (get request "cwd") (js/process.cwd))
-                     :platform "api_server"
-                     :load-context? true
-                     :max-turns (get request "max_turns")
-                     :budget-s (get request "budget_s")
-                     :on-event (fn [event]
-                                 (println (h/json-str {"type" "event" "event" event})))}]
-        (p/let [result (agent-loop/run prof prompt options)]
-          (println (h/json-str {"type" "result" "result" result})))))))
+  (let [rl (readline/createInterface #js {:input js/process.stdin :crlfDelay js/Infinity})
+        started? (atom false)
+        pending (atom {})]
+    (defn send-row [row] (println (h/json-str row)))
+    (defn start-request [request]
+      (let [profile-name (or (get request "profile") "default")
+            prompt (get request "prompt")
+            requested-tools (get request "tool_names")
+            unsupported (tools/unsupported-tools requested-tools)]
+        (when-not (string? prompt)
+          (throw (ex-info "bridge request requires a string prompt" {})))
+        (when-not (vector? requested-tools)
+          (throw (ex-info "bridge request requires an explicit tool_names array" {})))
+        (when (seq unsupported)
+          (throw (ex-info (str "Kotoba agent does not implement requested tools: "
+                               (str/join ", " unsupported))
+                          {:unsupported-tools unsupported})))
+        (let [prof (profile/load-profile profile-name)
+              ask-before-tool (fn [{:keys [name arguments]}]
+                                (let [request-id (.randomUUID crypto)]
+                                  (js/Promise.
+                                   (fn [resolve]
+                                     (swap! pending assoc request-id resolve)
+                                     (send-row {"type" "approval.request"
+                                                "request_id" request-id
+                                                "choices" ["once" "deny"]
+                                                "tool" name "arguments" arguments
+                                                "description" (str "Allow Kotoba agent to run " name "?")})))))
+              options {:model (get request "model")
+                       :provider (get request "provider")
+                       :pinned? (boolean (get request "model"))
+                       :tool-names requested-tools
+                       :history (get request "history")
+                       :instructions (get request "instructions")
+                       :cwd (or (get request "cwd") (js/process.cwd))
+                       :platform "api_server"
+                       :load-context? true
+                       :max-turns (get request "max_turns")
+                       :budget-s (get request "budget_s")
+                       :before-tool ask-before-tool
+                       :on-event (fn [event]
+                                   (send-row {"type" "event" "event" event}))}]
+          (-> (agent-loop/run prof prompt options)
+              (p/then (fn [result]
+                        (let [usage (:usage result)]
+                          (send-row
+                           {"type" "result"
+                            "result" {"final_response" (:final result)
+                                      "completed" (= "completed" (:exit-reason result))
+                                      "exit_reason" (:exit-reason result)
+                                      "error" (or (get-in result [:error :error])
+                                                  (when-not (= "completed" (:exit-reason result))
+                                                    (:exit-reason result)))
+                                      "usage" {"input_tokens" (or (get usage "prompt_tokens") 0)
+                                               "output_tokens" (or (get usage "completion_tokens") 0)
+                                               "total_tokens" (or (get usage "total_tokens") 0)}
+                                      "model" (:model result)
+                                      "provider" (:provider result)}})))
+              (p/catch (fn [e]
+                         (send-row {"type" "error" "error" (.-message e)})
+                         (set! (.-exitCode js/process) 1)))
+              (p/finally (fn [] (.close rl))))))))
+    (.on rl "line"
+         (fn [line]
+           (try
+             (let [message (h/json-parse line)]
+               (if-not @started?
+                 (do
+                   (reset! started? true)
+                   (start-request message))
+                 (let [request-id (get message "request_id")
+                       choice (get message "choice")
+                       resolve (get @pending request-id)]
+                   (when (and (= (get message "type") "approval")
+                              (contains? #{"once" "deny"} choice) resolve)
+                     (swap! pending dissoc request-id)
+                     (resolve (= choice "once"))))))
+             (catch :default e
+               (send-row {"type" "error" "error" (.-message e)})
+               (set! (.-exitCode js/process) 1)
+               (.close rl)))))
+    nil))
 
 ;; ---------------------------------------------------------------- -z / chat
 

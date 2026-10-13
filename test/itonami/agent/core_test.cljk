@@ -550,3 +550,13 @@ plain: true
   (testing "existing toolset expansion remains unchanged"
     (is (= (tools/tool-names ["hermes-cli"])
            (tools/enabled-tool-names ["hermes-cli"] nil)))))
+
+(deftest tool-approval-policy
+  (testing "read-only tools proceed directly while effectful tools require desktop approval"
+    (is (false? (tools/approval-required? "read_file")))
+    (is (false? (tools/approval-required? "search_files")))
+    (is (false? (tools/approval-required? "web_search")))
+    (is (false? (tools/approval-required? "skill_view")))
+    (is (true? (tools/approval-required? "terminal")))
+    (is (true? (tools/approval-required? "write_file")))
+    (is (true? (tools/approval-required? "memory")))))

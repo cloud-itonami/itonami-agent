@@ -92,6 +92,11 @@
   [names]
   (vec (distinct (remove (set (keys schemas)) names))))
 
+(def read-only-tools #{"read_file" "search_files" "web_search" "web_extract" "skill_view"})
+
+(defn approval-required? [name]
+  (not (contains? read-only-tools name)))
+
 (defn enabled-tool-names
   "Requested toolsets minus the profile's `agent.disabled_toolsets` (Hermes
   config.yaml; Hermes subtracts them last, after every enable, and so do
