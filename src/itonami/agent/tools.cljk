@@ -17,6 +17,7 @@
             [itonami.agent.confine :as confine]
             [itonami.agent.webguard :as webguard]
             [itonami.agent.process :as process]
+            [itonami.agent.homeassistant :as homeassistant]
             [itonami.agent.yaml :as yaml]))
 
 (defn- fn-schema [name desc props required]
@@ -130,7 +131,21 @@
               {"action" {"type" "string" "enum" ["add" "replace" "remove"]}
                "target" {"type" "string" "enum" ["memory" "user"]}
                "content" {"type" "string"} "old_text" {"type" "string"} "new_text" {"type" "string"}}
-              ["action"])})
+              ["action"])
+   "ha_list_entities"
+   (fn-schema "ha_list_entities" "List Home Assistant entities, optionally filtered by domain or area."
+              {"domain" {"type" "string"} "area" {"type" "string"}} [])
+   "ha_get_state"
+   (fn-schema "ha_get_state" "Get one Home Assistant entity state and attributes."
+              {"entity_id" {"type" "string"}} ["entity_id"])
+   "ha_list_services"
+   (fn-schema "ha_list_services" "List Home Assistant services, optionally filtered by domain."
+              {"domain" {"type" "string"}} [])
+   "ha_call_service"
+   (fn-schema "ha_call_service" "Call a Home Assistant service. Shell, scripting, add-on, and REST-command domains are blocked."
+              {"domain" {"type" "string"} "service" {"type" "string"}
+               "entity_id" {"type" "string"} "data" {"type" "string"}}
+              ["domain" "service"])})
 
 (def hermes-core-tools
   ;; Source of truth: Hermes `toolsets.py::_HERMES_CORE_TOOLS`. Keep the full
@@ -239,7 +254,8 @@
   [sets]
   (vec (distinct (remove #(or (contains? toolsets %) (contains? schemas %)) sets))))
 
-(def approval-free-tools #{"read_file" "search_files" "web_search" "web_extract" "skills_list" "skill_view" "todo_list" "delegate_task"})
+(def approval-free-tools #{"read_file" "search_files" "web_search" "web_extract" "skills_list" "skill_view" "todo_list" "delegate_task"
+                           "ha_list_entities" "ha_get_state" "ha_list_services"})
 
 (defn approval-required?
   ([name] (approval-required? name nil))
@@ -880,11 +896,18 @@
       (do (h/spit f (str/join "\n§\n" entries'))
           (ok {"entries" (count entries')})))))
 
+(defn- ha-tool [name]
+  (fn [ctx args] (homeassistant/call ctx name args)))
+
 (def impls
   {"terminal" terminal "process_manage" process/manage "read_file" read-file "write_file" write-file "patch" patch
    "search_files" search-files "web_extract" web-extract "web_search" web-search
    "skills_list" skills-list "skill_view" skill-view "skill_manage" skill-manage
-   "todo_list" todo-list "memory" memory})
+   "todo_list" todo-list "memory" memory
+   "ha_list_entities" (ha-tool "ha_list_entities")
+   "ha_get_state" (ha-tool "ha_get_state")
+   "ha_list_services" (ha-tool "ha_list_services")
+   "ha_call_service" (ha-tool "ha_call_service")})
 
 (defn call
   "Run one tool call. Always resolves to a result string."

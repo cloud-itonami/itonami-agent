@@ -22,7 +22,7 @@ the two can be swapped per profile.
 | `SOUL.md`, `profile.yaml`, `config.yaml`, `.env`, `secrets.command` | read the same way. YAML reader is checked against PyYAML on all 1,954 host files: 0 differences |
 | `model` / `providers` / `fallback_providers`, job pin disables fallback | same resolution order (`cron/scheduler.py`, `runtime_provider_custom.py`) |
 | `agent.max_turns`, `agent.run_budget_seconds` (80 % wrap-up notice, hop timeout ≤ ½ remaining budget) | same; plus up to 3 rounds over the chain with backoff when every hop failed transiently (429 / 5xx / transport) |
-| tools `terminal read_file write_file patch search_files web_search web_extract skills_list skill_view skill_manage todo_list delegate_task cronjob_manage memory`; toolsets `terminal`, `file`, `web`, `search`, `skills`, `todo`, `memory` | these names have Kotoba handlers and JSON-string results; some semantics remain partial. `hermes-cli`/`hermes-cron` retain Hermes' full core inventory and refuse to start when any selected tool is unsupported, rather than silently presenting a reduced bundle |
+| tools `terminal read_file write_file patch search_files web_search web_extract skills_list skill_view skill_manage todo_list delegate_task cronjob_manage memory ha_list_entities ha_get_state ha_list_services ha_call_service`; toolsets `terminal`, `file`, `web`, `search`, `skills`, `todo`, `memory`, `homeassistant` | these names have Kotoba handlers and JSON-string results; some semantics remain partial. `hermes-cli`/`hermes-cron` retain Hermes' full core inventory and refuse to start when any selected tool is unsupported, rather than silently presenting a reduced bundle |
 | `cron/jobs.json` (including `monitor_script` / `monitor_url`), 5-field cron / interval / once schedules | read and written in Hermes' format; Kotoba can create, list, and update monitor jobs, then evaluates the monitor before the agent turn |
 | Pre-run script extensions `.sh`/`.bash`, `.cljk`, `.js`/`.mjs`, `.py`, `.hy` | extension dispatch; `.hy` runs through `hy.cmdline.hy_main` with the job/config-selected Python, which must have Hy installed |
 | cron prompt: `_CRON_HINT`, `## Script Output` / `## Script Error` block, empty stdout and `{"wakeAgent": false}` skip, `[SILENT]`, `[CRON_FAILURE]` | identical text and semantics |
@@ -36,10 +36,14 @@ Hermes background/list/steer/stop controls, image inputs, and output-schema
 validation are not implemented. This is partial tool-contract coverage, not
 full Hermes agent parity.
 
-`terminal(background=true)` is explicitly rejected until process management is implemented;
-`skill_manage` accepts one operation at a time (not Hermes' atomic batch), and
-cron delivery adapters are not wired. These limitations must be closed before
-claiming full agent parity or adopting profiles that depend on them.
+Home Assistant uses the profile's `HASS_URL` / `HASS_TOKEN` (default URL:
+`http://homeassistant.local:8123`); redirects are refused and the service-call
+domains that can execute commands or issue arbitrary HTTP requests are blocked.
+`ha_call_service` requires approval. `terminal(background=true)` is explicitly
+rejected until process management is implemented; `skill_manage` has remaining
+staged-review/curator differences from Hermes, and cron delivery adapters are
+not wired. These limitations must be closed before claiming full agent parity
+or adopting profiles that depend on them.
 
 The CLJK turn API accepts prior user/assistant history and per-request
 instructions, in addition to the current prompt. Tool rows remain scoped to the
