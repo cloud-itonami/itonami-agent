@@ -111,7 +111,7 @@ async function oauthHeaders() {
       throw new Error("OAuth token endpoint authentication method is unsupported");
     }
 
-    const response = await fetch(endpoint, { method: "POST", headers, body: form });
+    const response = await fetch(endpoint, { method: "POST", headers, body: form, redirect: "manual" });
     if (!response.ok) throw new Error(`OAuth token refresh failed: HTTP ${response.status}`);
     const replacement = await response.json();
     if (typeof replacement.access_token !== "string" || !replacement.access_token || !(Number(replacement.expires_in) > 0)) {
