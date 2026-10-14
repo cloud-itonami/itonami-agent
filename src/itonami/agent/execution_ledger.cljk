@@ -1,0 +1,118 @@
+(ns itonami.agent.execution-ledger
+  "Hermes cron/executions.db persistence for Kotoba-owned cron runs."
+  (:require [itonami.agent.host :as h]
+            ["node:sqlite" :as sqlite]))
+
+(defonce ^:private process-id (str (h/random-hex 16)))
+(def ^:private max-terminal-executions 1000)
+
+(defn db-path [home]
+  (h/join home "cron" "executions.db"))
+
+(defn- open-db [home]
+  (let [f (db-path home)]
+    (h/mkdirs (h/dirname f))
+    (let [db (sqlite/DatabaseSync. f)]
+      (.exec db "PRAGMA journal_mode=WAL")
+      (.exec db "PRAGMA synchronous=FULL")
+      (.exec db "BEGIN IMMEDIATE")
+      (try
+      (.exec db "CREATE TABLE IF NOT EXISTS executions (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        process_id TEXT NOT NULL,
+        pid INTEGER NOT NULL,
+        process_started_at INTEGER,
+        status TEXT NOT NULL CHECK(status IN ('claimed','running','completed','failed','unknown')),
+        handoff_pending INTEGER NOT NULL DEFAULT 0,
+        handoff_started_at REAL,
+        claimed_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        error TEXT,
+        delivery_outcome TEXT,
+        scheduled_instant TEXT
+      )")
+      (let [info (.all (.prepare db "PRAGMA table_info(executions)"))
+            columns (set (for [i (range (.-length info))]
+                           (aget (aget info i) "name")))]
+        (when-not (columns "handoff_pending")
+          (.exec db "ALTER TABLE executions ADD COLUMN handoff_pending INTEGER NOT NULL DEFAULT 0"))
+        (when-not (columns "handoff_started_at")
+          (.exec db "ALTER TABLE executions ADD COLUMN handoff_started_at REAL"))
+        (when-not (columns "delivery_outcome")
+          (.exec db "ALTER TABLE executions ADD COLUMN delivery_outcome TEXT"))
+        (when-not (columns "scheduled_instant")
+          (.exec db "ALTER TABLE executions ADD COLUMN scheduled_instant TEXT")))
+      (.exec db "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed ON executions(job_id, claimed_at DESC, id DESC)")
+      (.exec db "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed ON executions(status, claimed_at DESC, id DESC)")
+      (.exec db "CREATE INDEX IF NOT EXISTS idx_executions_occurrence ON executions(job_id, scheduled_instant) WHERE status='completed'")
+      (.exec db "COMMIT")
+      (catch :default e
+        (try (.exec db "ROLLBACK") (catch :default _ nil))
+        (.close db)
+        (throw e)))
+      db)))
+
+(defn- iso-now [] (h/iso-local (js/Date.) true))
+
+(defn claim!
+  "Persist a claimed attempt before executing its script or agent turn."
+  [home job source]
+  (let [db (open-db home)
+        id (h/random-hex 16)
+        stmt (.prepare db "INSERT INTO executions
+          (id,job_id,source,process_id,pid,status,claimed_at)
+          VALUES (?,?,?,?,?,'claimed',?)")]
+    (try
+      (.run stmt id (str (get job "id")) (str source) process-id (.-pid js/process) (iso-now))
+      id
+      (finally (.close db)))))
+
+(defn mark-running!
+  "Transition an owned claimed attempt to running exactly once."
+  [home id]
+  (let [db (open-db home)]
+    (try
+      (let [r (.run (.prepare db "UPDATE executions SET status='running',started_at=?
+        WHERE id=? AND status='claimed' AND process_id=? AND pid=?")
+                    (iso-now) id process-id (.-pid js/process))]
+        (= 1 (.-changes r)))
+      (finally (.close db)))))
+
+(defn finish!
+  "Write an owned terminal result once. Error details are omitted from the
+  compatibility table so secrets in provider or script errors are not persisted."
+  [home id success? delivery-outcome]
+  (let [db (open-db home)
+        status (if success? "completed" "failed")]
+    (try
+      (let [r (.run (.prepare db "UPDATE executions
+        SET status=?,finished_at=?,error=?,handoff_pending=0,handoff_started_at=NULL,delivery_outcome=?
+        WHERE id=? AND status IN ('claimed','running') AND process_id=? AND pid=?")
+                    status (iso-now) (when-not success? "execution failed") delivery-outcome
+                    id process-id (.-pid js/process))]
+        (when (= 1 (.-changes r))
+          (.run (.prepare db "DELETE FROM executions WHERE id IN (
+            SELECT id FROM executions WHERE status IN ('completed','failed','unknown')
+            ORDER BY finished_at DESC,claimed_at DESC,id DESC LIMIT -1 OFFSET ?)")
+                max-terminal-executions))
+        (= 1 (.-changes r)))
+      (finally (.close db)))))
+
+(defn rows [home job-id]
+  "Read-only helper used by cron status and tests."
+  (let [db (open-db home)]
+    (try
+      (let [stmt (.prepare db (if job-id
+                                "SELECT * FROM executions WHERE job_id=? ORDER BY claimed_at DESC,id DESC"
+                                "SELECT * FROM executions ORDER BY claimed_at DESC,id DESC"))
+            result (if job-id (.all stmt job-id) (.all stmt))
+            fields ["id" "job_id" "source" "process_id" "pid" "process_started_at"
+                    "status" "handoff_pending" "handoff_started_at" "claimed_at"
+                    "started_at" "finished_at" "error" "delivery_outcome" "scheduled_instant"]]
+        (vec (for [i (range (.-length result))
+                   :let [row (aget result i)]]
+               (into {} (map (fn [field] [field (aget row field)]) fields)))))
+      (finally (.close db)))))

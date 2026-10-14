@@ -7,12 +7,14 @@
             [itonami.agent.loop :as agent-loop]
             [itonami.agent.provider :as provider]
             [itonami.agent.cron :as cron]
+            [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.tools :as tools]
             [itonami.agent.confine :as confine]
             [itonami.agent.webguard :as webguard]
             [promesa.core :as p]
-            ["node:child_process" :as cp]))
+            ["node:child_process" :as cp]
+            ["node:sqlite" :as sqlite]))
 
 (deftest yaml-hermes-subset
   (let [y (yaml/parse "
@@ -89,6 +91,37 @@ plain: true
     (is (= 1 (.getDay (cron/next-cron "0 9 * * mon" d))))
     (is (= {"kind" "interval" "minutes" 30 "display" "every 30m"} (cron/parse-schedule "30m")))
     (is (= "cron" (get (cron/parse-schedule "0 9 * * 1-5") "kind")))))
+
+(deftest cron-execution-ledger-hermes-schema
+  (let [home (h/join (h/tmp-dir) (str "test-cron-execution-ledger-" (.-pid js/process)))
+        db-path (execution-ledger/db-path home)
+        job {"id" "ledger-test"}
+        cleaned (h/rm home)
+        legacy-created (do
+            (h/mkdirs (h/dirname db-path))
+            (let [db (sqlite/DatabaseSync. db-path)]
+              (.exec db "CREATE TABLE executions (
+                id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+                process_id TEXT NOT NULL, pid INTEGER NOT NULL, process_started_at INTEGER,
+                status TEXT NOT NULL, claimed_at TEXT NOT NULL, started_at TEXT,
+                finished_at TEXT, error TEXT)")
+              (.close db)))
+        id (execution-ledger/claim! home job "direct")]
+    (try
+      (is (execution-ledger/mark-running! home id))
+      (is (execution-ledger/finish! home id false "not_configured"))
+      (let [row (first (execution-ledger/rows home "ledger-test"))]
+        (is (= id (get row "id")))
+        (is (= "direct" (get row "source")))
+        (is (= "failed" (get row "status")))
+        (is (= "not_configured" (get row "delivery_outcome")))
+        (is (= "execution failed" (get row "error")))
+        (is (string? (get row "claimed_at")))
+        (is (string? (get row "started_at")))
+        (is (string? (get row "finished_at"))))
+      (is (not (execution-ledger/finish! home id true "delivered"))
+          "terminal attempts cannot be rewritten")
+      (finally (h/rm home)))))
 
 (deftest cron-script-command-by-extension
   (testing "Hy uses the selected Python and enters Hy's CLI with script-local imports"

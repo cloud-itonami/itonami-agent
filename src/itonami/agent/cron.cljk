@@ -8,7 +8,8 @@
     output/     the run document, newest 50 kept
     ticker_heartbeat / ticker_last_success (epoch float)
     usage_audit.jsonl
-  What it does NOT write: executions.db / incidents (SQLite, Hermes-owned).
+  It writes claimed/running/terminal rows to Hermes' cron/executions.db.
+  Incident deduplication and ack/alert lifecycle remain unimplemented.
   Its own run log is cron/itonami-runs.jsonl.
 
   Exactly one scheduler ticks a profile: itonami.edn :runtime :scheduler
@@ -19,6 +20,7 @@
             [itonami.agent.host :as h]
             [itonami.agent.profile :as profile]
             [itonami.agent.loop :as agent-loop]
+            [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.webguard :as webguard]))
 
 (defn cron-hint [job]
@@ -150,7 +152,7 @@
 
       natural (do (parse-cron natural) {"kind" "cron" "expr" natural "display" s})
 
-      (and every? duration)
+      duration
       {"kind" "interval" "minutes" duration "display" (str "every " duration "m")}
 
       (= 5 (count (str/split s #"\s+")))
@@ -613,10 +615,29 @@
   executor: (fn [prof prompt opts]) -> promise of a loop result.
   Resolves to {:status ok|error|silent :output-file f :result r}."
   [prof job opts]
-  (p/let [monitor (monitor-outcome prof job)]
-    (run-job-core prof job opts monitor)))
+  (let [home (:home prof)
+        source (if (:manual? opts) "direct" "itonami")
+        execution-id (execution-ledger/claim! home job source)]
+    (if-not (execution-ledger/mark-running! home execution-id)
+      (do
+        (execution-ledger/finish! home execution-id false "not_configured")
+        (p/rejected (ex-info "Cron execution claim could not transition to running"
+                             {:execution-id execution-id :job-id (get job "id")})))
+      (-> (p/let [monitor (monitor-outcome prof job)
+                  result (run-job-core prof job (assoc opts :execution-id execution-id) monitor)]
+            (let [success? (not= "error" (:status result))
+                  outcome (cond
+                            (= "silent" (:status result)) "suppressed"
+                            (:delivery-error result) "failed"
+                            (= "local" (str/lower-case (delivery-lane job (= "error" (:status result))))) "not_configured"
+                            :else "delivered")]
+              (execution-ledger/finish! home execution-id success? outcome)
+              (assoc result :execution-id execution-id)))
+          (p/catch (fn [e]
+                     (execution-ledger/finish! home execution-id false "not_configured")
+                     (p/rejected e)))))))
 
-(defn- run-job-core [prof job {:keys [executor manual? delivery-fn]} monitor]
+(defn- run-job-core [prof job {:keys [executor manual? delivery-fn execution-id]} monitor]
   (let [home (:home prof)
         started (js/Date.)
         executor (or executor (fn [prof prompt opts]
@@ -674,7 +695,7 @@
                                     "engine" "itonami-agent"}) "\n")
                   {:append? true})
           (h/spit (h/join home "cron" "itonami-runs.jsonl")
-                  (str (h/json-str {"ts" (h/iso-local finished true) "job_id" (get job "id") "manual" (boolean manual?)
+                  (str (h/json-str {"ts" (h/iso-local finished true) "job_id" (get job "id") "execution_id" execution-id "manual" (boolean manual?)
                                     "status" (cond failed? "error" delivery-error "delivery_failed" silent? "silent" :else "ok")
                                     "exit_reason" (:exit-reason r) "turns" (:turns r) "provider" (:provider r) "model" (:model r)
                                     "peer" (:peer r) "receipt" (:receipt r) "placement" (:placement r)

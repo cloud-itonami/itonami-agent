@@ -32,6 +32,7 @@
             [itonami.agent.loop :as agent-loop]
             [itonami.agent.tools :as tools]
             [itonami.agent.cron :as cron]
+            [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.rails :as rails]
             [itonami.agent.provider :as provider]
@@ -250,11 +251,16 @@
 
       ("runs" "history")
       (let [f (h/join home "cron" "itonami-runs.jsonl")
-            rows (if (h/file? f) (map h/json-parse (remove str/blank? (str/split-lines (h/slurp f)))) [])]
-        (doseq [r (take-last (js/parseInt (or (:limit opts) "20") 10) rows)]
-          (println (str (.padEnd (str (get r "status")) 9) "  job=" (get r "job_id") "  " (get r "ts")
-                        "  " (get r "provider") "/" (get r "model")
-                        (when (get r "peer") (str "  peer=" (get r "peer")))))))
+            details (if (h/file? f) (map h/json-parse (remove str/blank? (str/split-lines (h/slurp f)))) [])
+            details-by-id (into {} (keep (fn [r] (when-let [id (get r "execution_id")] [id r])) details))
+            rows (execution-ledger/rows home nil)]
+        (doseq [r (take-last (js/parseInt (or (:limit opts) "20") 10) rows)
+                :let [detail (details-by-id (get r "id"))]]
+          (println (str (.padEnd (str (get r "status")) 9) "  job=" (get r "job_id") "  " (get r "claimed_at")
+                        "  id=" (get r "id") "  source=" (get r "source")
+                        (when (get r "delivery_outcome") (str "  delivery=" (get r "delivery_outcome")))
+                        (when detail (str "  " (get detail "provider") "/" (get detail "model")))
+                        (when (and detail (get detail "peer") (str "  peer=" (get detail "peer"))))))))
 
       "status"
       (let [hb (h/join home "cron" "ticker_heartbeat")]
