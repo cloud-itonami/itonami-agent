@@ -84,11 +84,15 @@ Exactly one scheduler ticks a profile:
 
 Hy cron scripts use the first configured interpreter among the job's
 `interpreter`, `cron.script_python`, `ITONAMI_PYTHON`, `HERMES_PYTHON`, then
-`python3`. That interpreter must provide `hy` (the fleet target is Hy 1.3.1).
+`python3`. The fleet target is Hy 1.3.1, supported on Python 3.9 through 3.15.
 The dispatcher inserts the script directory into `sys.path` and preserves
 arguments after the script path, matching the `.py` job contract. When launched
-by Kotoba Gateway, the scheduler also supplies its vendored Hy dependency via
-`KOTOBA_HY_DEPS`; direct CLI runs still require Hy in the selected interpreter.
+by Kotoba Gateway, the scheduler uses `KOTOBA_HY_DEPS` when configured; otherwise
+it discovers Hy and `funcparserlib` in the main environments under
+`ITONAMI_HERMES_ROOT/installs` and adds those site-packages to the selected
+Python's import path. It does not download or copy packages. Direct CLI runs
+still require Hy in the selected interpreter or an explicit `KOTOBA_HY_DEPS`
+path (multiple paths may be separated with the platform path separator).
 
 ## Peer-to-peer execution
 

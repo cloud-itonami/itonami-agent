@@ -357,11 +357,44 @@
 (def hy-script-bootstrap
   "Run a Hy script with its selected Python, preserving script-local imports and argv."
   (str "import os, sys; deps = os.environ.get('KOTOBA_HY_DEPS'); "
-       "sys.path.insert(0, deps) if deps and os.path.isdir(deps) else None; "
+       "sys.path[:0] = [p for p in (deps or '').split(os.pathsep) if p and os.path.isdir(p)]; "
        "script = sys.argv[1]; "
        "sys.path.insert(0, os.path.dirname(os.path.abspath(script))); "
        "sys.argv = ['hy', script, *sys.argv[2:]]; "
        "from hy.cmdline import hy_main; hy_main()"))
+
+(defonce ^:private hy-deps-cache (atom {}))
+
+(defn- hy-dependencies
+  "Resolve Hy from the gateway environment or installed Hermes Python envs.
+  The dependency stays in the Hermes-managed install; no package is downloaded
+  or copied into a profile."
+  [prof]
+  (let [configured (or (get (:env prof) "KOTOBA_HY_DEPS")
+                       (h/env "KOTOBA_HY_DEPS"))
+        home (:home prof)
+        hermes-root (or (some-> (h/env "ITONAMI_HERMES_ROOT") h/expand)
+                        (when (and home (str/includes? home "/.hermes/profiles/"))
+                          (h/dirname (h/dirname home))))]
+    (or (not-empty configured)
+        (when hermes-root
+          (let [installs (h/join hermes-root "installs")
+                cached (get @hy-deps-cache installs ::missing)]
+            (if (not= cached ::missing)
+              cached
+              (let [candidates
+                    (for [install (h/ls installs)
+                          environment (h/ls (h/join installs install "environments"))
+                          py-version (h/ls (h/join installs install "environments" environment "venv" "lib"))
+                          :let [site-packages (h/join installs install "environments" environment
+                                                     "venv" "lib" py-version "site-packages")]
+                          :when (and (h/file? (h/join site-packages "hy" "__init__.py"))
+                                     (h/file? (h/join site-packages "funcparserlib" "__init__.py")))]
+                      site-packages)
+                    resolved (when (seq candidates)
+                               (str/join (if (= "win32" (.-platform js/process)) ";" ":") candidates))]
+                (when resolved (swap! hy-deps-cache assoc installs resolved))
+                resolved)))))))
 
 (defn script-command
   "Choose the runner from the script extension. Hy uses the job interpreter,
@@ -410,9 +443,12 @@
       (not (script-path-safe? scripts rel)) [false (str "unsafe script path; expected a regular file below scripts/: " rel)]
       (not (contains? available rel)) [false (str "script not found in profile scripts/: " rel)]
       :else
-      (let [r (h/run-process (script-command prof job abs)
+      (let [deps (when (re-find #"\.hy$" (str/lower-case (str rel)))
+                   (hy-dependencies prof))
+            r (h/run-process (script-command prof job abs)
                              {:cwd (or (some-> (get job "workdir") h/expand) scripts)
-                              :env (assoc env "HERMES_HOME" home "ITONAMI_PROFILE_HOME" home)
+                              :env (cond-> (assoc env "HERMES_HOME" home "ITONAMI_PROFILE_HOME" home)
+                                     deps (assoc "KOTOBA_HY_DEPS" deps))
                               :timeout-ms (* 1000 (or (get-in config ["cron" "script_timeout_seconds"])
                                                       (some-> (h/env "HERMES_CRON_SCRIPT_TIMEOUT") js/parseInt)
                                                       3600))})]
