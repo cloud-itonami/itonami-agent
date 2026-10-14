@@ -83,6 +83,11 @@ Exactly one scheduler ticks a profile:
   `gateway run` then ticks it. `profile adopt --all --dry-run` previews a
   fleet-wide ownership change. Fleet adoption refuses the whole operation if
   any profile fails the Kotoba readiness check.
+- `profile adopt --ready-only [--dry-run]` adopts every currently ready profile
+  and reports blocked profiles individually. This supports staged fleet
+  migration while preserving the all-or-nothing behavior of `--all`. Profiles
+  owned by a scheduler other than Hermes or Kotoba are refused until that
+  scheduler is explicitly retired.
 - `profile release <p>` reverses both. `profile release --all --dry-run`
   previews a fleet rollback; `profile release --all` applies it.
 - `profile refresh-bundle <p>` recomputes the CID after files change without

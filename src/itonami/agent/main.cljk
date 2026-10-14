@@ -14,7 +14,7 @@
   itonami layer:
     itonami-agent profile itonamify <p>|--all [--dry-run]   write itonami.edn (additive)
     itonami-agent profile readiness <p>|--all              audit Kotoba cron compatibility
-    itonami-agent profile adopt <p>|--all [--dry-run]       itonami ticks selected cron; Hermes stops
+    itonami-agent profile adopt <p>|--all|--ready-only [--dry-run] itonami ticks selected cron; Hermes stops
     itonami-agent profile hy-stage <p>|--all <artifact-dir> [--dry-run] copy verified sibling .hy sources into profile scripts/
     itonami-agent profile hy-migrate <p>|--all [--dry-run]  switch eligible Kotoba-owned script refs to sibling .hy files
     itonami-agent profile release <p>|--all [--dry-run]     hand selected cron back to Hermes
@@ -622,12 +622,16 @@
                     "converted; " @skipped " profile(s) skipped")))
 
     "adopt"
-    (let [targets (if (:all opts) (profile/names) [(first args)])
+    (let [targets (if (or (:all opts) (:ready-only opts)) (profile/names) [(first args)])
           entries (mapv (fn [n]
                           (try
                             (let [prof (profile/load-profile n {:secrets? false})
-                                  m (or (:itonami prof) (profile/default-manifest prof))]
+                                  m (or (:itonami prof) (profile/default-manifest prof))
+                                  scheduler (or (get-in m [:runtime :scheduler]) :hermes)]
                               {:name n :profile prof :manifest m
+                               :error (when-not (contains? #{:hermes :itonami} scheduler)
+                                        (str "scheduler " (name scheduler)
+                                             " must be retired before Kotoba adoption"))
                                :already? (and (= :itonami (get-in m [:runtime :scheduler]))
                                               (h/file? (h/join (:home prof) "gateway.parked")))
                                :issues (profile-readiness-issues prof)})
