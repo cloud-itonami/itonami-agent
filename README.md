@@ -74,6 +74,14 @@ is an index, not authority: `:authority` only points at `yakuwari.edn`.
   `yakuwari.edn` when the profile has one.
 - `itonamify --refresh` keeps the declared runtime, placement, rails,
   terminal/web policy and organisation keys.
+- `profile did <p>|--all [--registry F] [--out F]` prints each profile's
+  did:key (`itonami.agent.identity`). The ed25519 key is derived, never
+  stored: HKDF-SHA256 over one fleet seed held in kagi
+  (`shared/hermes-profile-did-seed`), with info `<profile-id>/<epoch>`; the
+  registry's `:did/epoch` (default 0) rotates one profile. The seed comes
+  from `ITONAMI_PROFILE_DID_SEED` for that one command, filled in a human
+  session; without it the command refuses. `profile organize` projects the
+  registry's `:did` into `:ids :did`.
 - `profile soul <p>|--all --registry F --worlds F [--unit U] [--dry-run]`
   renders the generated SOUL blocks (`itonami.agent.soul`): **world** (the
   `:soul` lines of every world on the profile's `:org/path`, then

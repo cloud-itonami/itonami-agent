@@ -1,0 +1,58 @@
+(ns itonami.agent.identity
+  "Per-profile DIDs (owner decision D7, com-junkawasaki/root ADR-2610141512).
+
+  Every Hermes profile has its own did:key. Its ed25519 key is stored
+  nowhere: it is derived when needed from one fleet seed that lives in kagi
+  (the authority for bot secrets, ADR-2609241900):
+
+    key = HKDF-SHA256(ikm  = seed,
+                      salt = \"itonami.profile-did.v1\",
+                      info = \"<profile-id>/<epoch>\",  32 bytes)
+
+  so the agent registry can publish every profile's DID while one secret
+  exists. One profile's key is rotated by raising its epoch in the registry;
+  replacing the seed changes every DID. Nothing here prints the seed or a
+  private key: callers get the DID, and a private key object only to sign."
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]
+            [itonami.agent.p2p :as p2p]
+            ["node:crypto" :as crypto]))
+
+(def salt "itonami.profile-did.v1")
+
+(def seed-env
+  "The environment variable a human session fills from kagi
+  (item shared/hermes-profile-did-seed) for the one command that needs it."
+  "ITONAMI_PROFILE_DID_SEED")
+
+(def ^:private pkcs8-ed25519-prefix (js/Buffer.from "302e020100300506032b657004220420" "hex"))
+
+(defn parse-seed
+  "A 32-byte seed from 64 hex characters, or nil."
+  [s]
+  (when (and (string? s) (re-matches #"^[0-9a-fA-F]{64}$" (str/trim s)))
+    (js/Buffer.from (str/trim s) "hex")))
+
+(defn seed-from-env [] (parse-seed (h/env seed-env)))
+
+(defn- valid-epoch? [e] (and (int? e) (not (neg? e))))
+
+(defn derive-key
+  "{:did :epoch :private} for a profile. `seed` is a 32-byte Buffer."
+  [seed profile-id epoch]
+  (when-not (= 32 (some-> seed .-length))
+    (throw (ex-info "profile DID seed must be 32 bytes" {:itonami/error :bad-seed})))
+  (when-not (valid-epoch? epoch)
+    (throw (ex-info "epoch must be a non-negative integer" {:itonami/error :bad-epoch :epoch epoch})))
+  (let [okm (js/Buffer.from (crypto/hkdfSync "sha256" seed salt (str profile-id "/" epoch) 32))
+        private (crypto/createPrivateKey #js {:key (js/Buffer.concat #js [pkcs8-ed25519-prefix okm])
+                                              :format "der" :type "pkcs8"})
+        spki (.export (crypto/createPublicKey private) #js {:type "spki" :format "der"})]
+    {:did (p2p/pub->did (.subarray spki (- (.-length spki) 32)))
+     :epoch epoch
+     :private private}))
+
+(defn did-of
+  "Just the DID — what the registry publishes."
+  [seed profile-id epoch]
+  (:did (derive-key seed profile-id epoch)))
