@@ -358,6 +358,7 @@
   "Run a Hy script with its selected Python, preserving script-local imports and argv."
   (str "import os, sys; deps = os.environ.get('KOTOBA_HY_DEPS'); "
        "sys.path[:0] = [p for p in (deps or '').split(os.pathsep) if p and os.path.isdir(p)]; "
+       "sys.dont_write_bytecode = True; "
        "script = sys.argv[1]; "
        "sys.path.insert(0, os.path.dirname(os.path.abspath(script))); "
        "sys.argv = ['hy', script, *sys.argv[2:]]; "
