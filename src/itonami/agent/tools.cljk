@@ -132,6 +132,11 @@
                "target" {"type" "string" "enum" ["memory" "user"]}
                "content" {"type" "string"} "old_text" {"type" "string"} "new_text" {"type" "string"}}
               ["action"])
+   "execute_code"
+   (fn-schema "execute_code" "Run one Python script through this profile's OS confinement. This Kotoba implementation is stateless and does not provide Hermes tool RPC inside the script; use the normal Kotoba tools for tool calls."
+              {"code" {"type" "string" "description" "Python source to execute on stdin."}
+               "timeout" {"type" "integer" "minimum" 1 "maximum" 300 "description" "Maximum runtime in seconds (default 300)."}}
+              ["code"])
    "ha_list_entities"
    (fn-schema "ha_list_entities" "List Home Assistant entities, optionally filtered by domain or area."
               {"domain" {"type" "string"} "area" {"type" "string"}} [])
@@ -899,11 +904,49 @@
 (defn- ha-tool [name]
   (fn [ctx args] (homeassistant/call ctx name args)))
 
+(defn execute-code
+  "Run one Python source string on stdin under the same OS confinement,
+  sanitized environment, and write-root policy as terminal. Hermes' persistent
+  kernel and in-script `hermes_tools` RPC are not emulated here."
+  [ctx {:strs [code timeout]}]
+  (cond
+    (not (and (string? code) (not (str/blank? code))))
+    (err "execute_code requires non-empty Python source in `code`")
+
+    (and (:roots ctx) (not (writable? ctx (:cwd ctx))))
+    (err (str "execute_code refused: workdir outside this run's roots: " (:cwd ctx)))
+
+    :else
+    (let [pol (policy ctx)
+          c (confine/command pol {:argv ["python3" "-"]
+                                  :write-roots (or (:roots ctx) [(:cwd ctx)])
+                                  :read-roots (read-roots ctx)
+                                  :tool-env (:tool-env ctx)
+                                  :home (host-home ctx)
+                                  :backend (backend ctx)})]
+      (if-let [why (:refused c)]
+        (err (str "execute_code refused: " why))
+        (let [timeout-s (if (number? timeout) (max 1 (min 300 timeout)) 300)
+              r (try (h/run-process (:argv c) {:cwd (:cwd ctx) :exact-env? true :env (:env c)
+                                               :input code :timeout-ms (* 1000 timeout-s)})
+                     (finally (when (:tmpdir c) (h/rm (:tmpdir c)))))
+              output (str (:stdout r) (when-not (str/blank? (:stderr r))
+                                        (str "\n[stderr]\n" (:stderr r))))]
+          (confine/audit! {:tool "execute_code" :profile (:profile ctx) :peer? (:peer? pol)
+                           :sandbox (:sandbox c) :cmd "python3 -" :exit (:exit r)
+                           :stderr (:stderr r) :timed-out? (:timed-out? r)})
+          (ok {"output" (clip output 50000)
+               "exit_code" (:exit r)
+               "sandbox" (name (:sandbox c))
+               "error" (when (:timed-out? r) "timeout")
+               "persistent" false
+               "tool_rpc" false}))))))
+
 (def impls
   {"terminal" terminal "process_manage" process/manage "read_file" read-file "write_file" write-file "patch" patch
    "search_files" search-files "web_extract" web-extract "web_search" web-search
    "skills_list" skills-list "skill_view" skill-view "skill_manage" skill-manage
-   "todo_list" todo-list "memory" memory
+   "todo_list" todo-list "memory" memory "execute_code" execute-code
    "ha_list_entities" (ha-tool "ha_list_entities")
    "ha_get_state" (ha-tool "ha_get_state")
    "ha_list_services" (ha-tool "ha_list_services")
