@@ -9,7 +9,8 @@
     ticker_heartbeat / ticker_last_success (epoch float)
     usage_audit.jsonl
   It writes claimed/running/terminal rows to Hermes' cron/executions.db.
-  Incident deduplication and ack/alert lifecycle remain unimplemented.
+  It groups failures in cron_incidents, resolves them after a successful run,
+  supports operator ack, and records delivery outcomes; repeat-alert gating is not wired yet.
   Its own run log is cron/itonami-runs.jsonl.
 
   Exactly one scheduler ticks a profile: itonami.edn :runtime :scheduler
@@ -626,14 +627,23 @@
       (-> (p/let [monitor (monitor-outcome prof job)
                   result (run-job-core prof job (assoc opts :execution-id execution-id) monitor)]
             (let [success? (not= "error" (:status result))
+                  error (or (get-in result [:result :error :error])
+                            (get-in result [:result :exit-reason])
+                            "execution failed")
                   outcome (cond
                             (= "silent" (:status result)) "suppressed"
                             (:delivery-error result) "failed"
                             (= "local" (str/lower-case (delivery-lane job (= "error" (:status result))))) "not_configured"
                             :else "delivered")]
+              (if success?
+                (execution-ledger/resolve-incidents! home (get job "id"))
+                (let [incident (execution-ledger/upsert-incident! home (get job "id") error (:output-file result))]
+                  (when (and incident (contains? #{"delivered" "not_configured"} outcome))
+                    (execution-ledger/mark-incident-alerted! home (:id incident)))))
               (execution-ledger/finish! home execution-id success? outcome)
               (assoc result :execution-id execution-id)))
           (p/catch (fn [e]
+                     (execution-ledger/upsert-incident! home (get job "id") (.-message e) nil)
                      (execution-ledger/finish! home execution-id false "not_configured")
                      (p/rejected e)))))))
 

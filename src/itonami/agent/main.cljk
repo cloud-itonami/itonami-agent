@@ -8,6 +8,7 @@
     itonami-agent [-p P] cron list | create <schedule> [prompt] [--name n --script s --no-agent]
                               [--monitor-script s --monitor-url u --deliver d]
                               | run <id> | tick [--force] | runs [--limit n] | status
+                              | incidents [ack <id>]
     itonami-agent profile list | show <p>
 
   itonami layer:
@@ -261,6 +262,19 @@
                         (when (get r "delivery_outcome") (str "  delivery=" (get r "delivery_outcome")))
                         (when detail (str "  " (get detail "provider") "/" (get detail "model")))
                         (when (and detail (get detail "peer") (str "  peer=" (get detail "peer"))))))))
+
+      "incidents"
+      (let [[action incident-id] args]
+        (if (= action "ack")
+          (if (execution-ledger/ack-incident! home incident-id)
+            (println (str "closed incident " incident-id))
+            (die 2 (str "no such incident: " incident-id)))
+          (doseq [r (execution-ledger/incidents home)]
+            (println (str (.padEnd (str (get r "state")) 9)
+                          " job=" (get r "job_id")
+                          " type=" (get r "failure_type")
+                          " id=" (get r "id")
+                          " last=" (get r "last_seen_at"))))))
 
       "status"
       (let [hb (h/join home "cron" "ticker_heartbeat")]

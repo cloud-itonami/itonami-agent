@@ -137,6 +137,27 @@ plain: true
         (is (= "unknown" (get (first (execution-ledger/rows home "interrupted-job")) "status"))
             "a provably dead owner becomes unknown rather than silently retrying")
         (is (execution-ledger/finish! home next-id true "not_configured")))
+      (let [incident (execution-ledger/upsert-incident! home "ledger-test"
+                                                        "Provider timed out with api_key=topsecret123"
+                                                        "cron/output/ledger-test/report.md")
+            row (first (execution-ledger/incidents home))]
+        (is (= "timeout" (:failure-type incident)))
+        (is (= "detected" (get row "state")))
+        (is (= "execution failed" (get row "error")))
+        (is (not (str/includes? (get row "error") "topsecret123")))
+        (is (execution-ledger/mark-incident-alerted! home (:id incident)))
+        (execution-ledger/upsert-incident! home "ledger-test" "Provider timed out with api_key=topsecret123" nil)
+        (is (= "alerted" (get (first (execution-ledger/incidents home)) "state"))
+            "repeated failures preserve an alerted incident")
+        (is (execution-ledger/resolve-incidents! home "ledger-test"))
+        (is (= "resolved" (get (first (execution-ledger/incidents home)) "state")))
+        (execution-ledger/upsert-incident! home "ledger-test" " provider   timed out with api_key=topsecret123 " nil)
+        (is (= "detected" (get (first (execution-ledger/incidents home)) "state"))
+            "a resolved signature reopens")
+        (is (execution-ledger/ack-incident! home (:id incident)))
+        (execution-ledger/upsert-incident! home "ledger-test" "Provider timed out with api_key=topsecret123" nil)
+        (is (= "closed" (get (first (execution-ledger/incidents home)) "state"))
+            "an acknowledged signature stays closed"))
       (finally (h/rm home)))))
 
 (deftest cron-script-command-by-extension

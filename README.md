@@ -30,7 +30,8 @@ the two can be swapped per profile.
 | `usage_audit.jsonl`, `ticker_heartbeat`, `ticker_last_success` | written |
 | `-p`, `-z` (stdout = final text, exit 1 + `… -z: reason` on stderr), `-m`, `--provider`, `-t`, `cron list/create/run/tick/runs/status`, `profile list/show`, `chat` | same commands; `cron create` also accepts `--no-agent`, `--monitor-script`, and `--monitor-url` |
 | `cron/executions.db` | Kotoba writes Hermes-shaped claimed/running/completed/failed rows with ownership, timestamps, and delivery outcome. A later run marks attempts `unknown` only when the prior owner is provably gone; it does not retry them automatically. Handoff adoption is not implemented |
-| incidents, notepad, messaging gateway adapters, browser tools, MCP | **not implemented**; Kotoba also keeps its detailed local run log in `cron/itonami-runs.jsonl` |
+| `cron incidents` / `cron incidents ack <id>` | Kotoba groups failures by Hermes-compatible job/error signature, resolves them after success, and records acknowledgements and delivery outcomes. The delivery adapter and repeat-alert gate are not wired |
+| notepad, messaging gateway adapters, browser tools, MCP | **not implemented**; Kotoba also keeps its detailed local run log in `cron/itonami-runs.jsonl` |
 
 `delegate_task` is currently limited to up to three parallel foreground turns.
 Hermes background/list/steer/stop controls for agent turns, image inputs, and
