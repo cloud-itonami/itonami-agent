@@ -641,12 +641,18 @@ plain: true
       (is (= [] (mcp/names-for cfg ["terminal" "no_mcp"] [])))
       (is (= [] (mcp/names-for cfg ["terminal"] ["fixture"])))))
   (testing "stdio MCP schemas and tools/call use provider-safe names"
-    (let [cfg {"mcp_servers" {"fixture" {"command" "node" "args" ["test/mcp_stdio_fixture.mjs"]}}}
+    (let [cfg {"mcp_servers" {"fixture" {"command" "node" "args" ["test/mcp_stdio_fixture.mjs"]
+                                               "tools" {"include" ["e*"] "exclude" ["echo"]}}}}
           data (mcp/discover cfg (h/process-env) ["fixture"])
           schema (first (:schemas data))
-          result (mcp/call cfg (h/process-env) "fixture" "echo" {"text" "kotoba"})]
+          result (mcp/call cfg (h/process-env) "fixture" "echo" {"text" "kotoba"})
+          excluded (mcp/discover {"mcp_servers" {"fixture" {"command" "node"
+                                                            "args" ["test/mcp_stdio_fixture.mjs"]
+                                                            "tools" {"exclude" ["echo"]}}}}
+                                 (h/process-env) ["fixture"])]
       (is (= "mcp__fixture__echo" (get-in schema ["function" "name"])))
       (is (= ["fixture" "echo"] (get (:index data) "mcp__fixture__echo")))
+      (is (empty? (:schemas excluded)))
       (is (str/includes? result "kotoba"))))
   (testing "long names are bounded and stable"
     (let [n (mcp/tool-name "server-with-a-long-name" "tool-with-a-long-name-that-exceeds-provider-limits")]

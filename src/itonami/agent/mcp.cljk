@@ -97,6 +97,34 @@
       (not (vector? required)) (assoc "required" [])
       (vector? required) (assoc "required" (vec (filter #(contains? props %) required))))))
 
+(defn- filter-patterns [value]
+  (cond
+    (string? value) [value]
+    (sequential? value) (vec (filter string? value))
+    (set? value) (vec (filter string? value))
+    :else []))
+
+(defn- glob-match? [pattern name]
+  (let [special #{\. \+ \^ \$ \{ \} \( \) \| \[ \] \\}
+        regex (str "^" (apply str (map (fn [c]
+                                          (cond
+                                            (= c \*) ".*"
+                                            (= c \?) "."
+                                            (contains? special c) (str "\\" c)
+                                            :else (str c))) pattern)) "$")]
+    (boolean (re-matches (re-pattern regex) name))))
+
+(defn- tool-allowed? [spec name]
+  (let [raw (get spec "tools")
+        filters (if (map? raw) raw (if (nil? raw) {} {"include" raw}))
+        has-include (contains? filters "include")
+        include (filter-patterns (get filters "include"))
+        exclude (filter-patterns (get filters "exclude"))
+        matches (fn [patterns] (some #(glob-match? % name) patterns))]
+    (if has-include
+      (boolean (matches include))
+      (not (boolean (matches exclude))))))
+
 (defn discover [config env servers]
   "Discover schemas and dispatch metadata from selected stdio servers."
   (let [errors (atom [])
@@ -108,13 +136,12 @@
                      []
                      (if (get spec "url")
                        (do (swap! errors conj {"server" server "error" "remote MCP transport is not supported yet"}) [])
-                       (let [result (exchange spec env "tools/list" {})
-                             allow (set (get spec "tools" []))]
+                       (let [result (exchange spec env "tools/list" {})]
                          (if-let [error (:error result)]
                            (do (swap! errors conj {"server" server "error" error}) [])
                            (for [tool (get result "tools" [])
                                  :let [raw (get tool "name")]
-                                 :when (and raw (or (empty? allow) (contains? allow raw)))]
+                                 :when (and raw (tool-allowed? spec raw))]
                              [(tool-name server raw)
                               {"type" "function"
                                "function" {"name" (tool-name server raw)
