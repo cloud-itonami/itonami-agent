@@ -16,9 +16,10 @@
   (:require [clojure.string :as str]
             [cljs.reader :as reader]
             [itonami.agent.host :as h]
+            [itonami.agent.manifest :as manifest]
             [itonami.agent.yaml :as yaml]))
 
-(def manifest-schema "cloud.itonami.profile.v1")
+(def manifest-schema manifest/schema-v2)
 
 (defn hermes-root []
   (h/expand (or (h/env "ITONAMI_HERMES_ROOT") "~/.hermes")))
@@ -237,16 +238,56 @@
 
 (defn write-manifest! [home m]
   (h/spit-atomic (h/join home "itonami.edn")
-                 (str ";; itonami profile (" manifest-schema "). Additive to the Hermes layout:\n"
+                 (str ";; itonami profile (" (:itonami/schema m manifest-schema) "). Additive to the Hermes layout:\n"
                       ";; Hermes ignores this file; removing it returns the profile to plain Hermes.\n"
                       (pr-str m) "\n")))
+
+(defn with-bundle
+  "The manifest with its bundle CID and file count recomputed from the
+  profile's current SOUL, config, jobs, scripts and declared skills/dirs."
+  [home m]
+  (let [files (bundle-files home (select-keys (:bundle m) [:skills :dirs]))]
+    (assoc m :bundle (merge (:bundle m) {:cid (bundle-cid files) :files (count files)}))))
 
 (defn refresh-bundle-cid
   "Recompute the bundle CID of an itonami profile (after its SOUL, config,
   jobs or scripts changed) and write it back. Returns the manifest."
   [home]
-  (let [m (read-edn-file (h/join home "itonami.edn"))
-        files (bundle-files home (select-keys (:bundle m) [:skills :dirs]))
-        m (assoc m :bundle (merge (:bundle m) {:cid (bundle-cid files) :files (count files)}))]
+  (let [m (with-bundle home (read-edn-file (h/join home "itonami.edn")))]
     (write-manifest! home m)
     m))
+
+(def soul-blocks
+  "Managed SOUL blocks every itonami profile is expected to carry."
+  {:workspace-locations "<!-- managed-agent-workspace-locations -->"
+   :reward-contract "<!-- itonami:reward-contract:v1 -->"})
+
+(defn check
+  "What `profile check` reports for one loaded profile: manifest problems
+  (`manifest/validate`, plus an id that is not the directory's) and drift
+  between the manifest and the files it describes — a stale bundle CID, a
+  config provider other than the declared rail, a missing managed SOUL
+  block. Reads the profile's files; writes nothing."
+  [p]
+  (let [m (:itonami p)]
+    (if-not m
+      {:profile (:name p) :problems [{:level :warn :path [] :message "no itonami.edn"}] :drift []}
+      (let [recorded (get-in m [:bundle :cid])
+            actual (get-in (with-bundle (:home p) m) [:bundle :cid])
+            rail (get-in m [:placement :inference-rail])
+            provider (get-in p [:config "model" "provider"])
+            soul (or (:soul p) "")]
+        {:profile (:name p)
+         :problems (cond-> (manifest/validate m)
+                     (not= (:name p) (:profile/id m))
+                     (conj {:level :error :path [:profile/id]
+                            :message (str (pr-str (:profile/id m)) " but the directory is " (:name p))}))
+         :drift (cond-> []
+                  (not= recorded actual)
+                  (conj {:drift :bundle-cid :recorded recorded :actual actual})
+                  (and (keyword? rail) (not= :itonami-p2p rail) (not= (name rail) provider))
+                  (conj {:drift :config-provider :declared rail :config provider})
+                  (not (str/includes? soul (:workspace-locations soul-blocks)))
+                  (conj {:drift :soul-block :missing :workspace-locations})
+                  (not (str/includes? soul (:reward-contract soul-blocks)))
+                  (conj {:drift :soul-block :missing :reward-contract}))}))))
