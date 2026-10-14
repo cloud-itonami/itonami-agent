@@ -186,6 +186,20 @@ plain: true
         (is (= #{[:profile/id]} (set (map :path (:problems r)))) "the id must be the directory's name")
         (is (= #{:workspace-locations :reward-contract} (set (keep :missing (:drift r)))))))))
 
+(deftest refresh-recopies-capabilities
+  (let [home (h/join (h/tmp-dir) (str "itonami-refresh-" (h/random-hex 4)) "p")]
+    (h/mkdirs home)
+    (h/spit (h/join home "SOUL.md") "hi\n")
+    (let [m (profile/with-bundle home v1-manifest)]
+      (is (= m (profile/with-derived home m)) "no yakuwari.edn: capabilities left as they are")
+      (h/spit (h/join home "yakuwari.edn")
+              "{:yakuwari/id :p :yakuwari/capabilities [{:capability :p.read :decision :autonomous :note \"n\"} {:capability :p.deploy :decision :approval-required}]}")
+      (let [m' (profile/with-derived home m)]
+        (is (= [{:capability :p.read :decision :autonomous :note "n"} {:capability :p.deploy :decision :approval-required}]
+               (:capabilities m')) "a verbatim copy of yakuwari.edn")
+        (is (= (:bundle m) (:bundle m')) "yakuwari.edn is outside the bundle")
+        (is (= m' (profile/with-derived home m')) "idempotent")))))
+
 (deftest cron-next-fire
   (let [d (js/Date. 2026 9 7 13 0 0)]                      ; 2026-10-07 13:00 local
     (is (= [2026 9 7 17 30] ((juxt #(.getFullYear %) #(.getMonth %) #(.getDate %) #(.getHours %) #(.getMinutes %))
