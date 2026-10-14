@@ -148,6 +148,8 @@ plain: true
     (is (= {:default-decision :approval-required :source :yakuwari :ref "yakuwari.edn"} (:authority v2)))
     (is (= {:default-decision :approval-required}
            (:authority (manifest/with-org v1-manifest entry {:yakuwari? false}))) "no yakuwari.edn: ask only")
+    (is (= v2 (manifest/with-org v1-manifest (-> entry (dissoc :yakuwari) (assoc :yakuwari/id "p")) {:yakuwari? true}))
+        "the registry's flat :yakuwari/id and the draft's nested one project the same manifest")
     (is (= v2 (manifest/with-org v2 entry {:yakuwari? true})) "idempotent")
     (is (= (dissoc v1-manifest :itonami/schema) (apply dissoc v2 :itonami/schema manifest/org-keys))
         "keys outside the organisation are untouched")
