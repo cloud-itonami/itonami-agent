@@ -18,7 +18,8 @@
             [itonami.agent.webguard :as webguard]
             [itonami.agent.process :as process]
             [itonami.agent.homeassistant :as homeassistant]
-            [itonami.agent.yaml :as yaml]))
+            [itonami.agent.yaml :as yaml]
+            ["node:sqlite" :as sqlite]))
 
 (defn- fn-schema [name desc props required]
   {"type" "function"
@@ -137,6 +138,15 @@
               {"code" {"type" "string" "description" "Python source to execute on stdin."}
                "timeout" {"type" "integer" "minimum" 1 "maximum" 300 "description" "Maximum runtime in seconds (default 300)."}}
               ["code"])
+   "session_search"
+   (fn-schema "session_search" "Search and read this profile's local Hermes conversation history. Supports recent-session browsing, FTS discovery, reading the latest messages in a session, and scrolling around a message id. It is read-only and never searches another profile."
+              {"query" {"type" "string" "description" "Full-text search query; omit to browse recent sessions."}
+               "limit" {"type" "integer" "minimum" 1 "maximum" 20 "description" "Maximum sessions or matching messages (default 5)."}
+               "session_id" {"type" "string" "description" "Read one session from this profile's history."}
+               "around_message_id" {"type" "integer" "description" "Return a bounded window around this message id; requires session_id."}
+               "window" {"type" "integer" "minimum" 1 "maximum" 20 "description" "Messages on each side of the anchor (default 5)."}
+               "role_filter" {"type" "string" "enum" ["user,assistant" "user,assistant,tool" "user" "assistant" "tool"]}}
+              [])
    "ha_list_entities"
    (fn-schema "ha_list_entities" "List Home Assistant entities, optionally filtered by domain or area."
               {"domain" {"type" "string"} "area" {"type" "string"}} [])
@@ -901,6 +911,83 @@
       (do (h/spit f (str/join "\n§\n" entries'))
           (ok {"entries" (count entries')})))))
 
+(defn- sqlite-records [db sql & params]
+  (let [stmt (.prepare db sql)]
+    (js->clj (js/Reflect.apply (.-all stmt) stmt (clj->js params)))))
+
+(defn session-search
+  "Read-only local-profile history search. Cross-profile lookup and Hermes' adaptive detail mode are intentionally unavailable."
+  [ctx {:strs [query limit session_id around_message_id window role_filter]}]
+  (let [db-path (h/join (:home ctx) "state.db")
+        limit (if (number? limit) (max 1 (min 20 (int limit))) 5)
+        window (if (number? window) (max 1 (min 20 (int window))) 5)
+        role-filter (or role_filter "user,assistant")
+        roles (case role-filter
+                "user,assistant" ["user" "assistant"]
+                "user,assistant,tool" ["user" "assistant" "tool"]
+                "user" ["user"]
+                "assistant" ["assistant"]
+                "tool" ["tool"]
+                nil)]
+    (cond
+      (not roles) (err "session_search role_filter must be one of the advertised values")
+      (and around_message_id (not session_id)) (err "session_search around_message_id requires session_id")
+      (not (h/file? db-path)) (err "session_search requires this profile's state.db")
+      (not (readable? ctx "session_search" db-path)) (err "session_search denied by this run's read policy")
+      :else
+      (let [db (sqlite/DatabaseSync. db-path #js {:readOnly true})]
+        (try
+          (.exec db "PRAGMA query_only = ON")
+          (let [source-filter "COALESCE(s.source, '') NOT IN ('tool', 'delegate', 'kanban')"
+                hidden-filter "COALESCE(s.hidden, 0) = 0"
+                role-sql (str/join "," (map #(str "'" % "'") roles))
+                result
+                (cond
+                  session_id
+                  (if around_message_id
+                    (sqlite-records db
+                      (str "WITH numbered AS (SELECT m.id, m.role, m.content, m.timestamp, "
+                           "ROW_NUMBER() OVER (ORDER BY m.id) AS rn FROM messages m "
+                           "JOIN sessions s ON s.id = m.session_id WHERE s.id = ? AND " hidden-filter " AND " source-filter ") "
+                           "SELECT id, role, content, timestamp FROM numbered WHERE rn BETWEEN "
+                           "MAX(1, (SELECT rn FROM numbered WHERE id = ?) - ?) AND "
+                           "(SELECT rn FROM numbered WHERE id = ?) + ? "
+                           "AND (SELECT rn FROM numbered WHERE id = ?) IS NOT NULL ORDER BY rn")
+                      session_id around_message_id window around_message_id window around_message_id)
+                    (sqlite-records db
+                      (str "SELECT m.id, m.role, m.content, m.timestamp FROM messages m "
+                           "JOIN sessions s ON s.id = m.session_id WHERE s.id = ? AND " hidden-filter " AND " source-filter " "
+                           "ORDER BY m.id DESC LIMIT ?")
+                      session_id limit))
+
+                  (not (str/blank? (or query "")))
+                  (sqlite-records db
+                    (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count, "
+                         "m.id AS match_message_id, m.role, m.content, m.timestamp, "
+                         "snippet(messages_fts, 0, '[', ']', ' … ', 16) AS snippet "
+                         "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
+                         "JOIN sessions s ON s.id = m.session_id WHERE messages_fts MATCH ? AND "
+                         hidden-filter " AND " source-filter " AND m.role IN (" role-sql ") "
+                         "ORDER BY bm25(messages_fts), m.id DESC LIMIT ?")
+                    query limit)
+
+                  :else
+                  (sqlite-records db
+                    (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count "
+                         "FROM sessions s WHERE " hidden-filter " AND " source-filter " "
+                         "ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC LIMIT ?")
+                    limit))
+                result (if (and session_id (not around_message_id)) (vec (reverse result)) result)]
+            (ok {"mode" (cond session_id (if around_message_id "scroll" "read")
+                              (str/blank? (or query "")) "browse" :else "discover")
+                 "profile" (:profile ctx)
+                 "count" (count result)
+                 "results" (mapv (fn [row]
+                                   (cond-> row
+                                     (contains? row "content") (update "content" #(clip (str %) 4000))))
+                                 result)}))
+          (finally (.close db)))))))
+
 (defn- ha-tool [name]
   (fn [ctx args] (homeassistant/call ctx name args)))
 
@@ -947,6 +1034,7 @@
    "search_files" search-files "web_extract" web-extract "web_search" web-search
    "skills_list" skills-list "skill_view" skill-view "skill_manage" skill-manage
    "todo_list" todo-list "memory" memory "execute_code" execute-code
+   "session_search" session-search
    "ha_list_entities" (ha-tool "ha_list_entities")
    "ha_get_state" (ha-tool "ha_get_state")
    "ha_list_services" (ha-tool "ha_list_services")
