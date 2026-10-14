@@ -129,7 +129,8 @@
   ask (:approval-required)."
   [m entry {:keys [yakuwari?]}]
   (let [repo (get-in entry [:source :repo])
-        yid (get-in entry [:yakuwari :id])
+        ;; manifest/agent-registry.edn writes :yakuwari/id; the P1 draft nested it
+        yid (or (:yakuwari/id entry) (get-in entry [:yakuwari :id]))
         ids (cond-> {}
               repo (assoc :repo repo)
               yid (assoc :yakuwari/id (str yid)))
