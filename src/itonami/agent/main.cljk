@@ -13,6 +13,7 @@
 
   itonami layer:
     itonami-agent profile itonamify <p>|--all [--dry-run]   write itonami.edn (additive)
+    itonami-agent profile readiness <p>|--all              audit Kotoba cron compatibility
     itonami-agent profile adopt <p>|--all [--dry-run]       itonami ticks selected cron; Hermes stops
     itonami-agent profile release <p>|--all [--dry-run]     hand selected cron back to Hermes
     itonami-agent profile bundle <p>                        print the bundle CID and file list
@@ -33,6 +34,7 @@
             [itonami.agent.loop :as agent-loop]
             [itonami.agent.tools :as tools]
             [itonami.agent.cron :as cron]
+            [itonami.agent.mcp :as mcp]
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.rails :as rails]
@@ -295,6 +297,48 @@
       (h/spit f (str "parked by itonami-agent profile adopt at " (h/iso-local) "\n"))
       (h/rm f))))
 
+(defn- active-cron-job? [job]
+  (and (get job "enabled" true)
+       (not (contains? #{"paused" "completed" "disabled"} (get job "state" "scheduled")))))
+
+(defn- kotoba-job-issues [prof job]
+  "Read-only compatibility gate for a single active Hermes cron job."
+  (let [config (:config prof)
+        requested (if (and (contains? job "enabled_toolsets") (some? (get job "enabled_toolsets")))
+                    (get job "enabled_toolsets")
+                    (or (get-in config ["platform_toolsets" "cron"]) ["hermes-cron"]))
+        disabled (let [d (get-in config ["agent" "disabled_toolsets"])]
+                   (if (string? d) [d] d))
+        servers (get config "mcp_servers" {})
+        selected-mcp (if (true? (get job "no_agent")) [] (mcp/names-for config requested disabled))
+        remote-mcp (filter #(get-in servers [% "url"]) selected-mcp)
+        bad-sets (if (true? (get job "no_agent")) []
+                   (tools/unsupported-toolsets requested (set (keys servers))))
+        bad-tools (if (true? (get job "no_agent")) []
+                    (tools/unsupported-tools (tools/enabled-tool-names requested disabled)))
+        lane (or (get job "deliver") "local")]
+    (concat
+     (when (and (not (true? (get job "no_agent"))) (seq bad-sets))
+       [{:code :unsupported_toolset :detail (str/join ", " bad-sets)}])
+     (when (and (not (true? (get job "no_agent"))) (seq bad-tools))
+       [{:code :unsupported_tools :detail (str/join ", " bad-tools)}])
+     (when (seq remote-mcp)
+       [{:code :remote_mcp :detail (str/join ", " remote-mcp)}])
+     (when (not= "local" (str/lower-case (str lane)))
+       [{:code :delivery_adapter :detail (str lane)}]))))
+
+(defn- profile-readiness-issues [prof]
+  (vec (mapcat (fn [job]
+                 (when (and (map? job) (active-cron-job? job))
+                   (map #(assoc % :job (get job "id" "(unknown)"))
+                        (kotoba-job-issues prof job))))
+               (get-in prof [:jobs "jobs"] []))))
+
+(defn- issue-summary [issues]
+  (->> issues (map :code) frequencies
+       (map (fn [[code n]] (str (name code) "=" n)))
+       (str/join ", ")))
+
 (defn profile-cmd [opts [sub & args]]
   (case sub
     ("list" nil)
@@ -312,6 +356,25 @@
                     "\nmodel: " (get-in prof [:config "model" "provider"]) "/" (get-in prof [:config "model" "default"])
                     "\njobs: " (count (get-in prof [:jobs "jobs"]))
                     "\nitonami: " (if (:itonami prof) (pr-str (select-keys (:itonami prof) [:runtime :placement :bundle])) "no"))))
+
+    "readiness"
+    (let [targets (if (:all opts) (profile/names) [(first args)])
+          blocked (atom 0)
+          issues-count (atom 0)]
+      (doseq [n targets]
+        (try
+          (let [prof (profile/load-profile n {:secrets? false})
+                issues (profile-readiness-issues prof)]
+            (if (seq issues)
+              (do (swap! blocked inc)
+                  (swap! issues-count + (count issues))
+                  (println (str "blocked " n "  " (issue-summary issues))))
+              (println (str "ready   " n))))
+          (catch :default e
+            (swap! blocked inc)
+            (swap! issues-count inc)
+            (println (str "error   " n "  " (.-message e))))))
+      (println (str @blocked " profile(s) blocked; " @issues-count " compatibility issue(s)")))
 
     "itonamify"
     (let [targets (if (:all opts) (profile/names) [(first args)])
@@ -344,25 +407,39 @@
 
     "adopt"
     (let [targets (if (:all opts) (profile/names) [(first args)])
+          entries (mapv (fn [n]
+                          (try
+                            (let [prof (profile/load-profile n {:secrets? false})
+                                  m (or (:itonami prof) (profile/default-manifest prof))]
+                              {:name n :profile prof :manifest m
+                               :already? (and (= :itonami (get-in m [:runtime :scheduler]))
+                                              (h/file? (h/join (:home prof) "gateway.parked")))
+                               :issues (profile-readiness-issues prof)})
+                            (catch :default e {:name n :error (.-message e)})))
+                        targets)
+          blockers (filter #(or (:error %) (seq (:issues %))) entries)
           changed (atom 0)]
-      (doseq [n targets]
-        (try
-          (let [prof (profile/load-profile n {:secrets? false})
-                home (:home prof)
-                m (or (:itonami prof) (profile/default-manifest prof))
-                already? (and (= :itonami (get-in m [:runtime :scheduler]))
-                              (h/file? (h/join home "gateway.parked")))]
+      (if (and (:all opts) (seq blockers))
+        (do
+          (doseq [{:keys [name error issues]} blockers]
+            (println (str (if error "error   " "blocked ") name "  "
+                          (or error (issue-summary issues)))))
+          (println (str "refused all-profile adoption; " (count blockers)
+                        " of " (count entries) " profiles are not Kotoba-ready; no profiles changed")))
+        (do
+          (doseq [{:keys [name profile manifest already? issues error]} entries]
             (cond
-              already? (println (str "keep    " n "  already Kotoba-scheduled"))
-              (:dry-run opts) (do (swap! changed inc) (println (str "would   adopt " n)))
-              :else (do
-                      (profile/write-manifest! home (assoc-in m [:runtime :scheduler] :itonami))
+              error (println (str "error   " name "  " error))
+              already? (println (str "keep    " name "  already Kotoba-scheduled"))
+              (seq issues) (println (str "blocked " name "  " (issue-summary issues)))
+              (:dry-run opts) (do (swap! changed inc) (println (str "would   adopt " name)))
+              :else (let [home (:home profile)]
+                      (profile/write-manifest! home (assoc-in manifest [:runtime :scheduler] :itonami))
                       (set-hermes-parked! home true)
                       (profile/refresh-bundle-cid home)
                       (swap! changed inc)
-                      (println (str "adopted " n ": Kotoba ticks cron; Hermes is parked")))))
-          (catch :default e (println (str "skip    " n "  " (.-message e))))))
-      (println (str @changed " profile(s) " (if (:dry-run opts) "would be " "") "adopted")))
+                      (println (str "adopted " name ": Kotoba ticks cron; Hermes is parked")))))
+          (println (str @changed " profile(s) " (if (:dry-run opts) "would be " "") "adopted")))))
 
     "release"
     (let [targets (if (:all opts) (profile/names) [(first args)])

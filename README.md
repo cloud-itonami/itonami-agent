@@ -75,10 +75,13 @@ deleting it returns the profile to plain Hermes.
 
 Exactly one scheduler ticks a profile:
 
+- `profile readiness <p>|--all` checks active cron jobs for unsupported Kotoba
+  tools, remote MCP transports, and non-local delivery lanes.
 - `profile adopt <p>` sets `:scheduler :itonami` and writes Hermes'
   `gateway.parked` marker, so the Hermes gateway stops ticking it;
   `gateway run` then ticks it. `profile adopt --all --dry-run` previews a
-  fleet-wide ownership change; `profile adopt --all` applies it.
+  fleet-wide ownership change. Fleet adoption refuses the whole operation if
+  any profile fails the Kotoba readiness check.
 - `profile release <p>` reverses both. `profile release --all --dry-run`
   previews a fleet rollback; `profile release --all` applies it.
 - `profile refresh-bundle <p>` recomputes the CID after files change without
