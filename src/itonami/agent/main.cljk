@@ -288,7 +288,7 @@
                         :else (profile/names))]
       (when-not seed
         (die 2 (str "REFUSED: " identity/seed-env " is not set (64 hex characters). Fill it from the kagi item "
-                    "shared/hermes-profile-did-seed in a human session, for this one command; it is never printed.")))
+                    "shared/agent-identity-seed in a human session, for this one command; it is never printed.")))
       (when-not (first targets)
         (die 2 "usage: itonami-agent profile did <p>|--all [--registry <agent-registry.edn>] [--out <file>]"))
       (let [out (into (sorted-map)
