@@ -323,11 +323,8 @@
 (defn- kotoba-job-issues [prof job]
   "Read-only compatibility gate for a single active Hermes cron job."
   (let [config (:config prof)
-        requested (if (and (contains? job "enabled_toolsets") (some? (get job "enabled_toolsets")))
-                    (get job "enabled_toolsets")
-                    (or (get-in config ["platform_toolsets" "cron"]) ["hermes-cron"]))
-        disabled (let [d (get-in config ["agent" "disabled_toolsets"])]
-                   (if (string? d) [d] d))
+        requested (cron/tool-sets-for config job)
+        disabled (tools/execution-disabled-toolsets config "cron")
         servers (get config "mcp_servers" {})
         selected-mcp (if (true? (get job "no_agent")) [] (mcp/names-for config requested disabled))
         oauth-unready (filter #(and (get-in servers [% "url"])

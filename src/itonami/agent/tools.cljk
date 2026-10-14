@@ -418,6 +418,17 @@
   (let [off (set (tool-names disabled))]
     (vec (remove off (tool-names requested)))))
 
+(defn execution-disabled-toolsets [config platform]
+  "Return Hermes' profile denylist plus platform-specific execution denies."
+  (let [configured (get-in config ["agent" "disabled_toolsets"])
+        configured (if (string? configured) [configured] configured)]
+    (vec (distinct
+          (concat (filter string? configured)
+                  (when (= platform "cron")
+                    (concat ["messaging" "clarify"]
+                            (when-not (true? (get-in config ["cron" "allow_agent_scheduling"]))
+                              ["cronjob"]))))))))
+
 (defn runtime-tool-names
   "Resolve tools that Hermes would actually expose in this profile. Hermes gates
   browser_cdp and browser_dialog together on a configured CDP endpoint; neither

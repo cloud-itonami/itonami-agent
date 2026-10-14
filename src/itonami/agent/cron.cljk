@@ -633,10 +633,20 @@
       (h/rm (h/join dir old)))
     f))
 
-(defn- tool-sets-for [config job]
-  (if (and (contains? job "enabled_toolsets") (some? (get job "enabled_toolsets")))
-    (get job "enabled_toolsets")
-    (or (seq (get-in config ["platform_toolsets" "cron"])) ["hermes-cron"])))
+(defn tool-sets-for [config job]
+  "Resolve the selected cron toolsets, then apply Hermes' cron-only deny rules.
+  Clarification and messaging require an interactive user. Cron-job creation is
+  disabled by default to prevent unattended recursive scheduling."
+  (let [requested (if (and (contains? job "enabled_toolsets") (some? (get job "enabled_toolsets")))
+                    (get job "enabled_toolsets")
+                    (or (seq (get-in config ["platform_toolsets" "cron"])) ["hermes-cron"]))
+        agent-disabled (get-in config ["agent" "disabled_toolsets"])
+        agent-disabled (if (string? agent-disabled) [agent-disabled] agent-disabled)
+        disabled (into #{"messaging" "clarify"}
+                       (concat (when-not (true? (get-in config ["cron" "allow_agent_scheduling"]))
+                                 ["cronjob"])
+                               (filter string? agent-disabled)))]
+    (vec (remove disabled requested))))
 
 (def reasoning-efforts
   #{"none" "minimal" "low" "medium" "high" "xhigh" "max" "ultra"})
