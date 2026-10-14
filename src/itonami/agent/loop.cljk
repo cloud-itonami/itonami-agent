@@ -13,6 +13,7 @@
             [itonami.agent.host :as h]
             [itonami.agent.provider :as provider]
             [itonami.agent.tools :as tools]
+            [itonami.agent.mcp :as mcp]
             [itonami.agent.yaml :as yaml]
             [itonami.agent.confine :as confine]))
 
@@ -116,39 +117,58 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         hops (provider/decentralize (provider/chain config {:model model :provider provider :pinned? pinned?})
                                     (:itonami prof) config)
         requested-sets (when (nil? tool-names) (or toolsets ["hermes-cli"]))
-        unknown-sets (tools/unsupported-toolsets requested-sets)
+        disabled (let [d (get-in config ["agent" "disabled_toolsets"])]
+                   (if (string? d) [d] d))
+        all-requested (or tool-names requested-sets)
+        mcp-servers (if (and requested-sets (not peer?)) (mcp/names-for config requested-sets disabled) [])
+        unknown-sets (tools/unsupported-toolsets requested-sets (set (keys (get config "mcp_servers" {}))))
         _ (when (seq unknown-sets)
             (throw (ex-info (str "Kotoba agent does not recognize Hermes toolsets: "
                                  (str/join ", " unknown-sets))
                             {:unsupported-toolsets unknown-sets})))
         ;; agent.disabled_toolsets travels in the bundle (not host-local), so a
         ;; peer turn drops the same tools; a -t / peer opts toolsets cannot re-add them
-        names (tools/enabled-tool-names (or tool-names requested-sets)
-                                        (let [d (get-in config ["agent" "disabled_toolsets"])]
-                                          (if (string? d) [d] d)))
-        unsupported (tools/unsupported-tools names)
+        names (tools/enabled-tool-names all-requested disabled)
+        mcp-data (mcp/discover config env mcp-servers)
+        mcp-index (:index mcp-data)
+        mcp-names (vec (keys mcp-index))
+        names (into names mcp-names)
+        unsupported (tools/unsupported-tools (remove (set mcp-names) names))
         _ (when (seq unsupported)
             (throw (ex-info (str "Kotoba agent cannot run this Hermes toolset yet; unsupported tools: "
                                  (str/join ", " unsupported))
                             {:unsupported-tools unsupported})))
-        schemas (tools/tool-schemas names)
+        schemas (into (tools/tool-schemas (tools/enabled-tool-names all-requested disabled))
+                      (:schemas mcp-data))
+        mcp-overrides (into {} (for [[wire [server raw]] mcp-index]
+                                 [wire (fn [_ args] (mcp/call config env server raw args))]))
         writes (atom [])
         todo-state (tools/todo-history-state history)
         cwd (or cwd (some-> (get-in config ["terminal" "cwd"]) h/expand) (h/join (:home prof) "workspace"))
         _ (h/mkdirs cwd)
         ctx {:cwd cwd :home (:home prof) :profile (:name prof) :roots roots :writes writes :tool-env env
              :todos (atom (:todos todo-state)) :todo-revision (atom (:revision todo-state))
-             :tool-overrides tool-overrides
+             :mcp-config config :mcp-index mcp-index
+             :tool-overrides (merge mcp-overrides tool-overrides)
              :terminal-policy (confine/policy (:itonami prof) {:peer? peer?})}
         t0 (h/now-ms)
         emit (or on-event (fn [_]))
+        mcp-notice (cond
+                     peer? "\n\n## MCP tools unavailable\nCustom MCP servers are disabled for peer runs. Do not claim that you used them."
+                     (seq (:errors mcp-data))
+                     (str "\n\n## MCP server issues\n"
+                          (str/join "\n" (map (fn [e] (str "- " (get e "server") ": " (get e "error")))
+                                       (:errors mcp-data)))
+                          "\nThese tools are unavailable in this run; do not claim that you used them.")
+                     :else nil)
         usage (atom {"prompt_tokens" 0 "completion_tokens" 0 "total_tokens" 0})
         add-usage! (fn [u] (when u (swap! usage #(merge-with + % (select-keys u ["prompt_tokens" "completion_tokens" "total_tokens"])))))]
       (p/loop [messages (into [{"role" "system" "content"
-                                (system-prompt prof {:cwd cwd :platform platform
-                                                     :load-context? load-context?
-                                                     :skills? (boolean (some #{"skill_view"} names))
-                                                     :instructions instructions})}]
+                                (str (system-prompt prof {:cwd cwd :platform platform
+                                                          :load-context? load-context?
+                                                          :skills? (boolean (some #{"skill_view"} names))
+                                                          :instructions instructions})
+                                     (or mcp-notice ""))}]
                               (concat (history-messages history)
                                       [{"role" "user" "content" prompt}]))
              n 0

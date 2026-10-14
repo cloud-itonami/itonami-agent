@@ -1,0 +1,155 @@
+(ns itonami.agent.mcp
+  "Small profile-scoped MCP stdio client for Hermes-compatible tool servers."
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]))
+
+(def protocol-version "2024-11-05")
+(def max-name-length 64)
+
+(defn enabled? [spec]
+  (let [v (get spec "enabled" true)]
+    (not (or (false? v)
+             (and (string? v) (contains? #{"false" "0" "no" "off"} (str/lower-case (str/trim v))))))))
+
+(defn names-for [config requested disabled]
+  "Enabled MCP servers selected by toolsets. A listed server is an allowlist;
+  otherwise all enabled servers are included. `no_mcp` opts out."
+  (let [servers (get config "mcp_servers" {})
+        requested (vec (remove nil? requested))
+        disabled (set disabled)
+        explicit (filter #(contains? servers %) requested)]
+    (if (some #{"no_mcp"} requested)
+      []
+      (->> (if (seq explicit) explicit (keys servers))
+           (filter #(and (enabled? (get servers %)) (not (contains? disabled %))))
+           sort vec))))
+
+(defn- expand-string [s env]
+  (str/replace (str s) #"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}"
+               (fn [[_ key]] (str (get env key (str "${" key "}"))))))
+
+(defn- expand-value [v env]
+  (cond
+    (string? v) (expand-string v env)
+    (vector? v) (mapv #(expand-value % env) v)
+    (map? v) (into {} (map (fn [[k x]] [k (expand-value x env)]) v))
+    :else v))
+
+(defn- command-for [spec env]
+  (let [command (expand-value (get spec "command") env)
+        args (expand-value (get spec "args" []) env)]
+    (cond
+      (and (string? command) (not (str/blank? command))) (into [command] (if (vector? args) args []))
+      (and (vector? command) (seq command)) (into (vec command) (if (vector? args) args []))
+      :else nil)))
+
+(defn- server-env [spec env]
+  (let [base (select-keys env ["PATH" "HOME" "TMPDIR" "LANG" "LC_ALL" "XDG_CONFIG_HOME"])
+        configured (expand-value (get spec "env" {}) env)]
+    (merge base (if (map? configured) configured {}))))
+
+(defn- rpc [id method params]
+  {"jsonrpc" "2.0" "id" id "method" method "params" params})
+
+(defn- exchange [spec env method params]
+  (let [cmd (command-for spec env)]
+    (if-not cmd
+      {:error "MCP stdio server has no executable command"}
+      (let [input (str (h/json-str (rpc 1 "initialize"
+                                       {"protocolVersion" protocol-version
+                                        "capabilities" {}
+                                        "clientInfo" {"name" "itonami-agent" "version" "0.1"}})) "\n"
+                       (h/json-str {"jsonrpc" "2.0" "method" "notifications/initialized" "params" {}}) "\n"
+                       (h/json-str (rpc 2 method params)) "\n")
+            result (h/run-process cmd {:cwd (get spec "cwd")
+                                       :env (server-env spec env) :exact-env? true
+                                       :input input
+                                       :timeout-ms (* 1000 (or (get spec "timeout")
+                                                              (get spec "connect_timeout") 30))})
+            response (first (for [line (str/split-lines (:stdout result))
+                                  :let [m (try (h/json-parse line) (catch :default _ nil))]
+                                  :when (and (map? m) (= 2 (get m "id")))] m))]
+        (cond
+          (:timed-out? result) {:error "MCP server timed out"}
+          (not= 0 (:exit result)) {:error (str "MCP server exited " (:exit result))}
+          (nil? response) {:error "MCP server returned no JSON-RPC response"}
+          (get response "error") {:error (str "MCP " method " failed: " (get-in response ["error" "message"]))}
+          :else (get response "result" {}))))))
+
+(defn- sanitize [s]
+  (str/replace (str s) #"[^A-Za-z0-9_]" "_"))
+
+(defn tool-name [server tool]
+  (let [full (str "mcp__" (sanitize server) "__" (sanitize tool))]
+    (if (<= (count full) max-name-length)
+      full
+      (str (subs full 0 (- max-name-length 9)) "_" (subs (h/sha256-hex full) 0 8)))))
+
+(defn- object-schema [schema]
+  (let [schema (if (map? schema) schema {})
+        schema (if (or (= "object" (get schema "type"))
+                       (contains? schema "properties") (contains? schema "required"))
+                 (assoc schema "type" "object")
+                 {"type" "object" "properties" {}})
+        props (if (map? (get schema "properties")) (get schema "properties") {})
+        required (get schema "required" [])]
+    (cond-> (assoc schema "properties" props)
+      (not (vector? required)) (assoc "required" [])
+      (vector? required) (assoc "required" (vec (filter #(contains? props %) required))))))
+
+(defn discover [config env servers]
+  "Discover schemas and dispatch metadata from selected stdio servers."
+  (let [errors (atom [])
+        rows (vec
+              (mapcat
+               (fn [server]
+                 (let [spec (get-in config ["mcp_servers" server])]
+                   (if (not (enabled? spec))
+                     []
+                     (if (get spec "url")
+                       (do (swap! errors conj {"server" server "error" "remote MCP transport is not supported yet"}) [])
+                       (let [result (exchange spec env "tools/list" {})
+                             allow (set (get spec "tools" []))]
+                         (if-let [error (:error result)]
+                           (do (swap! errors conj {"server" server "error" error}) [])
+                           (for [tool (get result "tools" [])
+                                 :let [raw (get tool "name")]
+                                 :when (and raw (or (empty? allow) (contains? allow raw)))]
+                             [(tool-name server raw)
+                              {"type" "function"
+                               "function" {"name" (tool-name server raw)
+                                           "description" (or (get tool "description") (str "MCP tool " raw " from " server))
+                                           "parameters" (object-schema (or (get tool "inputSchema") (get tool "input_schema")))}}
+                              [server raw]])))))))
+               servers))]
+    {:schemas (mapv second rows)
+     :index (into {} (map (fn [[name _ target]] [name target]) rows))
+     :errors @errors}))
+
+(defn- render-result [result]
+  (let [content (get result "content" [])
+        texts (keep (fn [part]
+                      (when (and (map? part) (= "text" (get part "type")))
+                        (get part "text"))) content)
+        text (str/join "\n" texts)
+        structured (or (get result "structuredContent") (get result "structured_content"))
+        parsed (when-not (str/blank? text) (try (h/json-parse text) (catch :default _ ::not-json)))
+        structured (when-not (and (not= parsed ::not-json) (= parsed structured)) structured)
+        meta (get result "_meta")]
+    (cond
+      (get result "isError") (h/json-str {"error" (if (str/blank? text) "MCP tool returned an error" text)})
+      (and (str/blank? text) (nil? structured) (seq content))
+      (h/json-str {"result" content})
+      :else
+      (h/json-str (cond-> {"result" (if (str/blank? text) structured text)}
+                    (and structured (not (str/blank? text))) (assoc "structuredContent" structured)
+                    meta (assoc "_meta" meta))))))
+
+(defn call [config env server raw args]
+  (let [spec (get-in config ["mcp_servers" server])]
+    (if (or (not (enabled? spec)) (get spec "url"))
+      (h/json-str {"error" "MCP server transport is not supported"})
+      (let [result (exchange spec env "tools/call" {"name" raw "arguments" args})]
+        (if-let [error (:error result)]
+          (h/json-str {"error" error})
+          (render-result result))))))

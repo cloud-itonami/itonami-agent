@@ -12,6 +12,7 @@
             [itonami.agent.tools :as tools]
             [itonami.agent.confine :as confine]
             [itonami.agent.webguard :as webguard]
+            [itonami.agent.mcp :as mcp]
             [promesa.core :as p]
             ["node:child_process" :as cp]
             ["node:sqlite" :as sqlite]))
@@ -630,3 +631,24 @@ plain: true
     (is (true? (tools/approval-required? "terminal")))
     (is (true? (tools/approval-required? "write_file")))
     (is (true? (tools/approval-required? "memory")))))
+
+(deftest mcp-profile-tool-compatibility
+  (testing "MCP server selection follows per-run allowlists and disabled servers"
+    (let [cfg {"mcp_servers" {"fixture" {"command" "node" "args" ["test/mcp_stdio_fixture.mjs"]}
+                               "off" {"enabled" false "command" "node"}}}]
+      (is (= ["fixture"] (mcp/names-for cfg ["terminal"] [])))
+      (is (= ["fixture"] (mcp/names-for cfg ["fixture"] [])))
+      (is (= [] (mcp/names-for cfg ["terminal" "no_mcp"] [])))
+      (is (= [] (mcp/names-for cfg ["terminal"] ["fixture"])))))
+  (testing "stdio MCP schemas and tools/call use provider-safe names"
+    (let [cfg {"mcp_servers" {"fixture" {"command" "node" "args" ["test/mcp_stdio_fixture.mjs"]}}}
+          data (mcp/discover cfg (h/process-env) ["fixture"])
+          schema (first (:schemas data))
+          result (mcp/call cfg (h/process-env) "fixture" "echo" {"text" "kotoba"})]
+      (is (= "mcp__fixture__echo" (get-in schema ["function" "name"])))
+      (is (= ["fixture" "echo"] (get (:index data) "mcp__fixture__echo")))
+      (is (str/includes? result "kotoba"))))
+  (testing "long names are bounded and stable"
+    (let [n (mcp/tool-name "server-with-a-long-name" "tool-with-a-long-name-that-exceeds-provider-limits")]
+      (is (<= (count n) 64))
+      (is (= n (mcp/tool-name "server-with-a-long-name" "tool-with-a-long-name-that-exceeds-provider-limits"))))))

@@ -266,8 +266,9 @@
 
 (defn unsupported-toolsets
   "Toolset names neither implemented by Kotoba nor in Hermes' current catalog."
-  [sets]
-  (vec (distinct (remove #(or (contains? toolsets %) (contains? schemas %)) sets))))
+  ([sets] (unsupported-toolsets sets #{}))
+  ([sets additional]
+   (vec (distinct (remove #(or (contains? toolsets %) (contains? schemas %) (contains? additional %)) sets)))))
 
 (def approval-free-tools #{"read_file" "search_files" "web_search" "web_extract" "skills_list" "skill_view" "todo_list" "delegate_task"
                            "ha_list_entities" "ha_get_state" "ha_list_services"})
