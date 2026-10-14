@@ -64,6 +64,13 @@ plain: true
       (is (= 1 (count (provider/chain cfg {:model "x" :provider "kotoba" :pinned? true})))))
     (is (= "MURAKUMO_API_TOKEN" (:key-env (second (provider/chain cfg {})))))))
 
+(deftest cron-job-reasoning-effort
+  (let [config {"agent" {"reasoning_effort" "medium"}}]
+    (is (= "high" (cron/effective-reasoning-effort config {"reasoning_effort" "high"})))
+    (is (= "medium" (cron/effective-reasoning-effort config {"reasoning_effort" "invalid"})))
+    (is (= "medium" (cron/effective-reasoning-effort config {})))
+    (is (= "none" (cron/effective-reasoning-effort config {"reasoning_effort" "none"})))))
+
 (deftest decentralized-chain
   (let [hops [{:provider "kotoba" :base-url "https://api.kotoba.cloud/v1"}
               {:provider "openrouter-free" :base-url "https://openrouter.ai/api/v1"}

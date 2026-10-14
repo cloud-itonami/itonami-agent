@@ -601,6 +601,17 @@
     (get job "enabled_toolsets")
     (or (seq (get-in config ["platform_toolsets" "cron"])) ["hermes-cron"])))
 
+(def reasoning-efforts
+  #{"none" "minimal" "low" "medium" "high" "xhigh" "max" "ultra"})
+
+(defn effective-reasoning-effort
+  "Hermes cron semantics: a valid per-job reasoning pin overrides the profile default."
+  [config job]
+  (let [pinned (get job "reasoning_effort")]
+    (if (contains? reasoning-efforts pinned)
+      pinned
+      (get-in config ["agent" "reasoning_effort"]))))
+
 (defn- record-run-state! [home job started failed? error delivery-error]
   (update-job! home (get job "id")
                (fn [current]
@@ -713,6 +724,7 @@
                   (executor prof prompt {:platform "cron"
                                          :toolsets (tool-sets-for (:config prof) job)
                                          :model (get job "model") :provider (get job "provider")
+                                         :reasoning-effort (effective-reasoning-effort (:config prof) job)
                                          :pinned? (boolean (get job "model"))
                                          :cwd (some-> (get job "workdir") h/expand)
                                          :load-context? (boolean (get job "workdir"))}))]

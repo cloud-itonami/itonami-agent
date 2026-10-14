@@ -110,6 +110,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
     :provider str :model str :attempts [...] :writes [abs-paths]}"
   [{:keys [config env] :as prof} prompt {:keys [model provider pinned? toolsets tool-names cwd roots platform
                                                 load-context? max-turns budget-s on-event peer?
+                                                reasoning-effort max-tokens
                                                 history instructions before-tool tool-overrides]
                                          :as options}]
   (let [max-turns (or max-turns (get-in config ["agent" "max_turns"]) (get config "max_turns") 90)
@@ -186,7 +187,10 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
 
         :else
         (p/let [r (provider/complete hops env {:messages messages :tools schemas
-                                               :reasoning-effort (get-in config ["agent" "reasoning_effort"])
+                                               :reasoning-effort (or reasoning-effort
+                                                                     (get-in config ["agent" "reasoning_effort"]))
+                                               :max-tokens (or max-tokens
+                                                               (get-in config ["model" "max_tokens"]))
                                                :deadline-ms (when (pos? budget-ms) (+ t0 budget-ms))
                                                :on-hop (fn [hop r ms]
                                                          (emit {:event :hop :provider (:provider hop) :model (:model hop)
