@@ -75,12 +75,14 @@ is an index, not authority: `:authority` only points at `yakuwari.edn`.
 - `itonamify --refresh` keeps the declared runtime, placement, rails,
   terminal/web policy and organisation keys.
 - `profile did <p>|--all [--registry F] [--out F]` prints each profile's
-  did:key (`itonami.agent.identity`). The ed25519 key is derived, never
-  stored: HKDF-SHA256 over one fleet seed held in kagi
-  (`shared/hermes-profile-did-seed`), with info `<profile-id>/<epoch>`; the
-  registry's `:did/epoch` (default 0) rotates one profile. The seed comes
-  from `ITONAMI_PROFILE_DID_SEED` for that one command, filled in a human
-  session; without it the command refuses. `profile organize` projects the
+  did:key (`itonami.agent.identity`). It is the same identity tree
+  cloud-itonami-app uses for its Bots (`bot-identity`): ed25519 seed =
+  SHA-256(fleet-seed || 0x00 || key-id), key-id = the profile id (or
+  `<profile-id>#<epoch>` after the registry raises `:did/epoch`). The key is
+  derived, never stored. The fleet seed's canonical copy is the kagi item
+  `shared/agent-identity-seed`; it reaches the one command through
+  `ITONAMI_AGENT_IDENTITY_SEED`, filled in a human session; without it the
+  command refuses. `profile organize` projects the
   registry's `:did` into `:ids :did`.
 - `profile soul <p>|--all --registry F --worlds F [--unit U] [--dry-run]`
   renders the generated SOUL blocks (`itonami.agent.soul`): **world** (the
