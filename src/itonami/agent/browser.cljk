@@ -5,6 +5,7 @@
   (:require [clojure.string :as str]
             [promesa.core :as p]
             [itonami.agent.webguard :as webguard]
+            ["node:fs" :as fs]
             ["node:dns" :as dns]
             ["node:http" :as http]
             ["node:net" :as net]
@@ -14,6 +15,24 @@
 (defonce ^:private proxies (atom {}))
 (def ^:private secret-url-pattern
   #"(?i)(?:sk-[A-Za-z0-9_-]{10,}|ghp_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{10,}|gho_[A-Za-z0-9]{10,}|ghu_[A-Za-z0-9]{10,}|ghs_[A-Za-z0-9]{10,}|ghr_[A-Za-z0-9]{10,}|xapp-[0-9]+-[A-Za-z0-9-]{10,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[A-Za-z0-9_-]{30,}|AKIA[A-Z0-9]{16}|sk_live_[A-Za-z0-9]{10,}|sk_test_[A-Za-z0-9]{10,})")
+
+(defn cli-available?
+  "Whether the same agent-browser executable used by run-cli is on Kotoba's PATH.
+  This is a read-only check: it never installs or launches the browser."
+  []
+  (let [separator (if (= "win32" (.-platform js/process)) #";" #":")
+        dirs (str/split (or (h/env "PATH") "") separator)
+        names (if (= "win32" (.-platform js/process)) ["agent-browser.cmd" "agent-browser"] ["agent-browser"])]
+    (boolean
+     (some (fn [dir]
+             (some (fn [name]
+                     (let [candidate (h/join dir name)]
+                       (and (h/file? candidate)
+                            (or (= "win32" (.-platform js/process))
+                                (try (.accessSync fs candidate 1) true
+                                     (catch :default _ false))))))
+                   names))
+           dirs))))
 
 (defn- secret-url? [url]
   (or (re-find secret-url-pattern url)

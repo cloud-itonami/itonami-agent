@@ -35,6 +35,7 @@
             [itonami.agent.profile :as profile]
             [itonami.agent.loop :as agent-loop]
             [itonami.agent.tools :as tools]
+            [itonami.agent.browser :as browser]
             [itonami.agent.cron :as cron]
             [itonami.agent.mcp :as mcp]
             [itonami.agent.execution-ledger :as execution-ledger]
@@ -337,8 +338,10 @@
                    (tools/unsupported-toolsets requested (set (keys servers))))
         browser-cdp (browser-cdp-configured? prof)
         bad-tools (if (true? (get job "no_agent")) []
-                    (tools/unsupported-tools (tools/runtime-tool-names requested disabled browser-cdp)))
-        enabled-tools (tools/runtime-tool-names requested disabled browser-cdp)
+                    (tools/unsupported-tools (tools/runtime-tool-names requested disabled browser-cdp
+                                                                          (browser/cli-available?))))
+        enabled-tools (tools/runtime-tool-names requested disabled browser-cdp
+                                               (browser/cli-available?))
         browser-selected? (some (set tools/browser-tools) enabled-tools)
         browser-config (get config "browser" {})
         browser-backend (or (get browser-config "backend") "local")
