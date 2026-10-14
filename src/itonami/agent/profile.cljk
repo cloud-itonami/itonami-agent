@@ -249,6 +249,18 @@
   (let [files (bundle-files home (select-keys (:bundle m) [:skills :dirs]))]
     (assoc m :bundle (merge (:bundle m) {:cid (bundle-cid files) :files (count files)}))))
 
+(defn with-derived
+  "The manifest with everything derived from the profile's own files
+  recomputed: the bundle (`with-bundle`) and, when the profile has a
+  yakuwari.edn, :capabilities — a verbatim copy of what yakuwari.edn decides
+  (itonami.edn grants nothing itself). Without yakuwari.edn the
+  capabilities are left as they are."
+  [home m]
+  (let [m (with-bundle home m)]
+    (if (h/file? (h/join home "yakuwari.edn"))
+      (assoc m :capabilities (or (capabilities-from-yakuwari home) []))
+      m)))
+
 (defn refresh-bundle-cid
   "Recompute the bundle CID of an itonami profile (after its SOUL, config,
   jobs or scripts changed) and write it back. Returns the manifest."

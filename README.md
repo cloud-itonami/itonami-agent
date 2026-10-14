@@ -68,8 +68,10 @@ is an index, not authority: `:authority` only points at `yakuwari.edn`.
   (`:autonomous :voice-required :approval-required :blocked`); a legacy or
   unknown word is a warning, because yakuwari.edn, not itonami.edn, is where
   it is fixed.
-- `profile refresh <p>|--all [--dry-run]` rewrites a stale bundle CID.
-  Peers verify the bundle against it, so a stale CID fails peer runs.
+- `profile refresh <p>|--all [--dry-run]` rewrites what is derived from the
+  profile's own files: a stale bundle CID (peers verify the bundle against
+  it, so a stale CID fails peer runs) and `:capabilities`, re-copied from
+  `yakuwari.edn` when the profile has one.
 - `itonamify --refresh` keeps the declared runtime, placement, rails,
   terminal/web policy and organisation keys.
 

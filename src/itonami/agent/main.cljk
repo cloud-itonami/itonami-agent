@@ -12,7 +12,7 @@
     itonami-agent profile itonamify <p>|--all [--dry-run]   write itonami.edn (additive)
     itonami-agent profile rail <p>|--all --to R [--dry-run] inference rail: murakumo | kotoba | itonami-p2p
     itonami-agent profile check <p>|--all [--summary]       validate itonami.edn and report drift (read-only)
-    itonami-agent profile refresh <p>|--all [--dry-run]     recompute the bundle CID
+    itonami-agent profile refresh <p>|--all [--dry-run]     recompute the bundle CID; re-copy capabilities
     itonami-agent profile organize <p>|--all --registry F [--dry-run]
                                                             place profiles in the organisation (schema v2)
     itonami-agent profile adopt <p>                         itonami ticks this profile's cron; Hermes stops
@@ -261,15 +261,18 @@
       (doseq [t targets]
         (let [home (profile/home t)
               m (try (profile/read-edn-file (h/join home "itonami.edn")) (catch :default _ nil))
-              m' (some->> m (profile/with-bundle home))]
+              m' (some->> m (profile/with-derived home))]
           (cond
             (nil? m) (println (str "skip    " t "  no itonami.edn"))
             (= m m') (println (str "keep    " t))
             :else (do (when-not (:dry-run opts) (profile/write-manifest! home m'))
                       (swap! n inc)
                       (println (str (if (:dry-run opts) "would  " "wrote   ") t "  "
-                                    (get-in m [:bundle :cid]) " -> " (get-in m' [:bundle :cid])))))))
-      (println (str @n " bundle CID(s) " (if (:dry-run opts) "would be " "") "refreshed")))
+                                    (if (= (:bundle m) (:bundle m'))
+                                      "bundle unchanged"
+                                      (str (get-in m [:bundle :cid]) " -> " (get-in m' [:bundle :cid])))
+                                    (when (not= (:capabilities m) (:capabilities m')) "  capabilities re-copied from yakuwari.edn")))))))
+      (println (str @n " manifest(s) " (if (:dry-run opts) "would be " "") "refreshed")))
 
     "organize"
     (let [reg (try (some-> (:registry opts) profile/read-edn-file) (catch :default _ nil))
