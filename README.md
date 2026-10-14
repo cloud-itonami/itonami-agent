@@ -31,7 +31,7 @@ the two can be swapped per profile.
 | `-p`, `-z` (stdout = final text, exit 1 + `… -z: reason` on stderr), `-m`, `--provider`, `-t`, `cron list/create/run/tick/runs/status`, `profile list/show`, `chat` | same commands; `cron create` also accepts `--no-agent`, `--monitor-script`, and `--monitor-url` |
 | `cron/executions.db` | Kotoba writes Hermes-shaped claimed/running/completed/failed rows with ownership, timestamps, and delivery outcome. A later run marks attempts `unknown` only when the prior owner is provably gone; it does not retry them automatically. Handoff adoption is not implemented |
 | `cron incidents` / `cron incidents ack <id>` | Kotoba groups failures by Hermes-compatible job/error signature, resolves them after success, and records acknowledgements and delivery outcomes. The delivery adapter and repeat-alert gate are not wired |
-| configured MCP stdio servers | discovered from `mcp_servers`, exposed as `mcp__server__tool`, and invoked with the configured command plus profile-scoped environment values. MCP subprocesses are disabled on peer runs. Streamable HTTP/SSE and OAuth MCP transports are not implemented |
+| configured MCP stdio and Streamable HTTP servers | discovered from `mcp_servers`, exposed as `mcp__server__tool`, and invoked with profile-scoped environment values and configured HTTP headers. Cached OAuth tokens can refresh with issuer binding and a Kotoba process lock; interactive OAuth login remains unsupported. MCP subprocesses are disabled on peer runs |
 | notepad, messaging gateway adapters, browser tools | **not implemented**; Kotoba also keeps its detailed local run log in `cron/itonami-runs.jsonl` |
 
 `delegate_task` is currently limited to up to three parallel foreground turns.
@@ -76,7 +76,7 @@ deleting it returns the profile to plain Hermes.
 Exactly one scheduler ticks a profile:
 
 - `profile readiness <p>|--all` checks active cron jobs for unsupported Kotoba
-  tools, remote MCP transports, and non-local delivery lanes.
+  tools, missing/unrefreshable OAuth caches, and non-local delivery lanes.
 - `profile adopt <p>` sets `:scheduler :itonami` and writes Hermes'
   `gateway.parked` marker, so the Hermes gateway stops ticking it;
   `gateway run` then ticks it. `profile adopt --all --dry-run` previews a
@@ -87,6 +87,15 @@ Exactly one scheduler ticks a profile:
 - `profile refresh-bundle <p>` recomputes the CID after files change without
   replacing the rest of `itonami.edn` (including custom bundle directories and
   scheduler ownership).
+- `profile hy-stage <p>|--all <artifact-dir> [--dry-run]` verifies the staged
+  migration manifest and every source/payload hash before copying sibling `.hy`
+  files into profile `scripts/`. It leaves `.py` sources and job references intact;
+  Kotoba-owned bundle CIDs are refreshed after files are staged.
+- `profile hy-migrate <p>|--all [--dry-run]` switches cron `script` and
+  `monitor_script` references only when a sibling `.hy` file exists, the profile
+  is readiness-clean, and Kotoba owns its scheduler with Hermes parked. Apply
+  mode holds the Kotoba tick lock and updates only the job fields, preserving
+  `.py` sources, job run state, and unknown `jobs.json` metadata.
 
 Hy cron scripts use the first configured interpreter among the job's
 `interpreter`, `cron.script_python`, `ITONAMI_PYTHON`, `HERMES_PYTHON`, then

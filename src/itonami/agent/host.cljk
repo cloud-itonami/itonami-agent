@@ -28,6 +28,7 @@
 (defn exists? [p] (and p (fs/existsSync p)))
 (defn dir? [p] (and (exists? p) (.isDirectory (fs/statSync p))))
 (defn file? [p] (and (exists? p) (.isFile (fs/statSync p))))
+(defn file-size [p] (.-size (fs/statSync p)))
 (defn symlink? [p] (and (exists? p) (.isSymbolicLink (fs/lstatSync p))))
 (defn slurp [p] (str (fs/readFileSync p "utf8")))
 (defn slurp-bytes [p] (fs/readFileSync p))

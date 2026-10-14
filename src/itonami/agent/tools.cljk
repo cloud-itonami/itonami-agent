@@ -18,7 +18,10 @@
             [itonami.agent.webguard :as webguard]
             [itonami.agent.process :as process]
             [itonami.agent.homeassistant :as homeassistant]
+            [itonami.agent.profile :as profile]
+            [itonami.agent.provider :as provider]
             [itonami.agent.yaml :as yaml]
+            ["node:crypto" :as crypto]
             ["node:sqlite" :as sqlite]))
 
 (defn- fn-schema [name desc props required]
@@ -70,6 +73,11 @@
    (fn-schema "web_extract" "Fetch up to 5 URLs and return their readable text."
               {"urls" {"type" "array" "items" {"type" "string"}} "char_limit" {"type" "integer"}}
               ["urls"])
+   "vision_analyze"
+   (fn-schema "vision_analyze" "Analyze an image using the active Kotoba provider chain. Remote URLs use the public-only web guard; local files must be readable by this run."
+              {"image_url" {"type" "string" "description" "Public http(s) image URL, base64 image data URL, or readable local image path."}
+               "question" {"type" "string" "description" "What to inspect or answer about the image."}}
+              ["image_url" "question"])
    "skill_view"
    (fn-schema "skill_view" "Read a skill's SKILL.md (or a file inside the skill)."
               {"name" {"type" "string"} "file_path" {"type" "string"}}
@@ -147,6 +155,95 @@
                "window" {"type" "integer" "minimum" 1 "maximum" 20 "description" "Messages on each side of the anchor (default 5)."}
                "role_filter" {"type" "string" "enum" ["user,assistant" "user,assistant,tool" "user" "assistant" "tool"]}}
               [])
+   "kanban_show"
+   (fn-schema "kanban_show" "Read a Hermes Kanban task with its parent/child links, comments, recent events, and runs."
+              {"task_id" {"type" "string" "description" "Kanban task id; defaults to the assigned task in a dispatcher worker."}
+               "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              [])
+   "kanban_list"
+   (fn-schema "kanban_list" "List bounded Kanban task summaries for board routing. Dispatcher task workers cannot use this board-wide tool."
+              {"assignee" {"type" "string"} "status" {"type" "string"}
+               "tenant" {"type" "string"} "include_archived" {"type" "boolean"}
+               "limit" {"type" "integer" "minimum" 1 "maximum" 200}
+               "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              [])
+   "kanban_heartbeat"
+   (fn-schema "kanban_heartbeat" "Record progress on a running Kanban task and extend this worker's matching claim when available."
+              {"task_id" {"type" "string" "description" "Kanban task id; defaults to the assigned task in a dispatcher worker."}
+               "note" {"type" "string" "description" "Optional short progress note."}
+               "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              [])
+   "kanban_complete"
+   (fn-schema "kanban_complete" "Complete a Kanban task with a structured handoff. A dispatcher worker may complete only its assigned task and matching run."
+              {"task_id" {"type" "string" "description" "Kanban task id; defaults to the assigned task in a dispatcher worker."}
+               "summary" {"type" "string"} "result" {"type" "string"}
+               "metadata" {"type" "object"} "created_cards" {"type" "array" "items" {"type" "string"}}
+               "artifacts" {"type" "array" "items" {"type" "string"}}
+               "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              [])
+   "kanban_block"
+   (fn-schema "kanban_block" "Stop work on a Kanban task and route it as dependency, human input, capability, or transient blocker."
+              {"task_id" {"type" "string" "description" "Kanban task id; defaults to the assigned task in a dispatcher worker."}
+               "reason" {"type" "string" "description" "Short explanation shown on the board."}
+               "kind" {"type" "string" "enum" ["dependency" "needs_input" "capability" "transient"]}
+               "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              ["reason"])
+   "kanban_request_review"
+   (fn-schema "kanban_request_review" "Move a Kanban implementation into the review phase and optionally assign a reviewer."
+              {"task_id" {"type" "string"} "summary" {"type" "string"}
+               "metadata" {"type" "object"} "reviewer" {"type" "string"}
+               "artifacts" {"type" "array" "items" {"type" "string"}}
+               "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              ["summary"])
+   "kanban_request_changes"
+   (fn-schema "kanban_request_changes" "Return a reviewed Kanban task to its implementer with a reason."
+              {"task_id" {"type" "string"} "reason" {"type" "string"}
+               "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              ["reason"])
+   "kanban_link"
+   (fn-schema "kanban_link" "Add a parent-to-child dependency edge between existing Kanban tasks."
+              {"parent_id" {"type" "string"} "child_id" {"type" "string"}
+               "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              ["parent_id" "child_id"])
+   "kanban_unblock"
+   (fn-schema "kanban_unblock" "Unblock a task and restore its resumable phase, respecting parent dependencies. Orchestrator-only."
+              {"task_id" {"type" "string"} "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              ["task_id"])
+   "kanban_create"
+   (fn-schema "kanban_create" "Create an assigned Kanban task, optionally gated by parent tasks."
+              {"title" {"type" "string"} "assignee" {"type" "string"} "body" {"type" "string"}
+               "parents" {"type" "array" "items" {"type" "string"}}
+               "tenant" {"type" "string"} "priority" {"type" "integer"}
+               "workspace_kind" {"type" "string" "enum" ["scratch" "dir" "worktree"]}
+               "workspace_path" {"type" "string"} "project" {"type" "string"}
+               "triage" {"type" "boolean"} "idempotency_key" {"type" "string"}
+               "max_runtime_seconds" {"type" "integer"} "initial_status" {"type" "string" "enum" ["running" "blocked"]}
+               "skills" {"type" "array" "items" {"type" "string"}}
+               "goal_mode" {"type" "boolean"} "goal_max_turns" {"type" "integer"}
+               "completion_contract" {"type" "string"} "model" {"type" "string"}
+               "provider" {"type" "string"} "board" {"type" "string"}}
+              ["title" "assignee"])
+   "kanban_attachments"
+   (fn-schema "kanban_attachments" "List files attached to a Kanban task, including their stored paths and metadata."
+              {"task_id" {"type" "string"} "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              [])
+   "kanban_attach"
+   (fn-schema "kanban_attach" "Attach a base64-encoded file to a Kanban task."
+              {"task_id" {"type" "string"} "filename" {"type" "string"}
+               "content_base64" {"type" "string"} "content_type" {"type" "string"}
+               "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              ["task_id" "filename" "content_base64"])
+   "kanban_attach_url"
+   (fn-schema "kanban_attach_url" "Download a public http(s) URL and attach its bytes to a Kanban task (25 MB maximum)."
+              {"task_id" {"type" "string"} "url" {"type" "string"} "filename" {"type" "string"}
+               "content_type" {"type" "string"} "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              ["url"])
+   "kanban_comment"
+   (fn-schema "kanban_comment" "Append a durable comment to a Hermes Kanban task. The author is the active Kotoba profile; callers cannot impersonate another profile."
+              {"task_id" {"type" "string" "description" "Kanban task id."}
+               "body" {"type" "string" "description" "Markdown comment to add to the task thread."}
+               "board" {"type" "string" "description" "Optional Kanban board slug."}}
+              ["task_id" "body"])
    "ha_list_entities"
    (fn-schema "ha_list_entities" "List Home Assistant entities, optionally filtered by domain or area."
               {"domain" {"type" "string"} "area" {"type" "string"}} [])
@@ -180,7 +277,7 @@
    "ha_list_entities" "ha_get_state" "ha_list_services" "ha_call_service"
    "kanban_show" "kanban_list" "kanban_complete" "kanban_block"
    "kanban_request_review" "kanban_request_changes" "kanban_heartbeat"
-   "kanban_comment" "kanban_create" "kanban_link" "kanban_unblock"
+   "kanban_comment" "kanban_create"
    "kanban_attach" "kanban_attach_url" "kanban_attachments" "computer_use"
    "manage_connections"])
 
@@ -268,7 +365,9 @@
   "Toolset names neither implemented by Kotoba nor in Hermes' current catalog."
   ([sets] (unsupported-toolsets sets #{}))
   ([sets additional]
-   (vec (distinct (remove #(or (contains? toolsets %) (contains? schemas %) (contains? additional %)) sets)))))
+   (vec (distinct (remove #(or (contains? toolsets %) (contains? schemas %) (contains? additional %)
+                               (and (string? %) (str/starts-with? % "mcp-")
+                                    (contains? additional (subs % 4)))) sets)))))
 
 (def approval-free-tools #{"read_file" "search_files" "web_search" "web_extract" "skills_list" "skill_view" "todo_list" "delegate_task"
                            "ha_list_entities" "ha_get_state" "ha_list_services"})
@@ -458,6 +557,76 @@
                                           (audit {:url (str u) :denied (boolean reason) :reason (or reason :error)})
                                           {"url" u "error" (.-message e)}))))))]
       (ok {"results" (vec res)}))))
+
+(def ^:private image-types
+  {"jpg" "image/jpeg" "jpeg" "image/jpeg" "png" "image/png"
+   "webp" "image/webp" "gif" "image/gif"})
+
+(declare vision-complete)
+
+(defn vision-analyze
+  "Analyze a bounded image with the active Kotoba provider chain."
+  [ctx {:strs [image_url question]}]
+  (let [source (str/trim (str image_url))
+        q (str/trim (str question))
+        cap (* 5 1024 1024)
+        image-data
+        (cond
+          (str/starts-with? source "data:")
+          (when (<= (count source) 6990600)
+            (when-let [[_ mime b64] (re-matches #"(?is)^data:(image/(?:jpeg|png|webp|gif));base64,([A-Za-z0-9+/]*={0,2})$" source)]
+            (let [bytes (.from js/Buffer b64 "base64")]
+              (when (and (pos? (.-length bytes)) (<= (.-length bytes) cap))
+                {:mime mime :base64 (.toString bytes "base64")}))))
+
+          (re-matches #"(?i)^https?://.+" source) nil
+
+          :else
+          (let [path (resolve-path ctx source)
+                real (try (h/realpath path) (catch :default _ nil))
+                ext (some-> path (str/split #"\.") last str/lower-case)
+                mime (get image-types ext)]
+            (when (and real mime (h/file? real) (readable? ctx "vision_analyze" real))
+              (when (<= (h/file-size real) cap)
+                (let [bytes (h/slurp-bytes real)]
+                  (when (pos? (.-length bytes))
+                    {:mime mime :base64 (.toString bytes "base64")}))))))]
+    (cond
+      (str/blank? source) (p/resolved (err "image_url is required"))
+      (str/blank? q) (p/resolved (err "question is required"))
+      (str/starts-with? source "data:")
+      (if image-data
+        (vision-complete ctx q image-data)
+        (p/resolved (err "vision_analyze: data URL must be base64 JPEG, PNG, WebP, or GIF up to 5 MiB")))
+      (re-matches #"(?i)^https?://.+" source)
+      (-> (webguard/fetch-bytes source {:max-bytes cap :allow (:web-allow (policy ctx))
+                                        :public-override (:web-public-override ctx #{})})
+          (p/then (fn [{:keys [status content-type bytes truncated?]}]
+                    (let [mime (some-> content-type (str/split #";") first str/lower-case str/trim)]
+                      (cond
+                        (not (<= 200 status 299)) (err (str "vision_analyze: HTTP " status))
+                        truncated? (err "vision_analyze: image exceeds 5 MiB limit")
+                        (not (contains? (set (vals image-types)) mime)) (err "vision_analyze: URL did not return JPEG, PNG, WebP, or GIF")
+                        :else (vision-complete ctx q {:mime mime :base64 (.toString bytes "base64")})))))
+          (p/catch (fn [e] (err (str "vision_analyze: " (.-message e))))) )
+      image-data (vision-complete ctx q image-data)
+      :else (p/resolved (err "vision_analyze: local image must be readable JPEG, PNG, WebP, or GIF up to 5 MiB")))))
+
+(defn- vision-complete [ctx question {:keys [mime base64]}]
+  (if (seq (:model-hops ctx))
+    (-> (provider/complete (:model-hops ctx) (:tool-env ctx)
+                           {:messages [{"role" "user" "content"
+                                        [{"type" "text" "text" question}
+                                         {"type" "image_url" "image_url" {"url" (str "data:" mime ";base64," base64)}}]}]
+                            :reasoning-effort (:reasoning-effort ctx)
+                            :max-tokens 2048 :rounds 1})
+        (p/then (fn [r]
+                  (if-let [msg (get-in r [:ok :message])]
+                    (ok {"success" true "analysis" (get msg "content")
+                         "provider" (get-in r [:ok :provider]) "model" (get-in r [:ok :model])})
+                    (err (str "vision_analyze: " (get-in r [:err :error] "no multimodal provider available"))))))
+        (p/catch (fn [e] (err (str "vision_analyze: " (.-message e))))))
+    (p/resolved (err "vision_analyze: no provider chain is available"))))
 
 (def search-endpoint "https://html.duckduckgo.com/html/?q=")
 
@@ -992,6 +1161,957 @@
 (defn- ha-tool [name]
   (fn [ctx args] (homeassistant/call ctx name args)))
 
+(defn- kanban-env [ctx name]
+  (or (get (:tool-env ctx) name) (h/env name)))
+
+(defn- kanban-board-slug? [slug]
+  (and (string? slug) (re-matches #"[a-z0-9][a-z0-9_-]{0,63}" slug)))
+
+(defn- kanban-root [ctx]
+  (let [override (kanban-env ctx "HERMES_KANBAN_HOME")
+        hermes-home (some-> (kanban-env ctx "HERMES_HOME") h/expand)
+        profile-home (:home ctx)
+        profile-root (when (and profile-home (str/includes? profile-home "/.hermes/profiles/"))
+                       (h/dirname (h/dirname profile-home)))]
+    (h/expand (or override profile-root
+                  (when hermes-home
+                    (if (str/includes? hermes-home "/.hermes/profiles/")
+                      (h/dirname (h/dirname hermes-home))
+                      hermes-home))
+                  (h/join (host-home ctx) ".hermes")))))
+
+(defn- kanban-db-path [ctx args]
+  (if-let [override (not-empty (kanban-env ctx "HERMES_KANBAN_DB"))]
+    (h/expand override)
+    (let [root (kanban-root ctx)
+          explicit (get args "board")
+          env-board (kanban-env ctx "HERMES_KANBAN_BOARD")
+          current-file (h/join root "kanban" "current")
+          current (when (h/file? current-file) (str/trim (h/slurp current-file)))
+          current-dir (when (kanban-board-slug? current) (h/join root "kanban" "boards" current))
+          current-exists? (and current-dir
+                               (or (h/file? (h/join current-dir "board.json"))
+                                   (h/file? (h/join current-dir "kanban.db"))))
+          board (cond
+                  (some? explicit) explicit
+                  (not (str/blank? (str env-board))) env-board
+                  current-exists? current
+                  :else "default")]
+      (when-not (kanban-board-slug? board)
+        (throw (ex-info "invalid Kanban board slug" {:board board})))
+      (if (= board "default")
+        (h/join root "kanban.db")
+        (h/join root "kanban" "boards" board "kanban.db")))))
+
+(defn- redact-kanban-comment [body]
+  ;; Comments are injected into later workers' context. Mirror Hermes' forced
+  ;; redaction boundary for the common credential forms before persistence.
+  (-> (str/trim body)
+      (str/replace #"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"
+                   "[REDACTED PRIVATE KEY]")
+      (str/replace #"(?i)(\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|credential|authorization)\b\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+                   (fn [[_ prefix]] (str prefix "[REDACTED]")))
+      (str/replace #"(?i)(\bbearer\s+)[A-Za-z0-9._~+/-]+=*"
+                   (fn [[_ prefix]] (str prefix "[REDACTED]")))
+      (str/replace #"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}|\bgh[pousr]_[A-Za-z0-9]{20,}|\bgithub_pat_[A-Za-z0-9_]{20,}|\bxox[abpr]-[A-Za-z0-9-]{10,}|\bAKIA[0-9A-Z]{16}\b"
+                   "[REDACTED TOKEN]")
+      (str/replace #"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,})?\b"
+                   "[REDACTED TOKEN]")
+      (str/replace #"(?i)(://[^:/\s@]+:)[^@\s]+(@)"
+                   (fn [[_ prefix suffix]] (str prefix "[REDACTED]" suffix)))))
+
+(defn kanban-show
+  "Read task state from the shared Hermes Kanban SQLite board."
+  [ctx {:strs [task_id] :as args}]
+  (if (:peer? ctx)
+    (err "kanban_show is unavailable in peer runs; Kanban state is host-local")
+    (let [task-id (or (not-empty task_id) (not-empty (kanban-env ctx "HERMES_KANBAN_TASK")))]
+      (if-not task-id
+        (err "kanban_show requires task_id outside a dispatcher task")
+        (let [db-path (kanban-db-path ctx args)]
+        (cond
+          (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+          (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+          :else
+          (let [db (sqlite/DatabaseSync. db-path)]
+            (try
+              (let [task (first (sqlite-records db "SELECT * FROM tasks WHERE id = ?" task-id))]
+                (if-not task
+                  (err (str "Kanban task not found: " task-id))
+                  (let [parents (sqlite-records db "SELECT t.id, t.status FROM task_links l JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ? ORDER BY t.id" task-id)
+                        children (sqlite-records db "SELECT child_id AS id FROM task_links WHERE parent_id = ? ORDER BY child_id" task-id)
+                        comments (sqlite-records db "SELECT author, body, created_at FROM task_comments WHERE task_id = ? ORDER BY id" task-id)
+                        events (vec (reverse (sqlite-records db "SELECT kind, payload, created_at, run_id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 50" task-id)))
+                        runs (sqlite-records db "SELECT id, profile, status, outcome, summary, error, metadata, started_at, ended_at FROM task_runs WHERE task_id = ? ORDER BY id" task-id)
+                        safe-task (select-keys task ["id" "title" "body" "assignee" "status" "tenant" "priority"
+                                                     "workspace_kind" "workspace_path" "created_by" "created_at"
+                                                     "started_at" "completed_at" "result" "current_run_id"
+                                                     "model_override" "provider_override" "completion_contract"
+                                                     "last_failure_error"])
+                        context (str "Task " task-id ": " (get task "title") "\n"
+                                     (or (get task "body") "")
+                                     (when (seq comments)
+                                       (str "\n\nComments:\n"
+                                            (str/join "\n" (map #(str "- " (get % "author") ": " (redact-kanban-comment (get % "body"))) comments)))))
+                        safe-comments (mapv #(update % "body" redact-kanban-comment) comments)]
+                    (h/json-str {"task" safe-task
+                                 "parents" (mapv #(get % "id") parents)
+                                 "unsatisfied_parents" (filterv #(not (contains? #{"done" "archived"} (get % "status"))) parents)
+                                 "children" (mapv #(get % "id") children)
+                                 "comments" safe-comments
+                                 "events" events
+                                 "runs" runs
+                                 "worker_context" context}))))
+              (catch :default e (err (str "kanban_show: " (.-message e))))
+              (finally (.close db))))))))))
+
+(def ^:private kanban-resume-events
+  "blocked block_loop_detected dependency_wait gave_up unblocked changes_requested review_reopened status reclaimed stale timed_out crashed spawn_failed rate_limited")
+
+(defn- kanban-event-payload [row]
+  (when-let [payload (get row "payload")]
+    (try (h/json-parse payload) (catch :default _ {}))))
+
+(defn- kanban-sticky-block? [db task-id]
+  (let [last-block (first (sqlite-records db
+                            "SELECT kind FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'unblocked') ORDER BY id DESC LIMIT 1"
+                            task-id))
+        unblocked-id (or (some-> (first (sqlite-records db
+                                      "SELECT MAX(id) AS id FROM task_events WHERE task_id = ? AND kind = 'unblocked'"
+                                      task-id)) (get "id")) 0)
+        gave-up (first (sqlite-records db
+                       "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'gave_up' AND id > ? ORDER BY id DESC LIMIT 1"
+                       task-id unblocked-id))]
+    (or (= "blocked" (get last-block "kind"))
+        (true? (get (kanban-event-payload gave-up) "sticky")))))
+
+(defn- kanban-resume-status [db task-id]
+  (let [row (first (apply sqlite-records db
+                   (str "SELECT payload FROM task_events WHERE task_id = ? AND kind IN ("
+                        (str/join "," (repeat (count (str/split kanban-resume-events #" ")) "?"))
+                        ") ORDER BY id DESC LIMIT 1")
+                   (into [task-id] (str/split kanban-resume-events #" "))))
+        payload (kanban-event-payload row)]
+    (if (some #(= "review" (get payload %)) ["resume_status" "retry_status" "source_status"])
+      "review" "ready")))
+
+(defn- kanban-recompute-ready! [ctx db]
+  (let [failure-limit (or (get-in ctx [:config "kanban" "failure_limit"]) 2)
+        promoted (atom 0)]
+    (.exec db "BEGIN IMMEDIATE")
+    (try
+      (doseq [row (sqlite-records db "SELECT id, status, consecutive_failures, max_retries FROM tasks WHERE status IN ('todo', 'blocked')")
+              :let [task-id (get row "id")
+                    status (get row "status")
+                    parents (sqlite-records db "SELECT t.status FROM tasks t JOIN task_links l ON l.parent_id = t.id WHERE l.child_id = ?" task-id)
+                    satisfied? (every? #(contains? #{"done" "archived"} (get % "status")) parents)
+                    sticky? (and (= status "blocked") (kanban-sticky-block? db task-id))
+                    effective-limit (or (get row "max_retries") failure-limit)]
+              :when (and satisfied? (not sticky?)
+                         (or (= status "todo") (< (or (get row "consecutive_failures") 0) effective-limit)))]
+        (let [resume (kanban-resume-status db task-id)
+              timestamp (js/Math.floor (/ (h/now-ms) 1000))
+              payload (when (= resume "review") (h/json-str {"status" resume}))]
+          (.run (.prepare db "UPDATE tasks SET status = ? WHERE id = ? AND status = ?") resume task-id status)
+          (.run (.prepare db "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'promoted', ?, ?)")
+                task-id payload timestamp)
+          (swap! promoted inc)))
+      (.exec db "COMMIT")
+      @promoted
+      (catch :default e
+        (try (.exec db "ROLLBACK") (catch :default _ nil))
+        (throw e)))))
+
+(defn kanban-list
+  "List bounded Kanban task summaries from the shared Hermes board."
+  [ctx {:strs [assignee status tenant include_archived limit] :as args}]
+  (cond
+    (:peer? ctx) (err "kanban_list is unavailable in peer runs; Kanban state is host-local")
+    (kanban-env ctx "HERMES_KANBAN_TASK") (err "kanban_list is orchestrator-only; dispatcher workers may only inspect their assigned task")
+    (and status (not (contains? #{"triage" "todo" "ready" "running" "blocked" "done" "archived"} status)))
+    (err "status must be one of triage, todo, ready, running, blocked, done, archived")
+    (and limit (or (not (number? limit)) (not= limit (js/Math.floor limit)) (< limit 1) (> limit 200)))
+    (err "limit must be an integer from 1 to 200")
+    :else
+    (let [db-path (kanban-db-path ctx args)
+          row-limit (or limit 50)]
+      (cond
+        (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+        (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+        :else
+        (let [db (sqlite/DatabaseSync. db-path)]
+          (try
+            (let [promoted (kanban-recompute-ready! ctx db)
+                  filters (cond-> []
+                            assignee (conj ["assignee = ?" assignee])
+                            status (conj ["status = ?" status])
+                            tenant (conj ["tenant = ?" tenant])
+                            (and (not (true? include_archived)) (not= status "archived"))
+                            (conj ["status != 'archived'" nil]))
+                  where (if (seq filters) (str " WHERE " (str/join " AND " (map first filters))) "")
+                  params (mapv second (remove #(nil? (second %)) filters))
+                  rows (apply sqlite-records db
+                              (str "SELECT * FROM tasks" where " ORDER BY priority DESC, created_at ASC LIMIT ?")
+                              (concat params [(inc row-limit)]))
+                  truncated (> (count rows) row-limit)
+                  tasks (mapv (fn [task]
+                                (let [task-id (get task "id")
+                                      parents (mapv #(get % "parent_id") (sqlite-records db "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id" task-id))
+                                      children (mapv #(get % "child_id") (sqlite-records db "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id" task-id))]
+                                  (assoc (select-keys task ["id" "title" "assignee" "status" "priority" "tenant"
+                                                            "workspace_kind" "workspace_path" "project_id" "created_by"
+                                                            "created_at" "started_at" "completed_at" "current_run_id"
+                                                            "model_override" "provider_override"])
+                                         "parents" parents "children" children
+                                         "parent_count" (count parents) "child_count" (count children))))
+                              (take row-limit rows))]
+              (h/json-str {"tasks" tasks "count" (count tasks) "limit" row-limit
+                           "promoted" promoted
+                           "truncated" truncated
+                           "next_limit" (when (and truncated (< row-limit 200)) (min 200 (* row-limit 2)))}))
+            (catch :default e (err (str "kanban_list: " (.-message e))))
+            (finally (.close db))))))))
+
+(defn kanban-heartbeat
+  "Record a liveness event for a running Kanban task."
+  [ctx {:strs [task_id note] :as args}]
+  (let [task-id (or (not-empty task_id) (not-empty (kanban-env ctx "HERMES_KANBAN_TASK")))
+        run-id (when (= task-id (kanban-env ctx "HERMES_KANBAN_TASK"))
+                 (js/parseInt (kanban-env ctx "HERMES_KANBAN_RUN_ID") 10))
+        claim-lock (kanban-env ctx "HERMES_KANBAN_CLAIM_LOCK")]
+    (cond
+      (:peer? ctx) (err "kanban_heartbeat is unavailable in peer runs; Kanban state is host-local")
+      (not task-id) (err "kanban_heartbeat requires task_id outside a dispatcher task")
+      :else
+      (let [db-path (kanban-db-path ctx args)]
+        (cond
+          (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+          (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+          :else
+          (let [db (sqlite/DatabaseSync. db-path)]
+            (try
+              (.exec db "BEGIN IMMEDIATE")
+              (let [now (js/Math.floor (/ (h/now-ms) 1000))
+                    raw-ttl (some-> (kanban-env ctx "HERMES_KANBAN_CLAIM_TTL_SECONDS") js/parseInt)
+                    ttl (if (and raw-ttl (not (js/Number.isNaN raw-ttl))) raw-ttl 900)
+                    claim-expires (+ now (max 1 ttl))]
+                (when claim-lock
+                  (let [claim-update (.run (.prepare db "UPDATE tasks SET claim_expires = ? WHERE id = ? AND status = 'running' AND claim_lock = ?")
+                                           claim-expires task-id claim-lock)]
+                    (when-not (= 1 (.-changes claim-update))
+                      (throw (ex-info "could not heartbeat claim (claim ownership changed)" {})))
+                    (let [claim-run (get (first (sqlite-records db "SELECT current_run_id FROM tasks WHERE id = ?" task-id)) "current_run_id")]
+                      (when claim-run
+                        (.run (.prepare db "UPDATE task_runs SET claim_expires = ? WHERE id = ? AND task_id = ?")
+                              claim-expires claim-run task-id)))))
+                (let [owned-run (when (and run-id (not (js/Number.isNaN run-id))) run-id)
+                      sql (str "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ? AND status = 'running'"
+                               (when owned-run " AND current_run_id = ?"))
+                      stmt (.prepare db sql)
+                      updated (if owned-run
+                                (.run stmt now task-id owned-run)
+                                (.run stmt now task-id))]
+                  (when-not (= 1 (.-changes updated))
+                    (throw (ex-info "could not heartbeat task (unknown id, not running, or run ownership changed)" {})))
+                  (let [current-run (or owned-run
+                                        (get (first (sqlite-records db "SELECT current_run_id FROM tasks WHERE id = ?" task-id)) "current_run_id"))]
+                    (when current-run
+                      (.run (.prepare db "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ? AND task_id = ?")
+                            now current-run task-id))
+                    (.run (.prepare db "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'heartbeat', ?, ?)")
+                          task-id current-run (when-not (str/blank? note) (h/json-str {"note" note})) now))
+                  (.exec db "COMMIT")
+                  (ok {"task_id" task-id})))
+              (catch :default e
+                (try (.exec db "ROLLBACK") (catch :default _ nil))
+                (err (str "kanban_heartbeat: " (.-message e))))
+              (finally (.close db)))))))))
+
+(defn kanban-complete
+  "Complete an owned Kanban task and persist the run handoff atomically."
+  [ctx {:strs [task_id summary result metadata created_cards artifacts] :as args}]
+  (let [task-id (or (not-empty task_id) (not-empty (kanban-env ctx "HERMES_KANBAN_TASK")))
+        scoped-task (kanban-env ctx "HERMES_KANBAN_TASK")
+        raw-run (when (= task-id scoped-task) (kanban-env ctx "HERMES_KANBAN_RUN_ID"))
+        run-id (when raw-run (js/parseInt raw-run 10))
+        summary (when (string? summary) (redact-kanban-comment summary))
+        result (when (string? result) (redact-kanban-comment result))
+        metadata (when (map? metadata)
+                   (try (h/json-parse (redact-kanban-comment (h/json-str metadata)))
+                        (catch :default _ nil)))
+        created-cards (if (sequential? created_cards) (vec (remove str/blank? (map str created_cards))) [])
+        artifacts (if (sequential? artifacts) (vec (remove str/blank? (map str artifacts))) [])]
+    (cond
+      (:peer? ctx) (err "kanban_complete is unavailable in peer runs; Kanban state is host-local")
+      (not task-id) (err "kanban_complete requires task_id outside a dispatcher task")
+      (and scoped-task (not= scoped-task task-id)) (err "kanban_complete may only complete the assigned dispatcher task")
+      (and raw-run (or (js/Number.isNaN run-id) (not (pos? run-id)))) (err "kanban_complete requires a valid dispatcher run id")
+      (and (contains? args "metadata") (not (map? (get args "metadata")))) (err "metadata must be an object")
+      (and created_cards (or (not (sequential? created_cards)) (some (complement string?) created_cards)))
+      (err "created_cards must be an array of task ids")
+      (and artifacts (or (not (sequential? artifacts)) (some (complement string?) artifacts)))
+      (err "artifacts must be an array of file paths")
+      (or (seq artifacts) (seq (get metadata "artifacts")))
+      (err "kanban_complete cannot preserve artifact files yet; omit artifacts until Kotoba artifact storage is available")
+      :else
+      (let [db-path (kanban-db-path ctx args)]
+        (cond
+          (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+          (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+          :else
+          (let [db (sqlite/DatabaseSync. db-path)]
+            (try
+              (.exec db "BEGIN IMMEDIATE")
+              (let [task (first (sqlite-records db "SELECT status, result, current_run_id, claim_lock, created_at, assignee FROM tasks WHERE id = ?" task-id))
+                    status (get task "status")
+                    current-run (get task "current_run_id")
+                    actual-summary (or (not-empty summary) (not-empty result) (not-empty (get task "result"))
+                                       (when (= status "review") "Review approved without additional evidence."))
+                    parents (sqlite-records db "SELECT t.id, t.status FROM task_links l JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ?" task-id)
+                    unsatisfied (filterv #(not (contains? #{"done" "archived"} (get % "status"))) parents)
+                    child-ids (set (map #(get % "child_id") (sqlite-records db "SELECT child_id FROM task_links WHERE parent_id = ?" task-id)))
+                    created-missing (filterv (fn [id]
+                                               (let [child (first (sqlite-records db "SELECT created_by FROM tasks WHERE id = ?" id))
+                                                     creator (get child "created_by")]
+                                                 (not (and child
+                                                           (or (and creator
+                                                                    (or (= creator (get task "assignee"))
+                                                                        (= creator task-id)))
+                                                               (contains? child-ids id))))))
+                                             created-cards)]
+                (when-not task (throw (ex-info (str "Kanban task not found: " task-id) {})))
+                (when (seq unsatisfied)
+                  (throw (ex-info (str "unsatisfied parent dependencies: "
+                                       (str/join ", " (map #(str (get % "id") " (" (get % "status") ")") unsatisfied))) {})))
+                (when (seq created-missing)
+                  (throw (ex-info (str "created_cards do not exist: " (str/join ", " created-missing)) {})))
+                (when-not (contains? #{"running" "ready" "blocked" "review"} status)
+                  (throw (ex-info (str "task cannot be completed from status " status) {})))
+                (when (and (= status "running") (or (nil? run-id) (not= run-id current-run)))
+                  (throw (ex-info "running task completion requires the matching dispatcher run id" {})))
+                (when (and (not= status "running") current-run)
+                  (throw (ex-info "task has an active run but is not in running status" {})))
+                (when (and (not= status "review") (str/blank? (or actual-summary "")))
+                  (throw (ex-info "completion needs non-empty evidence in summary or result" {})))
+                (let [now (js/Math.floor (/ (h/now-ms) 1000))
+                      handoff (or (not-empty summary) (not-empty result))
+                      metadata-json (when (and metadata (seq (js/Object.keys (clj->js metadata)))) (h/json-str metadata))
+                      updated (.run (.prepare db
+                                "UPDATE tasks SET status='done', result=?, completed_at=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL, block_kind=NULL, block_recurrences=0, consecutive_failures=0, last_failure_error=NULL WHERE id=? AND status=? AND ((current_run_id IS NULL AND ? IS NULL) OR current_run_id=?)")
+                                result now task-id status current-run current-run)]
+                  (when-not (= 1 (.-changes updated))
+                    (throw (ex-info "task status or run ownership changed before completion" {})))
+                  (let [run-update (when current-run
+                                     (.run (.prepare db "UPDATE task_runs SET status='done', outcome='completed', summary=?, error=NULL, metadata=?, ended_at=?, claim_expires=NULL WHERE id=? AND task_id=? AND ended_at IS NULL")
+                                           (or handoff actual-summary) metadata-json now current-run task-id))]
+                    (when (and current-run (not= 1 (.-changes run-update)))
+                      (throw (ex-info "active task run was already closed" {}))))
+                  (let [completed-run (or current-run
+                                          (.-lastInsertRowid (.run (.prepare db "INSERT INTO task_runs (task_id, profile, status, outcome, summary, metadata, started_at, ended_at) VALUES (?, ?, 'done', 'completed', ?, ?, ?, ?)")
+                                                                  task-id (or (get task "assignee") (:profile ctx))
+                                                                  (or handoff actual-summary) metadata-json
+                                                                  (or (get task "created_at") now) now)))
+                        event-summary (or handoff actual-summary)
+                        summary-line (first (str/split (str event-summary) #"\n"))
+                        payload (h/json-str (cond-> {"result_len" (count (or result ""))
+                                                     "summary" (when-not (str/blank? summary-line)
+                                                                 (subs summary-line 0 (min 400 (count summary-line))))}
+                                              (seq created-cards) (assoc "verified_cards" created-cards)))]
+                    (.run (.prepare db "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'completed', ?, ?)")
+                          task-id completed-run payload now)
+                    (.exec db "COMMIT")
+                    (try (kanban-recompute-ready! ctx db) (catch :default _ nil))
+                    (ok {"task_id" task-id "status" "done" "run_id" completed-run}))))
+              (catch :default e
+                (try (.exec db "ROLLBACK") (catch :default _ nil))
+                (err (str "kanban_complete: " (.-message e))))
+              (finally (.close db)))))))))
+
+(defn kanban-block
+  "Route an owned Kanban worker run to a blocked or dependency-wait state."
+  [ctx {:strs [task_id reason kind] :as args}]
+  (let [task-id (or (not-empty task_id) (not-empty (kanban-env ctx "HERMES_KANBAN_TASK")))
+        scoped-task (kanban-env ctx "HERMES_KANBAN_TASK")
+        raw-run (when (= task-id scoped-task) (kanban-env ctx "HERMES_KANBAN_RUN_ID"))
+        run-id (when raw-run (js/parseInt raw-run 10))
+        reason (when (string? reason) (redact-kanban-comment reason))
+        allowed-kinds #{"dependency" "needs_input" "capability" "transient"}]
+    (cond
+      (:peer? ctx) (err "kanban_block is unavailable in peer runs; Kanban state is host-local")
+      (not task-id) (err "kanban_block requires task_id outside a dispatcher task")
+      (and scoped-task (not= scoped-task task-id)) (err "kanban_block may only block the assigned dispatcher task")
+      (or (not (string? reason)) (str/blank? reason)) (err "reason is required; explain what stopped the task")
+      (and kind (not (contains? allowed-kinds kind))) (err "kind must be dependency, needs_input, capability, or transient")
+      (and raw-run (or (js/Number.isNaN run-id) (not (pos? run-id)))) (err "kanban_block requires a valid dispatcher run id")
+      :else
+      (let [db-path (kanban-db-path ctx args)]
+        (cond
+          (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+          (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+          :else
+          (let [db (sqlite/DatabaseSync. db-path)]
+            (try
+              (.exec db "BEGIN IMMEDIATE")
+              (let [task (first (sqlite-records db "SELECT status, block_kind, block_recurrences, current_run_id, goal_mode FROM tasks WHERE id = ?" task-id))
+                    status (get task "status")
+                    current-run (get task "current_run_id")
+                    parent-rows (sqlite-records db "SELECT t.status FROM task_links l JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ?" task-id)
+                    parents-satisfied? (every? #(contains? #{"done" "archived"} (get % "status")) parent-rows)
+                    requested-kind kind
+                    kind (if (and (= kind "dependency") parents-satisfied?) "needs_input" kind)
+                    source-status (if (= status "running")
+                                    (let [claimed (first (sqlite-records db "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'claimed' ORDER BY id DESC LIMIT 1" task-id current-run))
+                                          payload (kanban-event-payload claimed)]
+                                      (if (= "review" (get payload "source_status")) "review" "ready"))
+                                    "ready")]
+                (when-not task (throw (ex-info (str "Kanban task not found: " task-id) {})))
+                (when (and (= 1 (get task "goal_mode")) (not (contains? #{"dependency" "needs_input"} kind)))
+                  (throw (ex-info "goal_mode tasks may only block with kind dependency or needs_input" {})))
+                (if (= status "blocked")
+                  (do
+                    (when (or (nil? kind) raw-run (some? (get task "block_kind")) current-run)
+                      (throw (ex-info "blocked task cannot be reclassified by this worker" {})))
+                    (let [classified (.run (.prepare db "UPDATE tasks SET block_kind = ?, block_recurrences = 1 WHERE id = ? AND status = 'blocked' AND block_kind IS NULL AND current_run_id IS NULL")
+                                            kind task-id)]
+                      (when-not (= 1 (.-changes classified))
+                        (throw (ex-info "blocked task changed before reclassification" {}))))
+                    (.run (.prepare db "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'blocked', ?, ?)")
+                          task-id (h/json-str {"kind" kind "reason" reason "classified_in_place" true})
+                          (js/Math.floor (/ (h/now-ms) 1000)))
+                    (.exec db "COMMIT")
+                    (ok {"task_id" task-id "status" "blocked" "block_kind" kind "classified_in_place" true}))
+                  (do
+                    (when-not (contains? #{"running" "ready"} status)
+                      (throw (ex-info (str "could not block task from status " status) {})))
+                    (when (and (= status "running") (or (nil? run-id) (not= run-id current-run)))
+                      (throw (ex-info "running task block requires the matching dispatcher run id" {})))
+                    (let [recurrences (if (= (get task "block_kind") kind)
+                                        (inc (or (get task "block_recurrences") 0)) 1)
+                          dependency? (= "dependency" kind)
+                          escalate? (and (not dependency?) (>= recurrences 2))
+                          new-status (cond dependency? "todo" escalate? "triage" :else "blocked")
+                          event-kind (cond dependency? "dependency_wait" escalate? "block_loop_detected" :else "blocked")
+                          payload (cond-> {"reason" reason "kind" kind "source_status" source-status}
+                                    (not dependency?) (assoc "recurrences" recurrences)
+                                    escalate? (assoc "limit" 2)
+                                    (and (= requested-kind "dependency") (not= kind requested-kind))
+                                    (assoc "requested_kind" requested-kind "rekind_reason" "no_open_parent"))
+                          now (js/Math.floor (/ (h/now-ms) 1000))
+                          updated (.run (.prepare db "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, block_kind=?, block_recurrences=? WHERE id=? AND status=? AND ((current_run_id IS NULL AND ? IS NULL) OR current_run_id=?)")
+                                        new-status kind (if dependency? (get task "block_recurrences") recurrences)
+                                        task-id status current-run current-run)]
+                      (when-not (= 1 (.-changes updated))
+                        (throw (ex-info "task status or run ownership changed before block" {})))
+                      (when current-run
+                        (let [ended (.run (.prepare db "UPDATE task_runs SET status='blocked', outcome='blocked', summary=?, ended_at=?, claim_expires=NULL WHERE id=? AND task_id=? AND ended_at IS NULL")
+                                          reason now current-run task-id)]
+                          (when-not (= 1 (.-changes ended))
+                            (throw (ex-info "active task run was already closed" {})))))
+                      (.run (.prepare db "UPDATE tasks SET current_run_id=NULL WHERE id=?") task-id)
+                      (.run (.prepare db "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)")
+                            task-id current-run event-kind (h/json-str payload) now)
+                      (.exec db "COMMIT")
+                      (ok {"task_id" task-id "status" new-status "block_kind" kind})))))
+              (catch :default e
+                (try (.exec db "ROLLBACK") (catch :default _ nil))
+                (err (str "kanban_block: " (.-message e))))
+              (finally (.close db)))))))))
+
+(defn kanban-request-review
+  "Hand an implementation to the reviewer, preserving implementer provenance."
+  [ctx {:strs [task_id summary metadata reviewer artifacts] :as args}]
+  (let [task-id (or (not-empty task_id) (not-empty (kanban-env ctx "HERMES_KANBAN_TASK")))
+        scoped-task (kanban-env ctx "HERMES_KANBAN_TASK")
+        raw-run (when (= task-id scoped-task) (kanban-env ctx "HERMES_KANBAN_RUN_ID"))
+        run-id (when raw-run (js/parseInt raw-run 10))
+        summary (when (string? summary) (redact-kanban-comment summary))
+        reviewer (when (and (string? reviewer) (not (str/blank? reviewer))) (redact-kanban-comment reviewer))
+        metadata (when (map? metadata)
+                   (try (h/json-parse (redact-kanban-comment (h/json-str metadata)))
+                        (catch :default _ nil)))
+        artifacts (or artifacts [])]
+    (cond
+      (:peer? ctx) (err "kanban_request_review is unavailable in peer runs; Kanban state is host-local")
+      (not task-id) (err "kanban_request_review requires task_id outside a dispatcher task")
+      (and scoped-task (not= scoped-task task-id)) (err "kanban_request_review may only hand off the assigned dispatcher task")
+      (or (not (string? summary)) (str/blank? summary)) (err "summary is required")
+      (and metadata (not (map? metadata))) (err "metadata must be an object")
+      (and (some? artifacts) (not (sequential? artifacts))) (err "artifacts must be an array of file paths")
+      (and (sequential? artifacts) (some (complement string?) artifacts)) (err "artifacts must be an array of file paths")
+      (seq artifacts)
+      (err "kanban_request_review cannot preserve artifact files yet; omit artifacts until Kotoba artifact storage is available")
+      (seq (get metadata "artifacts"))
+      (err "kanban_request_review cannot preserve metadata.artifacts yet; omit artifacts until Kotoba artifact storage is available")
+      (and raw-run (or (js/Number.isNaN run-id) (not (pos? run-id)))) (err "kanban_request_review requires a valid dispatcher run id")
+      (and reviewer (not (or (= reviewer "default") (some #{reviewer} (profile/names)))) )
+      (err (str "reviewer profile " reviewer " is not installed"))
+      :else
+      (let [db-path (kanban-db-path ctx args)]
+        (cond
+          (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+          (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+          :else
+          (let [db (sqlite/DatabaseSync. db-path)]
+            (try
+              (.exec db "BEGIN IMMEDIATE")
+              (let [task (first (sqlite-records db "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?" task-id))
+                    status (get task "status")
+                    current-run (get task "current_run_id")
+                    parents (sqlite-records db "SELECT t.status FROM task_links l JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ?" task-id)
+                    parents-satisfied? (every? #(contains? #{"done" "archived"} (get % "status")) parents)]
+                (when-not task (throw (ex-info (str "Kanban task not found: " task-id) {})))
+                (when-not (contains? #{"running" "ready"} status)
+                  (throw (ex-info (str "could not request review from status " status) {})))
+                (when-not parents-satisfied? (throw (ex-info "parent dependencies are not satisfied" {})))
+                (when (and (= status "running") (or (nil? run-id) (not= run-id current-run)))
+                  (throw (ex-info "running task review requires the matching dispatcher run id" {})))
+                (when (and (not= status "running") current-run)
+                  (throw (ex-info "task has an active run but is not in running status" {})))
+                (let [run-profile (when current-run
+                                    (get (first (sqlite-records db "SELECT profile FROM task_runs WHERE id = ?" current-run)) "profile"))
+                      implementer (or run-profile
+                                      (when (not= reviewer (get task "assignee")) (get task "assignee")))
+                      prior (first (sqlite-records db "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'changes_requested' ORDER BY id DESC LIMIT 1" task-id))
+                      prior-reviewer (get (kanban-event-payload prior) "reviewer")
+                      reviewer (or reviewer (when (and (string? prior-reviewer) (not (str/blank? prior-reviewer))) prior-reviewer))
+                      now (js/Math.floor (/ (h/now-ms) 1000))
+                      metadata-json (when (and metadata (seq (js/Object.keys (clj->js metadata)))) (h/json-str metadata))
+                      upd (.run (.prepare db "UPDATE tasks SET status='review', assignee=COALESCE(?, assignee), claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL WHERE id=? AND status=? AND ((current_run_id IS NULL AND ? IS NULL) OR current_run_id=?)")
+                                reviewer task-id status current-run current-run)]
+                  (when-not (= 1 (.-changes upd)) (throw (ex-info "task changed during review handoff" {})))
+                  (let [event-run (if current-run
+                                    current-run
+                                    (when (or (seq summary) metadata)
+                                      (.-lastInsertRowid (.run (.prepare db "INSERT INTO task_runs (task_id, profile, status, outcome, summary, metadata, started_at, ended_at) VALUES (?, ?, 'review', 'review_requested', ?, ?, ?, ?)")
+                                                                task-id (or implementer reviewer (get task "assignee") (:profile ctx)) summary metadata-json now now))))]
+                  (if current-run
+                    (let [ended (.run (.prepare db "UPDATE task_runs SET status='review', outcome='review_requested', summary=?, metadata=?, ended_at=?, claim_expires=NULL WHERE id=? AND task_id=? AND ended_at IS NULL")
+                                       summary metadata-json now current-run task-id)]
+                      (when-not (= 1 (.-changes ended)) (throw (ex-info "active task run was already closed" {}))))
+                  (.run (.prepare db "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'review_requested', ?, ?)")
+                        task-id event-run (h/json-str {"summary" (first (str/split summary #"\n")) "implementer" implementer "reviewer" reviewer}) now)))
+                  (.exec db "COMMIT")
+                  (ok {"task_id" task-id "status" "review" "reviewer" reviewer})))
+              (catch :default e
+                (try (.exec db "ROLLBACK") (catch :default _ nil))
+                (err (str "kanban_request_review: " (.-message e))))
+              (finally (.close db)))))))))
+
+(defn kanban-request-changes
+  "Return an active reviewer run to the implementer recorded on its handoff."
+  [ctx {:strs [task_id reason] :as args}]
+  (let [task-id (or (not-empty task_id) (not-empty (kanban-env ctx "HERMES_KANBAN_TASK")))
+        scoped-task (kanban-env ctx "HERMES_KANBAN_TASK")
+        raw-run (when (= task-id scoped-task) (kanban-env ctx "HERMES_KANBAN_RUN_ID"))
+        run-id (when raw-run (js/parseInt raw-run 10))
+        reason (when (string? reason) (redact-kanban-comment reason))]
+    (cond
+      (:peer? ctx) (err "kanban_request_changes is unavailable in peer runs; Kanban state is host-local")
+      (not task-id) (err "kanban_request_changes requires task_id outside a dispatcher task")
+      (and scoped-task (not= scoped-task task-id)) (err "kanban_request_changes may only return the assigned dispatcher task")
+      (or (not (string? reason)) (str/blank? reason)) (err "reason is required")
+      (and raw-run (or (js/Number.isNaN run-id) (not (pos? run-id)))) (err "kanban_request_changes requires a valid dispatcher run id")
+      :else
+      (let [db-path (kanban-db-path ctx args)]
+        (cond
+          (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+          (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+          :else
+          (let [db (sqlite/DatabaseSync. db-path)]
+            (try
+              (.exec db "BEGIN IMMEDIATE")
+              (let [task (first (sqlite-records db "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?" task-id))
+                    current-run (get task "current_run_id")
+                    claimed (first (sqlite-records db "SELECT payload FROM task_events WHERE task_id = ? AND run_id = ? AND kind = 'claimed' ORDER BY id DESC LIMIT 1" task-id current-run))
+                    requested (first (sqlite-records db "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_requested' ORDER BY id DESC LIMIT 1" task-id))
+                    claim-payload (kanban-event-payload claimed)
+                    review-payload (kanban-event-payload requested)
+                    implementer (get review-payload "implementer")
+                    parents (sqlite-records db "SELECT t.status FROM task_links l JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ?" task-id)
+                    landing (if (every? #(contains? #{"done" "archived"} (get % "status")) parents) "ready" "todo")]
+                (when-not task (throw (ex-info (str "Kanban task not found: " task-id) {})))
+                (when-not (and (= "running" (get task "status")) current-run)
+                  (throw (ex-info "task is not in an active review run" {})))
+                (when (and raw-run (not= run-id current-run)) (throw (ex-info "run_id mismatch" {})))
+                (when-not (= "review" (get claim-payload "source_status"))
+                  (throw (ex-info "active run was not claimed from review" {})))
+                (when-not (and (string? implementer) (not (str/blank? implementer)))
+                  (throw (ex-info "review handoff has no valid implementer provenance" {})))
+                (let [now (js/Math.floor (/ (h/now-ms) 1000))
+                      upd (.run (.prepare db "UPDATE tasks SET status=?, assignee=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, worker_started_at=NULL, current_run_id=NULL WHERE id=? AND status='running' AND current_run_id=?")
+                                landing implementer task-id current-run)]
+                  (when-not (= 1 (.-changes upd)) (throw (ex-info "task changed during review handoff" {})))
+                  (.run (.prepare db "UPDATE task_runs SET status='done', outcome='changes_requested', summary=?, ended_at=?, claim_expires=NULL WHERE id=? AND task_id=? AND ended_at IS NULL")
+                        reason now current-run task-id)
+                  (.run (.prepare db "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'changes_requested', ?, ?)")
+                        task-id current-run (h/json-str {"reason" reason "implementer" implementer "reviewer" (get task "assignee") "status" landing}) now)
+                  (.exec db "COMMIT")
+                  (ok {"task_id" task-id "status" landing "implementer" implementer})))
+              (catch :default e
+                (try (.exec db "ROLLBACK") (catch :default _ nil))
+                (err (str "kanban_request_changes: " (.-message e))))
+              (finally (.close db)))))))))
+
+(defn kanban-create
+  "Create an assigned Kanban task with dependency, idempotency, and retry metadata."
+  [ctx {:strs [title assignee body parents tenant priority workspace_kind workspace_path project triage
+               idempotency_key max_runtime_seconds initial_status skills goal_mode goal_max_turns
+               completion_contract model provider] :as args}]
+  (let [scoped-task (kanban-env ctx "HERMES_KANBAN_TASK")
+        parents (or parents [])
+        workspace-kind (or workspace_kind "scratch")
+        initial-status (or initial_status "running")
+        tenant (or tenant (kanban-env ctx "HERMES_TENANT"))
+        priority (or priority 0)
+        skills (or skills [])
+        goal-mode (boolean goal_mode)
+        contract (or completion_contract "local-only")]
+    (cond
+      (:peer? ctx) (err "kanban_create is unavailable in peer runs; Kanban state is host-local")
+      scoped-task (err "kanban_create is orchestrator-only; dispatcher workers cannot create sibling tasks")
+      (or (not (string? title)) (str/blank? title)) (err "title is required")
+      (or (not (string? assignee)) (str/blank? assignee)) (err "assignee is required")
+      (not (or (= assignee "default") (some #{assignee} (profile/names)))) (err (str "assignee profile " assignee " is not installed"))
+      (and (some? body) (not (string? body))) (err "body must be a string")
+      (and (some? tenant) (not (string? tenant))) (err "tenant must be a string")
+      (and (some? idempotency_key) (not (string? idempotency_key))) (err "idempotency_key must be a string")
+      (and (some? triage) (not (boolean? triage))) (err "triage must be a boolean")
+      (and (some? goal_mode) (not (boolean? goal_mode))) (err "goal_mode must be a boolean")
+      (and (some? model) (not (string? model))) (err "model must be a string")
+      (and (some? provider) (not (string? provider))) (err "provider must be a string")
+      (not (sequential? parents)) (err "parents must be an array of task ids")
+      (some (complement string?) parents) (err "parents must be an array of task ids")
+      (not (contains? #{"scratch" "dir" "worktree"} workspace-kind)) (err "workspace_kind must be scratch, dir, or worktree")
+      (and (contains? #{"dir" "worktree"} workspace-kind) (some? workspace_path)
+           (not (and (string? workspace_path) (str/starts-with? workspace_path "/")))) (err "workspace_path must be an absolute path")
+      (and (= "dir" workspace-kind) (not (and (string? workspace_path) (str/starts-with? workspace_path "/"))))
+      (err "workspace_kind 'dir' requires an absolute workspace_path")
+      (and project (not (str/blank? project))) (err "project-linked worktrees are not supported by Kotoba Kanban yet; omit project")
+      (not (contains? #{"running" "blocked"} initial-status)) (err "initial_status must be running or blocked")
+      (or (not (number? priority)) (not= priority (js/Math.floor priority))) (err "priority must be an integer")
+      (and (some? max_runtime_seconds) (or (not (number? max_runtime_seconds)) (not= max_runtime_seconds (js/Math.floor max_runtime_seconds)) (< max_runtime_seconds 1)))
+      (err "max_runtime_seconds must be a positive integer")
+      (not (sequential? skills)) (err "skills must be an array of skill names")
+      (some (complement string?) skills) (err "skills must be an array of skill names")
+      (and (some? goal_max_turns) (or (not (number? goal_max_turns)) (not= goal_max_turns (js/Math.floor goal_max_turns)) (< goal_max_turns 1)))
+      (err "goal_max_turns must be a positive integer")
+      (and (some? completion_contract)
+           (not (or (= contract "local-only")
+                    (re-matches #"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+" contract)
+                    (re-matches #"https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*" contract))))
+      (err "completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
+      (and provider (not model)) (err "provider requires model to be set as well")
+      :else
+      (let [db-path (kanban-db-path ctx args)]
+        (cond
+          (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+          (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+          :else
+          (let [db (sqlite/DatabaseSync. db-path)]
+            (try
+              (.exec db "BEGIN IMMEDIATE")
+              (let [existing (when (and idempotency_key (not (str/blank? idempotency_key)))
+                               (first (sqlite-records db "SELECT id FROM tasks WHERE idempotency_key=? AND status!='archived' ORDER BY created_at DESC LIMIT 1" idempotency_key)))]
+                (if existing
+                  (do (.exec db "COMMIT") (ok {"task_id" (get existing "id") "idempotent_reuse" true}))
+                  (let [parent-rows (if (seq parents)
+                                      (let [marks (str/join "," (repeat (count parents) "?"))]
+                                        (apply sqlite-records db (str "SELECT id, status, tenant FROM tasks WHERE id IN (" marks ")") parents))
+                                      [])
+                        parent-by-id (into {} (map (juxt #(get % "id") identity) parent-rows))
+                        missing (filterv #(not (contains? parent-by-id %)) parents)]
+                    (when (seq missing) (throw (ex-info (str "unknown parent task(s): " (str/join ", " missing)) {})))
+                    (let [tenant (or tenant (some #(get-in parent-by-id [% "tenant"]) parents))
+                          gating-parent (first (filter #(not (contains? #{"done" "archived"} (get-in parent-by-id [% "status"]))) parents))
+                          status (cond (= "blocked" initial-status) "blocked"
+                                       (true? (get args "triage")) "triage"
+                                       gating-parent "todo"
+                                       :else "ready")
+                          now (js/Math.floor (/ (h/now-ms) 1000))
+                          task-id (str "t_" (.toString (.randomBytes crypto 4) "hex"))
+                          workspace-path (when (and (string? workspace_path) (not (str/blank? workspace_path))) workspace_path)
+                          skill-json (when (seq skills) (h/json-str (vec skills)))
+                          inserted (.run (.prepare db "INSERT INTO tasks (id,title,body,assignee,status,priority,created_by,created_at,workspace_kind,workspace_path,tenant,idempotency_key,max_runtime_seconds,skills,model_override,provider_override,goal_mode,goal_max_turns,completion_contract) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                                           task-id (str/trim title) body assignee status priority (:profile ctx) now workspace-kind workspace-path tenant idempotency_key max_runtime_seconds skill-json model provider (if goal-mode 1 0) goal_max_turns contract)]
+                      (when-not (= 1 (.-changes inserted)) (throw (ex-info "Kanban task insert failed" {})))
+                      (doseq [parent-id parents]
+                        (.run (.prepare db "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)") parent-id task-id))
+                      (.run (.prepare db "INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,'created',?,?)")
+                            task-id (h/json-str {"assignee" assignee "status" status "parents" (vec parents)
+                                                "tenant" tenant "workspace_kind" workspace-kind
+                                                "workspace_path" workspace-path "skills" (when (seq skills) (vec skills))
+                                                "goal_mode" goal-mode "goal_max_turns" goal_max_turns
+                                                "model_override" model "provider_override" provider
+                                                "max_runtime_seconds" max_runtime_seconds "priority" priority
+                                                "completion_contract" contract "idempotency_key" idempotency_key}) now)
+                      (when (= status "blocked")
+                        (.run (.prepare db "INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,'blocked',?,?)")
+                              task-id (h/json-str {"reason" "initial_status" "status" "blocked" "actor" (:profile ctx)}) now))
+                      (when (and (= status "todo") gating-parent)
+                        (.run (.prepare db "INSERT INTO task_events (task_id,kind,payload,created_at) VALUES (?,'dependency_wait',?,?)")
+                              task-id (h/json-str {"reason" "parent_not_done" "parent" gating-parent}) now))
+                      (.exec db "COMMIT")
+                      (ok {"task_id" task-id "status" status "gated" (boolean gating-parent)})))))
+              (catch :default e
+                (try (.exec db "ROLLBACK") (catch :default _ nil))
+                (err (str "kanban_create: " (.-message e))))
+              (finally (.close db)))))))))
+
+(defn kanban-link
+  "Add a dependency edge and demote an unstarted ready child when needed."
+  [ctx {:strs [parent_id child_id] :as args}]
+  (let [scoped-task (kanban-env ctx "HERMES_KANBAN_TASK")
+        raw-run (when (= child_id scoped-task) (kanban-env ctx "HERMES_KANBAN_RUN_ID"))
+        run-id (when raw-run (js/parseInt raw-run 10))]
+    (cond
+      (:peer? ctx) (err "kanban_link is unavailable in peer runs; Kanban state is host-local")
+      (or (not (string? parent_id)) (str/blank? parent_id)
+          (not (string? child_id)) (str/blank? child_id)) (err "parent_id and child_id are required")
+      (= parent_id child_id) (err "a task cannot depend on itself")
+      (and raw-run (or (js/Number.isNaN run-id) (not (pos? run-id)))) (err "kanban_link requires a valid dispatcher run id")
+      :else
+      (let [db-path (kanban-db-path ctx args)]
+        (cond
+          (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+          (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+          :else
+          (let [db (sqlite/DatabaseSync. db-path)]
+            (try
+              (.exec db "BEGIN IMMEDIATE")
+              (let [parent (first (sqlite-records db "SELECT status FROM tasks WHERE id = ?" parent_id))
+                    child (first (sqlite-records db "SELECT status, current_run_id FROM tasks WHERE id = ?" child_id))]
+                (when-not parent (throw (ex-info (str "unknown task: " parent_id) {})))
+                (when-not child (throw (ex-info (str "unknown task: " child_id) {})))
+                (when (and (= "running" (get child "status"))
+                           (or (not= child_id scoped-task) (not= run-id (get child "current_run_id"))))
+                  (throw (ex-info (str "cannot link " parent_id " -> " child_id ": child is already running") {})))
+                (let [cycle (first (sqlite-records db
+                                  "WITH RECURSIVE descendants(id) AS (SELECT child_id FROM task_links WHERE parent_id = ? UNION SELECT l.child_id FROM task_links l JOIN descendants d ON l.parent_id = d.id) SELECT 1 AS cycle FROM descendants WHERE id = ? LIMIT 1"
+                                  child_id parent_id))]
+                  (when cycle (throw (ex-info (str "linking " parent_id " -> " child_id " would create a cycle") {}))))
+                (.run (.prepare db "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)") parent_id child_id)
+                (let [gated? (and (not (contains? #{"done" "archived"} (get parent "status")))
+                                  (= "ready" (get child "status")))
+                      now (js/Math.floor (/ (h/now-ms) 1000))]
+                  (when gated?
+                    (.run (.prepare db "UPDATE tasks SET status='todo' WHERE id=? AND status='ready'") child_id)
+                    (.run (.prepare db "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'dependency_wait', ?, ?)")
+                          child_id (h/json-str {"reason" "parent_not_done" "demoted" true "parent" parent_id}) now))
+                  (.run (.prepare db "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'linked', ?, ?)")
+                        child_id (h/json-str {"parent" parent_id "child" child_id}) now)
+                  (.exec db "COMMIT")
+                  (ok (cond-> {"parent_id" parent_id "child_id" child_id "gated" (boolean gated?)}
+                        gated? (assoc "gated_by" parent_id)))))
+              (catch :default e
+                (try (.exec db "ROLLBACK") (catch :default _ nil))
+                (err (str "kanban_link: " (.-message e))))
+              (finally (.close db)))))))))
+
+(defn kanban-unblock
+  "Restore a blocked task to its resumable state with parent gating applied."
+  [ctx {:strs [task_id] :as args}]
+  (let [scoped-task (kanban-env ctx "HERMES_KANBAN_TASK")]
+    (cond
+      (:peer? ctx) (err "kanban_unblock is unavailable in peer runs; Kanban state is host-local")
+      scoped-task (err "kanban_unblock is orchestrator-only; dispatcher workers cannot unblock tasks")
+      (or (not (string? task_id)) (str/blank? task_id)) (err "task_id is required")
+      :else
+      (let [db-path (kanban-db-path ctx args)]
+        (cond
+          (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+          (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+          :else
+          (let [db (sqlite/DatabaseSync. db-path)]
+            (try
+              (.exec db "BEGIN IMMEDIATE")
+              (let [task (first (sqlite-records db "SELECT status, current_run_id FROM tasks WHERE id = ?" task_id))
+                    parents (sqlite-records db "SELECT t.status FROM task_links l JOIN tasks t ON t.id = l.parent_id WHERE l.child_id = ?" task_id)
+                    satisfied? (every? #(contains? #{"done" "archived"} (get % "status")) parents)
+                    resume (kanban-resume-status db task_id)
+                    next-status (if satisfied? (if (= resume "review") "review" "ready") "todo")]
+                (when-not task (throw (ex-info (str "Kanban task not found: " task_id) {})))
+                (when-not (= "blocked" (get task "status"))
+                  (throw (ex-info "task is not blocked" {})))
+                (when (get task "current_run_id")
+                  (throw (ex-info "blocked task still has an active run; recover the run before unblocking" {})))
+                (let [now (js/Math.floor (/ (h/now-ms) 1000))
+                      updated (.run (.prepare db "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, worker_started_at=NULL, current_run_id=NULL, consecutive_failures=0, last_failure_error=NULL WHERE id=? AND status='blocked' AND current_run_id IS NULL")
+                                    next-status task_id)]
+                  (when-not (= 1 (.-changes updated)) (throw (ex-info "task changed before unblock" {})))
+                  (.run (.prepare db "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'unblocked', ?, ?)")
+                        task_id (when (or (not= next-status "ready") (not= resume "ready"))
+                                  (h/json-str {"status" next-status "resume_status" resume})) now)
+                  (.exec db "COMMIT")
+                  (ok {"task_id" task_id "status" next-status})))
+              (catch :default e
+                (try (.exec db "ROLLBACK") (catch :default _ nil))
+                (err (str "kanban_unblock: " (.-message e))))
+              (finally (.close db)))))))))
+
+(defn kanban-attachments
+  "List task attachment metadata from the shared Kanban database."
+  [ctx {:strs [task_id] :as args}]
+  (cond
+    (:peer? ctx) (err "kanban_attachments is unavailable in peer runs; Kanban state is host-local")
+    (or (not (string? task_id)) (str/blank? task_id)) (err "kanban_attachments requires task_id")
+    :else
+    (let [db-path (kanban-db-path ctx args)]
+      (cond
+        (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+        (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+        :else
+        (let [db (sqlite/DatabaseSync. db-path)]
+          (try
+            (let [task (.get (.prepare db "SELECT 1 AS present FROM tasks WHERE id = ?") task_id)]
+              (when-not task (throw (ex-info (str "Kanban task not found: " task_id) {})))
+              (let [attachments (sqlite-records db "SELECT id, filename, content_type, size, uploaded_by, stored_path, created_at FROM task_attachments WHERE task_id = ? ORDER BY created_at, id" task_id)]
+                (ok {"task_id" task_id "attachments" attachments})))
+            (catch :default e (err (str "kanban_attachments: " (.-message e))))
+            (finally (.close db))))))))
+
+(defn- kanban-attachments-root [ctx args]
+  (if-let [override (not-empty (kanban-env ctx "HERMES_KANBAN_ATTACHMENTS_ROOT"))]
+    (h/expand override)
+    (let [root (kanban-root ctx)
+          explicit (get args "board")
+          env-board (kanban-env ctx "HERMES_KANBAN_BOARD")
+          current-file (h/join root "kanban" "current")
+          current (when (h/file? current-file) (str/trim (h/slurp current-file)))
+          board (cond
+                  (some? explicit) explicit
+                  (not (str/blank? (str env-board))) env-board
+                  (kanban-board-slug? current) current
+                  :else "default")]
+      (when-not (kanban-board-slug? board)
+        (throw (ex-info "invalid Kanban board slug" {:board board})))
+      (if (= board "default")
+        (h/join root "kanban" "attachments")
+        (h/join root "kanban" "boards" board "attachments")))))
+
+(defn kanban-attach
+  "Persist an inline attachment with the shared task-attachment metadata row."
+  [ctx {:strs [task_id filename content_base64 content_type] :as args}]
+  (cond
+    (:peer? ctx) (err "kanban_attach is unavailable in peer runs; Kanban state is host-local")
+    (or (not (string? task_id)) (not (re-matches #"^[A-Za-z0-9_-]{1,128}$" task_id))) (err "task_id is required and must be a valid task id")
+    (or (not (string? filename)) (str/blank? filename)) (err "filename is required")
+    (or (not (string? content_base64)) (str/blank? content_base64)) (err "content_base64 is required")
+    (and (some? content_type) (not (string? content_type))) (err "content_type must be a string")
+    (> (count content_base64) 34952536) (err "attachment exceeds 25 MB limit")
+    (not (re-matches #"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?" content_base64))
+    (err "content_base64 is not valid base64")
+    :else
+    (let [db-path (kanban-db-path ctx args)
+          root (kanban-attachments-root ctx args)
+          name (-> filename (str/replace "\\" "/") (str/split #"/") last str/trim
+                   (str/replace #"[\u0000-\u001F\u007F]" ""))
+          name (loop [n name] (if (str/starts-with? n ".") (recur (subs n 1)) n))
+          name (subs name 0 (min 200 (count name)))
+          bytes (.from js/Buffer content_base64 "base64")]
+      (cond
+        (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+        (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+        (zero? (count name)) (err "invalid attachment filename")
+        (> (.-length bytes) (* 25 1024 1024)) (err "attachment exceeds 25 MB limit")
+        :else
+        (let [task-dir (h/join root task_id)
+              _ (when (h/symlink? root) (throw (ex-info "attachment root must not be a symlink" {})))
+              _ (h/mkdirs task-dir)]
+          (if (h/symlink? task-dir)
+            (err "task attachment directory must not be a symlink")
+            (let [dot (.lastIndexOf name ".")
+                  stem (if (pos? dot) (subs name 0 dot) name)
+                  ext (if (pos? dot) (subs name dot) "")
+                  stored-name (loop [i 0]
+                                (let [candidate (if (zero? i) name (str stem " (" i ")" ext))]
+                                  (if (h/exists? (h/join task-dir candidate)) (recur (inc i)) candidate)))
+                  stored-path (h/join task-dir stored-name)
+                  db (sqlite/DatabaseSync. db-path)
+                  timestamp (js/Math.floor (/ (h/now-ms) 1000))]
+              (try
+                (when-not (.get (.prepare db "SELECT 1 AS present FROM tasks WHERE id = ?") task_id)
+                  (throw (ex-info (str "Kanban task not found: " task_id) {})))
+                (h/spit-base64 stored-path content_base64 nil)
+                (.exec db "BEGIN IMMEDIATE")
+                (let [row (.run (.prepare db "INSERT INTO task_attachments (task_id, filename, stored_path, content_type, size, uploaded_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+                                task_id stored-name stored-path content_type (.-length bytes) "agent" timestamp)
+                      id (.-lastInsertRowid row)]
+                  (.run (.prepare db "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'attached', ?, ?)")
+                        task_id (h/json-str {"filename" stored-name "size" (.-length bytes) "by" "agent"}) timestamp)
+                  (.exec db "COMMIT")
+                  (ok {"task_id" task_id "attachment_id" id "size" (.-length bytes)}))
+                (catch :default e
+                  (try (.exec db "ROLLBACK") (catch :default _ nil))
+                  (h/rm stored-path)
+                  (err (str "kanban_attach: " (.-message e))))
+                (finally (.close db))))))))))
+
+(defn kanban-attach-url
+  "Fetch a public URL with SSRF-safe redirects and store it as an attachment."
+  [ctx {:strs [task_id url filename content_type] :as args}]
+  (let [task-id (or (not-empty task_id) (not-empty (kanban-env ctx "HERMES_KANBAN_TASK")))]
+    (cond
+      (:peer? ctx) (p/resolved (err "kanban_attach_url is unavailable in peer runs; Kanban state is host-local"))
+      (not task-id) (p/resolved (err "kanban_attach_url requires task_id outside a dispatcher task"))
+      (or (not (string? url)) (str/blank? url)) (p/resolved (err "url is required"))
+      (and (some? filename) (not (string? filename))) (p/resolved (err "filename must be a string"))
+      (and (some? content_type) (not (string? content_type))) (p/resolved (err "content_type must be a string"))
+      :else
+      (-> (webguard/fetch-bytes (str/trim url) {:max-bytes (* 25 1024 1024)})
+          (p/then
+           (fn [download]
+             (cond
+               (:truncated? download) (err "kanban_attach_url: attachment exceeds 25 MB limit")
+               (not (<= 200 (:status download) 299)) (err (str "kanban_attach_url: HTTP " (:status download)))
+               :else
+               (let [bytes (:bytes download)
+                     remote-type (:content-type download)
+                     leaf (try
+                            (let [parsed (js/URL. url)
+                                  part (last (str/split (.-pathname parsed) #"/"))]
+                              (js/decodeURIComponent part))
+                            (catch :default _ "download"))
+                     chosen (or (not-empty (some-> filename str/trim)) (not-empty leaf) "download")
+                     media-type (or content_type
+                                    (some-> remote-type (str/split #";") first str/trim not-empty))]
+                 (kanban-attach ctx {"task_id" task-id "filename" chosen
+                                     "content_base64" (.toString bytes "base64")
+                                     "content_type" media-type "board" (get args "board")})))))
+          (p/catch (fn [e] (err (str "kanban_attach_url: " (.-message e)))))))))
+
+(defn kanban-comment
+  "Append a comment and its matching task event to the shared Hermes Kanban DB."
+  [ctx {:strs [task_id body] :as args}]
+  (cond
+    (:peer? ctx) (err "kanban_comment is unavailable in peer runs; Kanban state is host-local")
+    (not (and (string? task_id) (not (str/blank? task_id)))) (err "kanban_comment requires task_id")
+    (not (and (string? body) (not (str/blank? body)))) (err "kanban_comment requires non-empty body")
+    :else
+    (let [db-path (kanban-db-path ctx args)
+          author (or (not-empty (:profile ctx)) "worker")]
+      (cond
+        (not (h/file? db-path)) (err (str "Kanban database not found: " db-path))
+        (h/symlink? db-path) (err "Kanban database path must not be a symlink")
+        :else
+        (let [db (sqlite/DatabaseSync. db-path)]
+          (try
+            (.exec db "BEGIN IMMEDIATE")
+            (let [task (.get (.prepare db "SELECT 1 AS present FROM tasks WHERE id = ?") task_id)]
+              (when-not task (throw (ex-info (str "Kanban task not found: " task_id) {})))
+              (let [timestamp (js/Math.floor (/ (h/now-ms) 1000))
+                    clean-body (redact-kanban-comment body)
+                    comment (.run (.prepare db "INSERT INTO task_comments (task_id, author, body, created_at) VALUES (?, ?, ?, ?)")
+                                  task_id author clean-body timestamp)
+                    payload (h/json-str {"author" author "len" (count clean-body)})]
+                (.run (.prepare db "INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, ?, ?, ?)")
+                      task_id "commented" payload timestamp)
+                (.exec db "COMMIT")
+                (ok {"task_id" task_id "comment_id" (.-lastInsertRowid comment)})))
+            (catch :default e
+              (try (.exec db "ROLLBACK") (catch :default _ nil))
+              (err (str "kanban_comment: " (.-message e))))
+            (finally (.close db))))))))
+
 (defn execute-code
   "Run one Python source string on stdin under the same OS confinement,
   sanitized environment, and write-root policy as terminal. Hermes' persistent
@@ -1033,9 +2153,22 @@
 (def impls
   {"terminal" terminal "process_manage" process/manage "read_file" read-file "write_file" write-file "patch" patch
    "search_files" search-files "web_extract" web-extract "web_search" web-search
+   "vision_analyze" vision-analyze
    "skills_list" skills-list "skill_view" skill-view "skill_manage" skill-manage
    "todo_list" todo-list "memory" memory "execute_code" execute-code
-   "session_search" session-search
+   "session_search" session-search "kanban_show" kanban-show "kanban_list" kanban-list
+   "kanban_heartbeat" kanban-heartbeat
+   "kanban_complete" kanban-complete
+   "kanban_block" kanban-block
+   "kanban_request_review" kanban-request-review
+   "kanban_request_changes" kanban-request-changes
+   "kanban_link" kanban-link
+   "kanban_unblock" kanban-unblock
+   "kanban_create" kanban-create
+   "kanban_attachments" kanban-attachments
+   "kanban_attach" kanban-attach
+   "kanban_attach_url" kanban-attach-url
+   "kanban_comment" kanban-comment
    "ha_list_entities" (ha-tool "ha_list_entities")
    "ha_get_state" (ha-tool "ha_get_state")
    "ha_list_services" (ha-tool "ha_list_services")

@@ -130,7 +130,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         ;; agent.disabled_toolsets travels in the bundle (not host-local), so a
         ;; peer turn drops the same tools; a -t / peer opts toolsets cannot re-add them
         names (tools/enabled-tool-names all-requested disabled)
-        mcp-data (mcp/discover config env mcp-servers)
+        mcp-data (mcp/discover config env mcp-servers (:home prof))
         mcp-index (:index mcp-data)
         mcp-names (vec (keys mcp-index))
         names (into names mcp-names)
@@ -142,15 +142,17 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         schemas (into (tools/tool-schemas (tools/enabled-tool-names all-requested disabled))
                       (:schemas mcp-data))
         mcp-overrides (into {} (for [[wire [server raw]] mcp-index]
-                                 [wire (fn [_ args] (mcp/call config env server raw args))]))
+                                 [wire (fn [_ args] (mcp/call config env server raw args (:home prof)))]))
         writes (atom [])
         todo-state (tools/todo-history-state history)
         cwd (or cwd (some-> (get-in config ["terminal" "cwd"]) h/expand) (h/join (:home prof) "workspace"))
         _ (h/mkdirs cwd)
         ctx {:cwd cwd :home (:home prof) :profile (:name prof) :roots roots :writes writes :tool-env env
+             :model-hops hops :reasoning-effort reasoning-effort
              :todos (atom (:todos todo-state)) :todo-revision (atom (:revision todo-state))
              :mcp-config config :mcp-index mcp-index
              :tool-overrides (merge mcp-overrides tool-overrides)
+             :peer? peer?
              :terminal-policy (confine/policy (:itonami prof) {:peer? peer?})}
         t0 (h/now-ms)
         emit (or on-event (fn [_]))
@@ -257,7 +259,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
       (some #(or (not (map? %)) (not (string? (get % "goal"))) (str/blank? (get % "goal"))) tasks)
       (h/json-str {"error" "each delegated task needs a non-empty goal"})
       :else
-      (let [child-names (vec (remove #{"delegate_task" "memory" "cronjob_manage"} parent-names))
+      (let [child-names (vec (remove #(or (#{"delegate_task" "memory" "cronjob_manage"} %)
+                                             (str/starts-with? % "kanban_")) parent-names))
             configured-budget (:budget-s parent-options)
             budget-s (if (and (number? configured-budget) (pos? configured-budget))
                        (min 300 configured-budget)

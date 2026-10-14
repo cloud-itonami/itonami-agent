@@ -1,7 +1,8 @@
 (ns itonami.agent.mcp
-  "Small profile-scoped MCP stdio client for Hermes-compatible tool servers."
+  "Profile-scoped MCP stdio and Streamable HTTP client for Hermes-compatible servers."
   (:require [clojure.string :as str]
-            [itonami.agent.host :as h]))
+            [itonami.agent.host :as h]
+            ["node:path" :as path]))
 
 (def protocol-version "2024-11-05")
 (def max-name-length 64)
@@ -16,12 +17,18 @@
   otherwise all enabled servers are included. `no_mcp` opts out."
   (let [servers (get config "mcp_servers" {})
         requested (vec (remove nil? requested))
-        disabled (set disabled)
-        explicit (filter #(contains? servers %) requested)]
+        server-for (fn [name]
+                     (cond
+                       (contains? servers name) name
+                       (and (string? name) (str/starts-with? name "mcp-")
+                            (contains? servers (subs name 4))) (subs name 4)
+                       :else nil))
+        explicit (keep server-for requested)
+        disabled-servers (set (keep server-for disabled))]
     (if (some #{"no_mcp"} requested)
       []
       (->> (if (seq explicit) explicit (keys servers))
-           (filter #(and (enabled? (get servers %)) (not (contains? disabled %))))
+           (filter #(and (enabled? (get servers %)) (not (contains? disabled-servers %))))
            sort vec))))
 
 (defn- expand-string [s env]
@@ -76,8 +83,80 @@
           (get response "error") {:error (str "MCP " method " failed: " (get-in response ["error" "message"]))}
           :else (get response "result" {}))))))
 
+(defn- http-client-path []
+  (if-let [bin (h/env "ITONAMI_AGENT_BIN")]
+    (path/resolve (path/dirname bin) ".." "src" "itonami" "agent" "mcp_http_client.mjs")
+    (path/resolve "src" "itonami" "agent" "mcp_http_client.mjs")))
+
+(defn- http-exchange [spec env method params home server]
+  (let [url (get spec "url")
+        raw-headers (expand-value (get spec "headers" {}) env)
+        headers (if (map? raw-headers) raw-headers {})
+        unresolved (some (fn [[_ value]]
+                           (and (string? value) (re-find #"\$\{(?:env:)?[A-Za-z_][A-Za-z0-9_]*\}" value)))
+                         headers)
+        expanded-url (expand-value url env)
+        unresolved-url (and (string? expanded-url) (re-find #"\$\{(?:env:)?[A-Za-z_][A-Za-z0-9_]*\}" expanded-url))
+        unresolved (or unresolved unresolved-url)
+        input (h/json-str {"url" expanded-url "headers" headers "method" method "params" params
+                           "home" home "server" server "auth" (get spec "auth")
+                           "oauth" (expand-value (get spec "oauth" {}) env)})
+        result (when-not unresolved
+                 (h/run-process [(.-execPath js/process) (http-client-path)]
+                                {:env (server-env spec env) :exact-env? true
+                                 :input input
+                                 :timeout-ms (* 1000 (or (get spec "timeout")
+                                                        (get spec "connect_timeout") 30))}))]
+    (cond
+      unresolved {:error "MCP HTTP URL or credential environment variable is not configured"}
+      (:timed-out? result) {:error "MCP HTTP server timed out"}
+      (not= 0 (:exit result))
+      (let [status (re-find #"HTTP [0-9]{3}" (:stderr result))]
+        {:error (str "MCP HTTP request failed" (when status (str ": " status)))})
+      :else (try (h/json-parse (:stdout result))
+                 (catch :default _ {:error "MCP HTTP server returned invalid JSON"})))))
+
+(defn- exchange-selected [spec env method params home server]
+  (if (get spec "url")
+    (http-exchange spec env method params home server)
+    (exchange spec env method params)))
+
 (defn- sanitize [s]
   (str/replace (str s) #"[^A-Za-z0-9_]" "_"))
+
+(defn oauth-cache-ready?
+  "Whether a profile has a usable cached OAuth access token or enough issuer-bound
+  state for Kotoba to refresh it. Reads token metadata but never exposes token values."
+  [home server spec]
+  (let [name (subs (sanitize server) 0 (min 128 (count (sanitize server))))
+        dir (h/join home "mcp-tokens")
+        token-path (h/join dir (str name ".json"))
+        meta-path (h/join dir (str name ".meta.json"))
+        client-path (h/join dir (str name ".client.json"))
+        read-json (fn [p] (try (when (h/file? p) (h/json-parse (h/slurp p))) (catch :default _ nil)))
+        tokens (read-json token-path)
+        meta (read-json meta-path)
+        client (read-json client-path)
+        stored-expiry (js/parseFloat (str (get tokens "expires_at" "NaN")))
+        ttl (js/parseFloat (str (get tokens "expires_in" "NaN")))
+        expiry (cond
+                 (js/Number.isFinite stored-expiry) stored-expiry
+                 (and (js/Number.isFinite ttl) (h/file? token-path)) (+ (/ (h/mtime-ms token-path) 1000) ttl)
+                 :else 0)
+        fresh? (and (get tokens "access_token") (js/Number.isFinite expiry)
+                    (> expiry (+ (/ (js/Date.now) 1000) 60)))
+        client-id (or (get-in spec ["oauth" "client_id"]) (get client "client_id"))
+        client-secret (or (get-in spec ["oauth" "client_secret"]) (get client "client_secret"))
+        auth-method (or (get client "token_endpoint_auth_method") "none")
+        endpoint (get meta "token_endpoint")
+        issuer-bound? (and (get tokens "refresh_token")
+                           (string? (get tokens "hermes_issuer"))
+                           (= (get tokens "hermes_issuer") (get meta "issuer"))
+                           (string? endpoint) (str/starts-with? endpoint "https://")
+                           client-id
+                           (contains? #{"none" "client_secret_post" "client_secret_basic"} auth-method)
+                           (or (= "none" auth-method) client-secret))]
+    (boolean (or fresh? issuer-bound?))))
 
 (defn tool-name [server tool]
   (let [full (str "mcp__" (sanitize server) "__" (sanitize tool))]
@@ -125,8 +204,24 @@
       (boolean (matches include))
       (not (boolean (matches exclude))))))
 
-(defn discover [config env servers]
-  "Discover schemas and dispatch metadata from selected stdio servers."
+(def ^:private hermes-native-aliases
+  ;; Hermes integrations expose these names directly, while the Kotoba MCP
+  ;; transport normally namespaces every discovered tool as mcp__server__tool.
+  ;; Alias only names that have no native Kotoba executor; collisions across
+  ;; MCP servers remain namespaced and therefore cannot route ambiguously.
+  #{"vision_analyze" "image_generate" "browser_navigate" "browser_snapshot"
+    "browser_click" "browser_type" "browser_scroll" "browser_back"
+    "browser_press" "browser_get_images" "browser_vision" "browser_console"
+    "browser_cdp" "browser_dialog" "browser_vault_list" "browser_vault_unlock"
+    "browser_vault_fill" "browser_vault_save_login" "browser_vault_enter_code"
+    "browser_exec" "text_to_speech" "computer_use" "manage_connections"
+    "clarify" "kanban_create" "kanban_attach" "kanban_attach_url"
+    "kanban_attachments"})
+
+(defn discover
+  "Discover schemas and dispatch metadata from selected MCP servers."
+  ([config env servers] (discover config env servers (get env "HERMES_HOME")))
+  ([config env servers home]
   (let [errors (atom [])
         rows (vec
               (mapcat
@@ -134,9 +229,7 @@
                  (let [spec (get-in config ["mcp_servers" server])]
                    (if (not (enabled? spec))
                      []
-                     (if (get spec "url")
-                       (do (swap! errors conj {"server" server "error" "remote MCP transport is not supported yet"}) [])
-                       (let [result (exchange spec env "tools/list" {})]
+                     (let [result (exchange-selected spec env "tools/list" {} home server)]
                          (if-let [error (:error result)]
                            (do (swap! errors conj {"server" server "error" error}) [])
                            (for [tool (get result "tools" [])
@@ -147,11 +240,18 @@
                                "function" {"name" (tool-name server raw)
                                            "description" (or (get tool "description") (str "MCP tool " raw " from " server))
                                            "parameters" (object-schema (or (get tool "inputSchema") (get tool "input_schema")))}}
-                              [server raw]])))))))
-               servers))]
-    {:schemas (mapv second rows)
-     :index (into {} (map (fn [[name _ target]] [name target]) rows))
-     :errors @errors}))
+                              [server raw]]))))))
+               servers))
+        alias-rows (for [[_ schema target] rows
+                         :let [[_ raw] target
+                               same-name (filter #(= raw (second (nth % 2))) rows)]
+                         :when (and (contains? hermes-native-aliases raw)
+                                    (= 1 (count same-name)))]
+                     [raw (assoc-in schema ["function" "name"] raw) target])
+        all-rows (into rows alias-rows)]
+    {:schemas (mapv second all-rows)
+     :index (into {} (map (fn [[name _ target]] [name target]) all-rows))
+     :errors @errors})))
 
 (defn- render-result [result]
   (let [content (get result "content" [])
@@ -172,11 +272,13 @@
                     (and structured (not (str/blank? text))) (assoc "structuredContent" structured)
                     meta (assoc "_meta" meta))))))
 
-(defn call [config env server raw args]
-  (let [spec (get-in config ["mcp_servers" server])]
-    (if (or (not (enabled? spec)) (get spec "url"))
-      (h/json-str {"error" "MCP server transport is not supported"})
-      (let [result (exchange spec env "tools/call" {"name" raw "arguments" args})]
-        (if-let [error (:error result)]
-          (h/json-str {"error" error})
-          (render-result result))))))
+(defn call
+  ([config env server raw args] (call config env server raw args (get env "HERMES_HOME")))
+  ([config env server raw args home]
+   (let [spec (get-in config ["mcp_servers" server])]
+     (if (not (enabled? spec))
+       (h/json-str {"error" "MCP server is disabled"})
+       (let [result (exchange-selected spec env "tools/call" {"name" raw "arguments" args} home server)]
+         (if-let [error (:error result)]
+           (h/json-str {"error" error})
+           (render-result result)))))))
