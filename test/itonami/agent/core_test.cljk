@@ -250,6 +250,13 @@ plain: true
         (is (str/starts-with? out3 "<!-- itonami:world:v1"))
         (is (= (soul/strip out3) plain))
         (is (= out3 (soul/splice out3 b)))))
+    (testing "an outward role holder is told so"
+      (let [ob (soul/render (assoc soul-entry :outward {:business :cloud-itonami :role :sales
+                                                         :identity "network-awai/person-itonami-sales"
+                                                         :mailbox "sales@itonami.cloud"})
+                            soul-worlds caps nil)]
+        (is (str/includes? (:unit ob) "外向き役割: cloud-itonami の sales（宛先 sales@itonami.cloud"))
+        (is (not (str/includes? (:unit b) "外向き役割")) "nobody else is")))
     (testing "a :host profile sits outside the tree"
       (let [hb (soul/render {:agent/id "h" :agent/kind :worker :org/world :host :invocation :on-demand} soul-worlds [] nil)]
         (is (str/includes? (:world hb) "系列: 組織の木の外（ホスト運用）"))
