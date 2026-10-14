@@ -36,6 +36,7 @@
             [itonami.agent.loop :as agent-loop]
             [itonami.agent.tools :as tools]
             [itonami.agent.browser :as browser]
+            [itonami.agent.computer-use :as computer-use]
             [itonami.agent.cron :as cron]
             [itonami.agent.mcp :as mcp]
             [itonami.agent.execution-ledger :as execution-ledger]
@@ -184,7 +185,18 @@
 (defn chat [opts]
   (let [prof (profile/load-profile (:profile opts))
         rl (readline/createInterface #js {:input js/process.stdin :output js/process.stdout})
-        history (atom nil)]
+        history (atom nil)
+        ask-before-tool (fn [{:keys [name arguments]}]
+                          (let [arguments (if (map? arguments) arguments
+                                            (try (h/json-parse (str arguments)) (catch :default _ {})))]
+                          (if (and (= name "computer_use")
+                                   (not (contains? #{"capture" "list_apps" "list_windows" "wait"}
+                                                   (get arguments "action"))))
+                            (js/Promise.
+                             (fn [resolve]
+                               (.question rl (str "Approve computer_use " (get arguments "action") "? [y/N] ")
+                                  (fn [answer] (resolve (= "y" (str/lower-case (str/trim answer))))))))
+                            true)))]
     (println (str "itonami-agent · profile " (:name prof) " · /exit to quit"))
     (letfn [(ask []
               (.question rl "> "
@@ -194,7 +206,8 @@
                              (let [prompt (if @history
                                             (str "Conversation so far:\n" @history "\n\nUser: " line)
                                             line)]
-                               (-> ((executor opts) prof prompt (run-opts opts prof))
+                               (-> ((executor opts) prof prompt
+                                    (assoc (run-opts opts prof) :before-tool ask-before-tool))
                                    (p/then (fn [r]
                                              (println (or (:final r) (str "[" (:exit-reason r) "] " (get-in r [:error :error]))))
                                              (swap! history #(str % "\nUser: " line "\nAssistant: " (:final r)))
@@ -336,9 +349,11 @@
         browser-cdp (browser-cdp-configured? prof)
         bad-tools (if (true? (get job "no_agent")) []
                     (tools/unsupported-tools (tools/runtime-tool-names requested disabled browser-cdp
-                                                                          (browser/cli-available?))))
+                                                                          (browser/cli-available?)
+                                                                          (computer-use/cli-available? (:env prof)))))
         enabled-tools (tools/runtime-tool-names requested disabled browser-cdp
-                                               (browser/cli-available?))
+                                               (browser/cli-available?)
+                                               (computer-use/cli-available? (:env prof)))
         browser-selected? (some (set tools/browser-tools) enabled-tools)
         browser-config (get config "browser" {})
         browser-backend (or (get browser-config "backend") "local")

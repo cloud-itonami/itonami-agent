@@ -58,6 +58,44 @@
 (defn- rpc [id method params]
   {"jsonrpc" "2.0" "id" id "method" method "params" params})
 
+(defn stdio-call-sequence
+  "Make ordered MCP tool calls against one short-lived stdio server process.
+  This is for stateful local backends that need setup plus an operation on one
+  transport; callers must still keep their own bounded session state."
+  [command env requests timeout-s]
+  (if-not (and (vector? command) (seq command) (vector? requests) (seq requests))
+    {:error "MCP sequence requires a command and at least one request"}
+    (let [ids (vec (range 2 (+ 2 (count requests))))
+          input (str (h/json-str (rpc 1 "initialize"
+                                     {"protocolVersion" protocol-version
+                                      "capabilities" {}
+                                      "clientInfo" {"name" "itonami-agent" "version" "0.1"}})) "\n"
+                     (h/json-str {"jsonrpc" "2.0" "method" "notifications/initialized" "params" {}}) "\n"
+                     (apply str (map (fn [id request]
+                                       (str (h/json-str (rpc id "tools/call"
+                                                             {"name" (get request "name")
+                                                              "arguments" (get request "arguments" {})})) "\n"))
+                                     ids requests)))
+          result (h/run-process command {:env env :exact-env? true :input input
+                                         :timeout-ms (* 1000 (or timeout-s 45))})
+          responses (into {}
+                          (for [line (str/split-lines (:stdout result))
+                                :let [m (try (h/json-parse line) (catch :default _ nil))]
+                                :when (and (map? m) (number? (get m "id")))]
+                            [(get m "id") m]))]
+      (cond
+        (:timed-out? result) {:error "MCP stdio sequence timed out"}
+        (not= 0 (:exit result)) {:error (str "MCP stdio server exited " (:exit result))}
+        :else
+        (let [results (mapv (fn [id]
+                              (let [response (get responses id)]
+                                (cond
+                                  (nil? response) {"isError" true "error" "MCP server returned no response"}
+                                  (get response "error") {"isError" true "error" (get-in response ["error" "message"])}
+                                  :else (get response "result" {"isError" true "error" "MCP result was empty"}))))
+                            ids)]
+          {"results" results})))))
+
 (defn- exchange [spec env method params]
   (let [cmd (command-for spec env)]
     (if-not cmd

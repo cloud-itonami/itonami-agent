@@ -21,6 +21,7 @@
             [itonami.agent.profile :as profile]
             [itonami.agent.provider :as provider]
             [itonami.agent.browser :as browser]
+            [itonami.agent.computer-use :as computer-use]
             [itonami.agent.yaml :as yaml]
             ["node:crypto" :as crypto]
             ["node:sqlite" :as sqlite]))
@@ -286,7 +287,8 @@
    (fn-schema "ha_call_service" "Call a Home Assistant service. Shell, scripting, add-on, and REST-command domains are blocked."
               {"domain" {"type" "string"} "service" {"type" "string"}
                "entity_id" {"type" "string"} "data" {"type" "string"}}
-              ["domain" "service"])})
+              ["domain" "service"])
+   "computer_use" (computer-use/schema)})
 
 (def hermes-core-tools
   ;; Source of truth: Hermes `toolsets.py::_HERMES_CORE_TOOLS`. Keep the full
@@ -405,9 +407,11 @@
 (defn approval-required?
   ([name] (approval-required? name nil))
   ([name args]
-   (if (= name "cronjob_manage")
-     (not= "list" (get args "action"))
-     (not (contains? approval-free-tools name)))))
+   (cond
+     (= name "cronjob_manage") (not= "list" (get args "action"))
+     (= name "computer_use") (not (contains? #{"capture" "list_apps" "list_windows" "wait"}
+                                              (get args "action")))
+     :else (not (contains? approval-free-tools name)))))
 
 (defn enabled-tool-names
   "Requested toolsets minus the profile's `agent.disabled_toolsets` (Hermes
@@ -434,14 +438,18 @@
   browser_cdp and browser_dialog together on a configured CDP endpoint; neither
   belongs in the local browser surface when no endpoint is configured. Kotoba's
   local browser commands also require the agent-browser CLI on PATH."
-  [requested disabled cdp-configured? browser-cli-available?]
-  (let [names (enabled-tool-names requested disabled)]
-    (vec (remove (fn [name]
-                   (or (and (not cdp-configured?)
-                            (contains? #{"browser_cdp" "browser_dialog"} name))
-                       (and (not browser-cli-available?)
-                            (some #{name} browser-tools))))
-                 names))))
+  ([requested disabled cdp-configured? browser-cli-available?]
+   (runtime-tool-names requested disabled cdp-configured? browser-cli-available?
+                       (computer-use/cli-available? {})))
+  ([requested disabled cdp-configured? browser-cli-available? computer-cli-available?]
+   (let [names (enabled-tool-names requested disabled)]
+     (vec (remove (fn [name]
+                    (or (and (not cdp-configured?)
+                             (contains? #{"browser_cdp" "browser_dialog"} name))
+                        (and (not browser-cli-available?)
+                             (some #{name} browser-tools))
+                        (and (= name "computer_use") (not computer-cli-available?))))
+                  names)))))
 
 (defn tool-schemas [names] (vec (keep schemas names)))
 
@@ -2232,6 +2240,7 @@
    "browser_console" browser/console-output
    "browser_vision" browser-vision
    "vision_analyze" vision-analyze
+   "computer_use" computer-use/call
    "skills_list" skills-list "skill_view" skill-view "skill_manage" skill-manage
    "todo_list" todo-list "memory" memory "execute_code" execute-code
    "session_search" session-search "kanban_show" kanban-show "kanban_list" kanban-list

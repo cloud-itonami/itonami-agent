@@ -13,6 +13,7 @@
             [itonami.agent.host :as h]
             [itonami.agent.provider :as provider]
             [itonami.agent.browser :as browser-runtime]
+            [itonami.agent.computer-use :as computer-use]
             [itonami.agent.tools :as tools]
             [itonami.agent.mcp :as mcp]
             [itonami.agent.yaml :as yaml]
@@ -133,7 +134,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                     (not (str/blank? (get-in config ["browser" "cdp_url"])))
                                     (not (str/blank? (get-in config ["browser" "cdp_endpoint"]))))
         names (tools/runtime-tool-names all-requested disabled browser-cdp-configured?
-                                         (browser-runtime/cli-available?))
+                                         (browser-runtime/cli-available?)
+                                         (computer-use/cli-available? env))
         mcp-data (mcp/discover config env mcp-servers (:home prof))
         mcp-index (:index mcp-data)
         mcp-names (vec (keys mcp-index))
@@ -155,6 +157,10 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
              :browser-config (get config "browser" {})
              :browser-session (str "kotoba-" (h/random-hex 12))
              :browser-used? (atom false)
+             :computer-config (get config "computer_use" {})
+             :computer-session (str "kotoba-" (h/random-hex 12))
+             :computer-state (atom {})
+             :approval-available? (boolean before-tool)
              :model-hops hops :reasoning-effort reasoning-effort
              :todos (atom (:todos todo-state)) :todo-revision (atom (:revision todo-state))
              :mcp-config config :mcp-index mcp-index
@@ -235,15 +241,16 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                           true)
                                               t1 (h/now-ms)
                                               _ (emit {:event :tool-start :name nm
-                                                       :args (if (some #{nm} tools/browser-tools)
-                                                               "[browser arguments redacted]"
+                                                       :args (if (or (some #{nm} tools/browser-tools)
+                                                                     (= nm "computer_use"))
+                                                               "[sensitive UI arguments redacted]"
                                                                (subs (str args) 0 (min 160 (count (str args)))))})
                                               out-result (if approved?
                                                     (if (= nm "delegate_task")
                                                       (if (map? args-map)
                                                         (delegated-tasks prof names options args-map)
                                                         (h/json-str {"error" "delegate_task arguments must be a JSON object"}))
-                                                      (tools/call ctx names nm args))
+                                                      (tools/call (assoc ctx :tool-approved? approved?) names nm args))
                                                     (h/json-str {"error" "Tool call denied by user."}))
                                               out (tools/tool-result-text out-result)
                                               _ (swap! images into (tools/tool-result-images out-result))]
