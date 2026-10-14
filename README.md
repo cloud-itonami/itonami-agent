@@ -74,6 +74,16 @@ is an index, not authority: `:authority` only points at `yakuwari.edn`.
   `yakuwari.edn` when the profile has one.
 - `itonamify --refresh` keeps the declared runtime, placement, rails,
   terminal/web policy and organisation keys.
+- `profile soul <p>|--all --registry F --worlds F [--unit U] [--dry-run]`
+  renders the generated SOUL blocks (`itonami.agent.soul`): **world** (the
+  `:soul` lines of every world on the profile's `:org/path`, then
+  `:soul/common`, from `manifest/worlds.edn`), **unit** (the registry entry)
+  and **role** (a summary of `yakuwari.edn`, which stays the authority). They
+  sit right after the workspace-locations block; together they stay under
+  1500 characters (capability lists shrink to fit). The body — everything
+  outside these blocks — is never changed: a profile whose body would change,
+  or whose blocks would not fit, is refused. Every rewrite keeps a backup
+  and a receipt under `~/.hermes/state/soul-blocks/<stamp>/`.
 
 Exactly one scheduler ticks a profile:
 

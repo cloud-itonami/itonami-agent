@@ -13,6 +13,8 @@
     itonami-agent profile rail <p>|--all --to R [--dry-run] inference rail: murakumo | kotoba | itonami-p2p
     itonami-agent profile check <p>|--all [--summary]       validate itonami.edn and report drift (read-only)
     itonami-agent profile refresh <p>|--all [--dry-run]     recompute the bundle CID; re-copy capabilities
+    itonami-agent profile soul <p>|--all --registry F --worlds F [--unit U] [--dry-run]
+                                                            render the world/unit/role SOUL blocks
     itonami-agent profile organize <p>|--all --registry F [--dry-run]
                                                             place profiles in the organisation (schema v2)
     itonami-agent profile adopt <p>                         itonami ticks this profile's cron; Hermes stops
@@ -32,6 +34,7 @@
             [itonami.agent.host :as h]
             [itonami.agent.profile :as profile]
             [itonami.agent.manifest :as manifest]
+            [itonami.agent.soul :as soul]
             [itonami.agent.loop :as agent-loop]
             [itonami.agent.cron :as cron]
             [itonami.agent.p2p :as p2p]
@@ -273,6 +276,52 @@
                                       (str (get-in m [:bundle :cid]) " -> " (get-in m' [:bundle :cid])))
                                     (when (not= (:capabilities m) (:capabilities m')) "  capabilities re-copied from yakuwari.edn")))))))
       (println (str @n " manifest(s) " (if (:dry-run opts) "would be " "") "refreshed")))
+
+    "soul"
+    (let [reg (try (some-> (:registry opts) profile/read-edn-file) (catch :default _ nil))
+          worlds (try (some-> (:worlds opts) profile/read-edn-file) (catch :default _ nil))
+          by-id (into {} (map (juxt :agent/id identity)) (:agents reg))
+          targets (if (:all opts) (profile/names) [(first args)])
+          stamp (str/replace (subs (h/iso-local) 0 19) #"[^0-9T]" "")
+          backup-dir (h/join (profile/hermes-root) "state" "soul-blocks" stamp)
+          written (atom [])
+          refused (atom 0)]
+      (when-not (and (seq by-id) (map? (:worlds worlds)) (first targets))
+        (die 2 "usage: itonami-agent profile soul <p>|--all --registry <agent-registry.edn> --worlds <worlds.edn> [--unit U] [--dry-run]"))
+      (doseq [t targets
+              :let [e (get by-id t)]
+              :when (or (nil? (:unit opts)) (= (str (:unit opts)) (some-> (:org/unit e) name)))]
+        (let [home (profile/home t)
+              path (h/join home "SOUL.md")
+              text (when (h/file? path) (h/slurp path))
+              m (try (profile/read-edn-file (h/join home "itonami.edn")) (catch :default _ nil))
+              y (try (profile/read-edn-file (h/join home "yakuwari.edn")) (catch :default _ nil))]
+          (cond
+            (nil? e) (println (str "skip    " t "  not in the registry"))
+            (nil? text) (println (str "skip    " t "  no SOUL.md"))
+            :else
+            (let [blocks (soul/render e worlds (vec (:yakuwari/capabilities y)) (:authority m))
+                  size (soul/generated-size blocks)
+                  new (soul/splice text blocks)]
+              (cond
+                (> size soul/limit)
+                (do (swap! refused inc) (println (str "refuse  " t "  generated blocks are " size " chars (limit " soul/limit ")")))
+                (not= (soul/strip new) (soul/strip text))
+                (do (swap! refused inc) (println (str "refuse  " t "  the body would change")))
+                (= new text) (println (str "keep    " t))
+                :else
+                (do (when-not (:dry-run opts)
+                      (h/mkdirs (h/join backup-dir t))
+                      (h/spit (h/join backup-dir t "SOUL.md") text)
+                      (h/spit-atomic path new))
+                    (swap! written conj {:profile t :before (h/sha256-hex text) :after (h/sha256-hex new) :generated-chars size})
+                    (println (str (if (:dry-run opts) "would  " "wrote   ") t "  " size " chars"))))))))
+      (when (and (seq @written) (not (:dry-run opts)))
+        (h/spit (h/join backup-dir "receipt.edn")
+                (pr-str {:at (h/iso-local) :registry (:registry opts) :worlds (:worlds opts) :written @written})))
+      (println (str (count @written) " SOUL(s) " (if (:dry-run opts) "would be " "") "rewritten, " @refused " refused"
+                    (when (and (seq @written) (not (:dry-run opts))) (str "; backups and receipt in " backup-dir))))
+      (when (pos? @refused) (set! (.-exitCode js/process) 1)))
 
     "organize"
     (let [reg (try (some-> (:registry opts) profile/read-edn-file) (catch :default _ nil))
