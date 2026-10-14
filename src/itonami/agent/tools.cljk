@@ -2253,7 +2253,8 @@
    "ha_call_service" (ha-tool "ha_call_service")})
 
 (defn call
-  "Run one tool call. Always resolves to a result string."
+  "Run one tool call. Text tools return strings; tools may return the reserved
+  $kotoba_tool_text / $kotoba_tool_images envelope for multimodal output."
   [ctx allowed name args-json]
   (let [args (try (if (string? args-json) (h/json-parse (if (str/blank? args-json) "{}" args-json)) args-json)
                   (catch :default _ ::bad))]
@@ -2264,3 +2265,15 @@
               (-> (p/do (f ctx args))
                   (p/catch (fn [e] (err (str name ": " (.-message e))))))
               (p/resolved (err (str "tool executor not configured for " name)))))))
+
+(defn tool-result-text [result]
+  "Compact text for logs and budget notices; never include base64 image payloads."
+  (if (and (map? result) (contains? result "$kotoba_tool_text"))
+    (get result "$kotoba_tool_text")
+    (if (string? result) result (h/json-str result))))
+
+(defn tool-result-images [result]
+  "Images produced by a tool, encoded as user-message image_url parts."
+  (if (and (map? result) (vector? (get result "$kotoba_tool_images")))
+    (get result "$kotoba_tool_images")
+    []))

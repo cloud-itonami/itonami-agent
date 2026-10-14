@@ -222,7 +222,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                   {:final (or (get message "content") "") :exit-reason "completed" :turns (inc n)
                    :messages messages :usage @usage :attempts attempts :writes @writes
                    :provider (:provider resp) :model (:model resp)}
-                  (p/let [results (p/loop [[c & more] calls acc []]
+                  (p/let [images (atom [])
+                          results (p/loop [[c & more] calls acc []]
                                     (if (nil? c)
                                       acc
                                       (p/let [nm (get-in c ["function" "name"])
@@ -237,20 +238,28 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                        :args (if (some #{nm} tools/browser-tools)
                                                                "[browser arguments redacted]"
                                                                (subs (str args) 0 (min 160 (count (str args)))))})
-                                              out (if approved?
+                                              out-result (if approved?
                                                     (if (= nm "delegate_task")
                                                       (if (map? args-map)
                                                         (delegated-tasks prof names options args-map)
                                                         (h/json-str {"error" "delegate_task arguments must be a JSON object"}))
                                                       (tools/call ctx names nm args))
-                                                    (h/json-str {"error" "Tool call denied by user."}))]
+                                                    (h/json-str {"error" "Tool call denied by user."}))
+                                              out (tools/tool-result-text out-result)
+                                              _ (swap! images into (tools/tool-result-images out-result))]
                                         (emit {:event :tool :name nm :bytes (count out)
                                                :ms (- (h/now-ms) t1) :denied (not approved?)})
                                         (p/recur more (conj acc {"role" "tool" "tool_call_id" (get c "id") "content" out})))))
                           results (if (and (pos? budget-ms) (> (- (h/now-ms) t0) (* 0.8 budget-ms)) (seq results))
                                     (update-in results [(dec (count results)) "content"] str wrapup-notice)
                                     results)]
-                    (p/recur (into messages results) (inc n) attempts resp)))))))))
+                    (let [image-message (when (seq @images)
+                                          {"role" "user"
+                                           "content" (into [{"type" "text"
+                                                             "text" "Image output from the preceding tool call(s):"}]
+                                                           @images)})]
+                      (p/recur (cond-> (into messages results) image-message (conj image-message))
+                               (inc n) attempts resp))))))))))
        (fn [] (browser-runtime/close-session ctx)))))
 
 (defn delegated-tasks
