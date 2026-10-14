@@ -239,16 +239,16 @@
          (let [f (h/join (itonami-dir) "peer.env")] (when (h/file? f) (profile/parse-dotenv (h/slurp f))))))
 
 (defn ensure-rail
-  "A turn run for a peer always has the decentralised rail on its chain:
-  itonami-p2p (this node's own rails, then its trusted peers'), then the
-  named operator rail (murakumo) — appended when the profile's config does
-  not already name them."
+  "A turn run for a peer has the requester's :inference-rail on its chain,
+  appended when the profile's config does not already name it: murakumo
+  (the operator rail) or itonami-p2p (this node's own rails, then its
+  trusted peers'). itonami-p2p is added only when the profile names it."
   [config rail]
   (let [has? (fn [c r] (or (= r (get-in c ["model" "provider"]))
                            (some #(= r (get % "provider")) (get c "fallback_providers"))))
         add (fn [c r m] (if (has? c r) c (update c "fallback_providers" (fnil conj []) {"provider" r "model" m})))]
-    (cond-> (add config "itonami-p2p" "auto")
-      (and rail (not= rail "itonami-p2p")) (add rail (if (= rail "murakumo") "murakumo/free" "auto")))))
+    (cond-> config
+      rail (add rail (if (= rail "murakumo") "murakumo/free" "auto")))))
 
 (defn rebase-paths
   "The requester's prompt and SOUL name paths in ITS profile home

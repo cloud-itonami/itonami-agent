@@ -171,17 +171,24 @@ any OpenAI client on node A (itonami-agent, Hermes)
   peer can answer which model.
 - For an itonami profile, hops whose base URL is a relay in
   `:inference :deny-hosts` (default `openrouter.ai`) are dropped from the
-  chain; a profile without `itonami.edn` keeps its Hermes chain. Turns run for
-  a peer always get `itonami-p2p` on their chain.
+  chain; a profile without `itonami.edn` keeps its Hermes chain.
+- **`itonami-p2p` is opt-in.** A profile gets it on its chain only when it
+  names `:itonami-p2p` in `:inference :rails` or as `:placement
+  :inference-rail`. New profiles use murakumo only (`:inference-rail
+  :murakumo`, `:inference {:rails [:murakumo]}`); a turn run for a peer gets
+  the requester's `:inference-rail`. `profile rail <p>|--all --to R
+  [--dry-run]` repoints existing manifests (`murakumo`, `kotoba` or
+  `itonami-p2p`).
 - **Authority servers, used but not depended on.** kotoba
   (`api.kotoba.cloud`) and murakumo (`api.murakumo.cloud`) are the few
   authority servers of the plane (`:inference :authorities`). They keep their
   place on a profile's chain while healthy, but each sits behind a circuit
   breaker shared by the node (`~/.itonami/authority-health.json`): a failure
   parks the authority (402/401/403 → 30 min, 429 → 2 min, 5xx/transport → 5
-  min) and later turns skip it at no cost; a success clears it. The chain of
-  an itonami profile always also carries `itonami-p2p`, so it never consists
-  of authorities alone. `peer authorities` shows the breaker state.
+  min) and later turns skip it at no cost while a hop behind it can still
+  carry the turn; a success clears it. When the authority is the last rail
+  (a murakumo-only chain) it is tried anyway, so a parked breaker never fails
+  the turn by itself. `peer authorities` shows the breaker state.
 
 ### murakumo
 
