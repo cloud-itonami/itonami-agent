@@ -57,17 +57,47 @@
 
 (defn- iso-now [] (h/iso-local (js/Date.) true))
 
+(defn- recover-interrupted! [db]
+  (let [rows (.all (.prepare db "SELECT id,process_id,pid,process_started_at FROM executions WHERE status IN ('claimed','running')"))
+        now (iso-now)]
+    (doseq [i (range (.-length rows))
+            :let [row (aget rows i)
+                  owner-pid (aget row "pid")
+                  recorded-start (aget row "process_started_at")
+                  current-start (when (h/process-alive? owner-pid) (h/process-start-time owner-pid))
+                  owner-gone? (or (not (h/process-alive? owner-pid))
+                                  (and (number? recorded-start) (number? current-start)
+                                       (> (js/Math.abs (- current-start recorded-start)) 200)))]]
+      (when (and (not= process-id (aget row "process_id")) owner-gone?)
+        (.run (.prepare db "UPDATE executions SET status='unknown',finished_at=?,error=?,
+          handoff_pending=0,handoff_started_at=NULL WHERE id=? AND status IN ('claimed','running')")
+              now "scheduler restarted before a terminal result; execution outcome is unknown"
+              (aget row "id"))))))
+
 (defn claim!
   "Persist a claimed attempt before executing its script or agent turn."
   [home job source]
   (let [db (open-db home)
         id (h/random-hex 16)
+        job-id (str (get job "id"))
         stmt (.prepare db "INSERT INTO executions
-          (id,job_id,source,process_id,pid,status,claimed_at)
-          VALUES (?,?,?,?,?,'claimed',?)")]
+          (id,job_id,source,process_id,pid,process_started_at,status,claimed_at)
+          VALUES (?,?,?,?,?,?,'claimed',?)")]
     (try
-      (.run stmt id (str (get job "id")) (str source) process-id (.-pid js/process) (iso-now))
-      id
+      (.exec db "BEGIN IMMEDIATE")
+      (try
+        (recover-interrupted! db)
+        (let [active (.get (.prepare db "SELECT id FROM executions WHERE job_id=? AND status IN ('claimed','running') LIMIT 1") job-id)]
+          (when active
+            (throw (ex-info "Cron job already has an active execution"
+                            {:job-id job-id :execution-id (aget active "id")}))))
+        (.run stmt id job-id (str source) process-id (.-pid js/process)
+              (h/process-start-time (.-pid js/process)) (iso-now))
+        (.exec db "COMMIT")
+        id
+        (catch :default e
+          (try (.exec db "ROLLBACK") (catch :default _ nil))
+          (throw e)))
       (finally (.close db)))))
 
 (defn mark-running!

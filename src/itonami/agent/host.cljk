@@ -166,6 +166,38 @@
 
 (defn random-hex [n] (.toString (crypto/randomBytes n) "hex"))
 
+(defn process-alive? [pid]
+  (try
+    (.kill js/process pid 0)
+    true
+    (catch :default e
+      (not= "ESRCH" (.-code e)))))
+
+(defn process-start-time
+  "Hermes-compatible process-incarnation fingerprint, or nil when the host
+  cannot prove it. The current process uses uptime-derived centiseconds;
+  Linux other-process checks use /proc ticks, and macOS uses ps start time."
+  [pid]
+  (try
+    (cond
+      (= "linux" (.-platform js/process))
+      (let [text (slurp (str "/proc/" pid "/stat"))
+            end (.lastIndexOf text ") ")
+            fields (str/split (subs text (+ end 2)) #"\s+")]
+        (when (and (>= end 0) (> (count fields) 19))
+          (js/parseInt (nth fields 19) 10)))
+
+      (= pid (.-pid js/process))
+      ;; Node uptime avoids shelling out for the process Kotoba just started.
+      (js/Math.round (/ (- (js/Date.now) (* (.uptime js/process) 1000)) 10))
+
+      :else
+      (let [text (cp/execFileSync "ps" #js ["-p" (str pid) "-o" "lstart="]
+                                  #js {:encoding "utf8" :timeout 2000})
+            ms (js/Date.parse (str/trim text))]
+        (when (js/Number.isFinite ms) (js/Math.round (/ ms 10)))))
+    (catch :default _ nil)))
+
 ;; ---------------------------------------------------------------- processes
 
 (defn run-process

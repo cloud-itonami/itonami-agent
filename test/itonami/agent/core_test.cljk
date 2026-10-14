@@ -108,6 +108,11 @@ plain: true
               (.close db)))
         id (execution-ledger/claim! home job "direct")]
     (try
+      (is (try
+            (execution-ledger/claim! home job "duplicate")
+            false
+            (catch :default _ true))
+          "a second active run for one job is fenced")
       (is (execution-ledger/mark-running! home id))
       (is (execution-ledger/finish! home id false "not_configured"))
       (let [row (first (execution-ledger/rows home "ledger-test"))]
@@ -116,11 +121,22 @@ plain: true
         (is (= "failed" (get row "status")))
         (is (= "not_configured" (get row "delivery_outcome")))
         (is (= "execution failed" (get row "error")))
+        (is (number? (get row "process_started_at")))
         (is (string? (get row "claimed_at")))
         (is (string? (get row "started_at")))
         (is (string? (get row "finished_at"))))
       (is (not (execution-ledger/finish! home id true "delivered"))
           "terminal attempts cannot be rewritten")
+      (let [db (sqlite/DatabaseSync. db-path)]
+        (.run (.prepare db "INSERT INTO executions
+          (id,job_id,source,process_id,pid,status,claimed_at,started_at)
+          VALUES ('interrupted','interrupted-job','itonami','old-process',?,'running',?,?)")
+              (+ (.-pid js/process) 1000000) (h/iso-local (js/Date.) true) (h/iso-local (js/Date.) true))
+        (.close db))
+      (let [next-id (execution-ledger/claim! home {"id" "next-job"} "direct")]
+        (is (= "unknown" (get (first (execution-ledger/rows home "interrupted-job")) "status"))
+            "a provably dead owner becomes unknown rather than silently retrying")
+        (is (execution-ledger/finish! home next-id true "not_configured")))
       (finally (h/rm home)))))
 
 (deftest cron-script-command-by-extension
