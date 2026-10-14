@@ -5,6 +5,7 @@
             [itonami.agent.host :as h]
             [itonami.agent.profile :as profile]
             [itonami.agent.manifest :as manifest]
+            [itonami.agent.soul :as soul]
             [itonami.agent.provider :as provider]
             [itonami.agent.cron :as cron]
             [itonami.agent.p2p :as p2p]
@@ -199,6 +200,63 @@ plain: true
                (:capabilities m')) "a verbatim copy of yakuwari.edn")
         (is (= (:bundle m) (:bundle m')) "yakuwari.edn is outside the bundle")
         (is (= m' (profile/with-derived home m')) "idempotent")))))
+
+(def soul-worlds
+  {:worlds {:etzhayyim {:name "etzhayyim" :parent nil :equity {:holder "SECRET-HOLDER"}
+                        :soul [{:line "最上位" :source "x"}]}
+            :awai {:name "AWAI Network, L.L.C." :parent :etzhayyim :equity {:holder "SECRET-HOLDER"}
+                   :soul [{:line "etzhayyim の下部組織" :source "x"}]
+                   :units {:hyakka {:what "wiki の知識源" :source "x"}}}
+            :host {:name "ホスト運用" :soul [{:line "木の外" :source "x"}]}}
+   :soul/common [{:line "推論は murakumo だけ" :source "x"}]})
+
+(def soul-entry
+  {:agent/id "p" :agent/kind :worker :org/world :awai :org/path [:etzhayyim :awai :hyakka]
+   :org/unit :hyakka :org/parent "awai" :invocation :resident :awai/business :hyakka
+   :source {:repo "network-awai/app-hyakka"}})
+
+(deftest soul-blocks
+  (let [ws "<!-- managed-agent-workspace-locations -->\nrules\n<!-- /managed-agent-workspace-locations -->"
+        rc "<!-- itonami:reward-contract:v1 -->\nc\n<!-- /itonami:reward-contract -->\n"
+        text (str ws "\n\n# p\n\nbody 本文\n\n" rc)
+        caps [{:capability :p.read :decision :autonomous} {:capability :p.deploy :decision :approval-required}
+              {:capability :p/secret :decision :blocked}]
+        b (soul/render soul-entry soul-worlds caps nil)
+        out (soul/splice text b)]
+    (is (= (soul/strip out) text) "the body is byte-identical")
+    (is (= out (soul/splice out b)) "idempotent")
+    (is (str/starts-with? (subs out (+ (str/index-of out soul/ws-end) (count soul/ws-end))) "\n\n<!-- itonami:world:v1 sha=")
+        "the blocks sit right after the workspace-locations block")
+    (is (< (str/index-of out "itonami:role:v1") (str/index-of out "# p")) "before the body")
+    (is (str/includes? out "系列: etzhayyim › AWAI Network, L.L.C. › hyakka"))
+    (is (str/includes? out "etzhayyim: 最上位"))
+    (is (str/includes? out "共通: 推論は murakumo だけ"))
+    (is (str/includes? out "unit: hyakka — wiki の知識源"))
+    (is (str/includes? out "自律: p.read"))
+    (is (str/includes? out "禁止: p/secret"))
+    (is (not (str/includes? out "SECRET-HOLDER")) "equity holders are never rendered")
+    (is (<= (soul/generated-size b) soul/limit))
+    (testing "new blocks replace old ones; nothing else moves"
+      (let [b2 (soul/render (assoc soul-entry :org/parent "itonami") soul-worlds [] {:default-decision :approval-required})
+            out2 (soul/splice out b2)]
+        (is (= 1 (count (re-seq #"itonami:role:v1 sha" out2))))
+        (is (str/includes? out2 "yakuwari.edn なし。既定は approval-required"))
+        (is (= (soul/strip out2) text))))
+    (testing "a SOUL without the workspace-locations block gets the blocks on top"
+      (let [plain "# q\n\nbody\n"
+            out3 (soul/splice plain b)]
+        (is (str/starts-with? out3 "<!-- itonami:world:v1"))
+        (is (= (soul/strip out3) plain))
+        (is (= out3 (soul/splice out3 b)))))
+    (testing "a :host profile sits outside the tree"
+      (let [hb (soul/render {:agent/id "h" :agent/kind :worker :org/world :host :invocation :on-demand} soul-worlds [] nil)]
+        (is (str/includes? (:world hb) "系列: 組織の木の外（ホスト運用）"))
+        (is (str/includes? (:world hb) "ホスト運用: 木の外"))))
+    (testing "long capability lists shrink to fit the limit"
+      (let [many (vec (for [i (range 400)] {:capability (keyword (str "cap-with-a-long-name-" i)) :decision :autonomous}))
+            bm (soul/render soul-entry soul-worlds many nil)]
+        (is (<= (soul/generated-size bm) soul/limit))
+        (is (str/includes? (:role bm) "ほか"))))))
 
 (deftest cron-next-fire
   (let [d (js/Date. 2026 9 7 13 0 0)]                      ; 2026-10-07 13:00 local
