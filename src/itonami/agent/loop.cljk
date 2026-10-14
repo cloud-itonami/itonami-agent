@@ -12,6 +12,7 @@
             [promesa.core :as p]
             [itonami.agent.host :as h]
             [itonami.agent.provider :as provider]
+            [itonami.agent.browser :as browser-runtime]
             [itonami.agent.tools :as tools]
             [itonami.agent.mcp :as mcp]
             [itonami.agent.yaml :as yaml]
@@ -148,6 +149,9 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         cwd (or cwd (some-> (get-in config ["terminal" "cwd"]) h/expand) (h/join (:home prof) "workspace"))
         _ (h/mkdirs cwd)
         ctx {:cwd cwd :home (:home prof) :profile (:name prof) :roots roots :writes writes :tool-env env
+             :browser-config (get config "browser" {})
+             :browser-session (str "kotoba-" (h/random-hex 12))
+             :browser-used? (atom false)
              :model-hops hops :reasoning-effort reasoning-effort
              :todos (atom (:todos todo-state)) :todo-revision (atom (:revision todo-state))
              :mcp-config config :mcp-index mcp-index
@@ -166,7 +170,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                      :else nil)
         usage (atom {"prompt_tokens" 0 "completion_tokens" 0 "total_tokens" 0})
         add-usage! (fn [u] (when u (swap! usage #(merge-with + % (select-keys u ["prompt_tokens" "completion_tokens" "total_tokens"])))))]
-      (p/loop [messages (into [{"role" "system" "content"
+      (p/finally
+       (p/loop [messages (into [{"role" "system" "content"
                                 (str (system-prompt prof {:cwd cwd :platform platform
                                                           :load-context? load-context?
                                                           :skills? (boolean (some #{"skill_view"} names))
@@ -226,7 +231,9 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                           true)
                                               t1 (h/now-ms)
                                               _ (emit {:event :tool-start :name nm
-                                                       :args (subs (str args) 0 (min 160 (count (str args))))})
+                                                       :args (if (some #{nm} tools/browser-tools)
+                                                               "[browser arguments redacted]"
+                                                               (subs (str args) 0 (min 160 (count (str args)))))})
                                               out (if approved?
                                                     (if (= nm "delegate_task")
                                                       (if (map? args-map)
@@ -240,7 +247,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                           results (if (and (pos? budget-ms) (> (- (h/now-ms) t0) (* 0.8 budget-ms)) (seq results))
                                     (update-in results [(dec (count results)) "content"] str wrapup-notice)
                                     results)]
-                    (p/recur (into messages results) (inc n) attempts resp)))))))))))
+                    (p/recur (into messages results) (inc n) attempts resp)))))))))
+       (fn [] (browser-runtime/close-session ctx)))))
 
 (defn delegated-tasks
   "Run bounded foreground child turns in Kotoba with recursive delegation and

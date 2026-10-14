@@ -20,6 +20,7 @@
             [itonami.agent.homeassistant :as homeassistant]
             [itonami.agent.profile :as profile]
             [itonami.agent.provider :as provider]
+            [itonami.agent.browser :as browser]
             [itonami.agent.yaml :as yaml]
             ["node:crypto" :as crypto]
             ["node:sqlite" :as sqlite]))
@@ -73,6 +74,34 @@
    (fn-schema "web_extract" "Fetch up to 5 URLs and return their readable text."
               {"urls" {"type" "array" "items" {"type" "string"}} "char_limit" {"type" "integer"}}
               ["urls"])
+   "browser_navigate"
+   (fn-schema "browser_navigate" "Navigate to a public website through Kotoba's guarded browser proxy."
+              {"url" {"type" "string"}} ["url"])
+   "browser_snapshot"
+   (fn-schema "browser_snapshot" "Read the current page accessibility snapshot."
+              {"full" {"type" "boolean" "default" false}} [])
+   "browser_click"
+   (fn-schema "browser_click" "Click an element ref from the latest browser snapshot."
+              {"ref" {"type" "string"}} ["ref"])
+   "browser_type"
+   (fn-schema "browser_type" "Replace the value of an input identified by a browser ref."
+              {"ref" {"type" "string"} "text" {"type" "string"}} ["ref" "text"])
+   "browser_scroll"
+   (fn-schema "browser_scroll" "Scroll the current browser page."
+              {"direction" {"type" "string" "enum" ["up" "down" "left" "right"]}} ["direction"])
+   "browser_back"
+   (fn-schema "browser_back" "Navigate back in the current browser session." {} [])
+   "browser_press"
+   (fn-schema "browser_press" "Press a keyboard key in the current browser page."
+              {"key" {"type" "string"}} ["key"])
+   "browser_get_images"
+   (fn-schema "browser_get_images" "List images in the current browser page with source URLs and alt text." {} [])
+   "browser_console"
+   (fn-schema "browser_console" "Read browser console output or evaluate an expression in the current page."
+              {"clear" {"type" "boolean" "default" false} "expression" {"type" "string"}} [])
+   "browser_vision"
+   (fn-schema "browser_vision" "Capture the current page and analyze its visible layout with the active Kotoba vision provider."
+              {"question" {"type" "string"} "annotate" {"type" "boolean" "default" false}} ["question"])
    "vision_analyze"
    (fn-schema "vision_analyze" "Analyze an image using the active Kotoba provider chain. Remote URLs use the public-only web guard; local files must be readable by this run."
               {"image_url" {"type" "string" "description" "Public http(s) image URL, base64 image data URL, or readable local image path."}
@@ -370,6 +399,7 @@
                                     (contains? additional (subs % 4)))) sets)))))
 
 (def approval-free-tools #{"read_file" "search_files" "web_search" "web_extract" "skills_list" "skill_view" "todo_list" "delegate_task"
+                           "browser_snapshot" "browser_get_images"
                            "ha_list_entities" "ha_get_state" "ha_list_services"})
 
 (defn approval-required?
@@ -627,6 +657,23 @@
                     (err (str "vision_analyze: " (get-in r [:err :error] "no multimodal provider available"))))))
         (p/catch (fn [e] (err (str "vision_analyze: " (.-message e))))))
     (p/resolved (err "vision_analyze: no provider chain is available"))))
+
+(defn- browser-vision [ctx {:strs [question annotate]}]
+  (if (str/blank? (str question))
+    (p/resolved (err "browser_vision: question is required"))
+    (let [dir (h/join (:home ctx) "data" "browser")
+          path (h/join dir (str "vision-" (h/random-hex 8) ".png"))
+          cleanup (fn [value] (h/rm path) value)]
+      (h/mkdirs dir)
+      (-> (browser/screenshot ctx path annotate)
+          (p/then (fn [raw]
+                    (let [result (try (h/json-parse raw) (catch :default _ nil))]
+                      (if (and result (not= false (get result "success")))
+                        (-> (vision-analyze ctx {"image_url" path "question" question})
+                            (p/then cleanup)
+                            (p/catch (fn [e] (h/rm path) (err (str "browser_vision: " (.-message e))))))
+                        (do (h/rm path) raw)))))
+          (p/catch (fn [e] (h/rm path) (err (str "browser_vision: " (.-message e)))))))))
 
 (def search-endpoint "https://html.duckduckgo.com/html/?q=")
 
@@ -2153,6 +2200,12 @@
 (def impls
   {"terminal" terminal "process_manage" process/manage "read_file" read-file "write_file" write-file "patch" patch
    "search_files" search-files "web_extract" web-extract "web_search" web-search
+   "browser_navigate" browser/navigate "browser_snapshot" browser/snapshot
+   "browser_click" browser/click "browser_type" browser/type-text
+   "browser_scroll" browser/scroll "browser_back" browser/back
+   "browser_press" browser/press "browser_get_images" browser/get-images
+   "browser_console" browser/console-output
+   "browser_vision" browser-vision
    "vision_analyze" vision-analyze
    "skills_list" skills-list "skill_view" skill-view "skill_manage" skill-manage
    "todo_list" todo-list "memory" memory "execute_code" execute-code

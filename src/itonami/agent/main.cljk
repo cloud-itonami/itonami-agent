@@ -321,12 +321,23 @@
                    (tools/unsupported-toolsets requested (set (keys servers))))
         bad-tools (if (true? (get job "no_agent")) []
                     (tools/unsupported-tools (tools/enabled-tool-names requested disabled)))
+        enabled-tools (tools/enabled-tool-names requested disabled)
+        browser-selected? (some (set tools/browser-tools) enabled-tools)
+        browser-config (get config "browser" {})
+        browser-backend (or (get browser-config "backend") "local")
+        browser-provider (get browser-config "cloud_provider")
+        browser-cdp (or (get browser-config "cdp_url") (get browser-config "cdp_endpoint"))
+        browser-engine (get browser-config "engine")
         lane (or (get job "deliver") "local")]
     (concat
      (when (and (not (true? (get job "no_agent"))) (seq bad-sets))
        [{:code :unsupported_toolset :detail (str/join ", " bad-sets)}])
      (when (and (not (true? (get job "no_agent"))) (seq bad-tools))
        [{:code :unsupported_tools :detail (str/join ", " bad-tools)}])
+     (when (and browser-selected?
+                (or (not= browser-backend "local") browser-provider browser-cdp
+                    (and browser-engine (not (contains? #{"auto" "chrome"} browser-engine)))))
+       [{:code :unsupported_browser_backend :detail "Kotoba browser supports local Chrome only"}])
      (when (seq oauth-unready)
        [{:code :oauth_cache_unavailable :detail (str/join ", " oauth-unready)}])
      (when (not= "local" (str/lower-case (str lane)))
