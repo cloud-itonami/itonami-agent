@@ -130,7 +130,10 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                             {:unsupported-toolsets unknown-sets})))
         ;; agent.disabled_toolsets travels in the bundle (not host-local), so a
         ;; peer turn drops the same tools; a -t / peer opts toolsets cannot re-add them
-        names (tools/enabled-tool-names all-requested disabled)
+        browser-cdp-configured? (or (not (str/blank? (get env "BROWSER_CDP_URL")))
+                                    (not (str/blank? (get-in config ["browser" "cdp_url"])))
+                                    (not (str/blank? (get-in config ["browser" "cdp_endpoint"]))))
+        names (tools/runtime-tool-names all-requested disabled browser-cdp-configured?)
         mcp-data (mcp/discover config env mcp-servers (:home prof))
         mcp-index (:index mcp-data)
         mcp-names (vec (keys mcp-index))
@@ -140,7 +143,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
             (throw (ex-info (str "Kotoba agent cannot run this Hermes toolset yet; unsupported tools: "
                                  (str/join ", " unsupported))
                             {:unsupported-tools unsupported})))
-        schemas (into (tools/tool-schemas (tools/enabled-tool-names all-requested disabled))
+        schemas (into (tools/tool-schemas names)
                       (:schemas mcp-data))
         mcp-overrides (into {} (for [[wire [server raw]] mcp-index]
                                  [wire (fn [_ args] (mcp/call config env server raw args (:home prof)))]))

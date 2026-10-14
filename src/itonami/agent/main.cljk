@@ -303,6 +303,17 @@
   (and (get job "enabled" true)
        (not (contains? #{"paused" "completed" "disabled"} (get job "state" "scheduled")))))
 
+(defn- browser-cdp-configured? [prof]
+  (let [dotenv (profile/parse-dotenv
+                (let [path (h/join (:home prof) ".env")]
+                  (when (h/file? path) (h/slurp path))))]
+    (boolean (some (complement str/blank?)
+                   [(get-in prof [:config "browser" "cdp_url"])
+                    (get-in prof [:config "browser" "cdp_endpoint"])
+                    (get (:env prof) "BROWSER_CDP_URL")
+                    (get dotenv "BROWSER_CDP_URL")
+                    (h/env "BROWSER_CDP_URL")]))))
+
 (defn- kotoba-job-issues [prof job]
   "Read-only compatibility gate for a single active Hermes cron job."
   (let [config (:config prof)
@@ -319,14 +330,14 @@
                               selected-mcp)
         bad-sets (if (true? (get job "no_agent")) []
                    (tools/unsupported-toolsets requested (set (keys servers))))
+        browser-cdp (browser-cdp-configured? prof)
         bad-tools (if (true? (get job "no_agent")) []
-                    (tools/unsupported-tools (tools/enabled-tool-names requested disabled)))
-        enabled-tools (tools/enabled-tool-names requested disabled)
+                    (tools/unsupported-tools (tools/runtime-tool-names requested disabled browser-cdp)))
+        enabled-tools (tools/runtime-tool-names requested disabled browser-cdp)
         browser-selected? (some (set tools/browser-tools) enabled-tools)
         browser-config (get config "browser" {})
         browser-backend (or (get browser-config "backend") "local")
         browser-provider (get browser-config "cloud_provider")
-        browser-cdp (or (get browser-config "cdp_url") (get browser-config "cdp_endpoint"))
         browser-engine (get browser-config "engine")
         lane (or (get job "deliver") "local")]
     (concat

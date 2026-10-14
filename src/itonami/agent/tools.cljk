@@ -418,6 +418,16 @@
   (let [off (set (tool-names disabled))]
     (vec (remove off (tool-names requested)))))
 
+(defn runtime-tool-names
+  "Resolve tools that Hermes would actually expose in this profile. Hermes gates
+  browser_cdp and browser_dialog together on a configured CDP endpoint; neither
+  belongs in the local browser surface when no endpoint is configured."
+  [requested disabled cdp-configured?]
+  (let [names (enabled-tool-names requested disabled)]
+    (if cdp-configured?
+      names
+      (vec (remove #{"browser_cdp" "browser_dialog"} names)))))
+
 (defn tool-schemas [names] (vec (keep schemas names)))
 
 ;; ---------------------------------------------------------------- helpers
