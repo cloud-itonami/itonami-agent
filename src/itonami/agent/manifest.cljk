@@ -103,6 +103,7 @@
                [[:invocation] false #{:resident :on-demand} "not one of :resident :on-demand"]
                [[:awai/business] false keyword? "not a business id"]
                [[:ids] false map? "not a map"]
+               [[:ids :did] false #(boolean (re-matches #"^did:key:z6Mk[1-9A-HJ-NP-Za-km-z]+$" (str %))) "not an ed25519 did:key"]
                [[:authority] false map? "not a map"]
                [[:authority :default-decision] false decisions "not in the yakuwari vocabulary"]
                [[:authority :source] false #{:yakuwari} "not :yakuwari"]])
@@ -133,7 +134,8 @@
         yid (or (:yakuwari/id entry) (get-in entry [:yakuwari :id]))
         ids (cond-> {}
               repo (assoc :repo repo)
-              yid (assoc :yakuwari/id (str yid)))
+              yid (assoc :yakuwari/id (str yid))
+              (:did entry) (assoc :did (:did entry)))
         org (into {} (remove (comp nil? val))
                   (select-keys entry [:agent/kind :org/world :org/path :org/github :org/unit
                                       :org/layer :invocation :awai/business]))]

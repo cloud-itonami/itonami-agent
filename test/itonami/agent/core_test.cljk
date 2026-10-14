@@ -6,6 +6,7 @@
             [itonami.agent.profile :as profile]
             [itonami.agent.manifest :as manifest]
             [itonami.agent.soul :as soul]
+            [itonami.agent.identity :as identity]
             [itonami.agent.provider :as provider]
             [itonami.agent.cron :as cron]
             [itonami.agent.p2p :as p2p]
@@ -257,6 +258,30 @@ plain: true
             bm (soul/render soul-entry soul-worlds many nil)]
         (is (<= (soul/generated-size bm) soul/limit))
         (is (str/includes? (:role bm) "ほか"))))))
+
+(deftest profile-dids
+  (let [seed (identity/parse-seed (apply str (repeat 64 "a")))
+        a0 (identity/derive-key seed "murakumo-eng" 0)]
+    (is (re-matches #"^did:key:z6Mk[1-9A-HJ-NP-Za-km-z]+$" (:did a0)) "an ed25519 did:key")
+    (is (= (:did a0) (identity/did-of seed "murakumo-eng" 0)) "deterministic")
+    (is (not= (:did a0) (identity/did-of seed "murakumo-eng" 1)) "a new epoch is a new key")
+    (is (not= (:did a0) (identity/did-of seed "murakumo-eng-2" 0)) "each profile its own key")
+    (is (not= (:did a0) (identity/did-of (identity/parse-seed (apply str (repeat 64 "b"))) "murakumo-eng" 0))
+        "another seed, another key")
+    (testing "the derived key signs what its DID verifies"
+      (let [env (p2p/sign-envelope a0 {"hello" "world"})]
+        (is (= (:did a0) (:did (p2p/open-envelope env {}))))
+        (is (= "bad signature" (:error (p2p/open-envelope (assoc env "did" (identity/did-of seed "other" 0)) {}))))))
+    (is (nil? (identity/parse-seed "not hex")))
+    (is (nil? (identity/parse-seed (apply str (repeat 63 "a")))))
+    (is (thrown? js/Error (identity/derive-key (js/Buffer.alloc 16) "p" 0)))
+    (is (thrown? js/Error (identity/derive-key seed "p" -1)))
+    (testing "organize projects the registry's DID into :ids"
+      (let [m (manifest/with-org v1-manifest {:agent/id "p" :agent/kind :worker :org/world :host :invocation :resident
+                                              :did (:did a0)} {})]
+        (is (= (:did a0) (get-in m [:ids :did])))
+        (is (= [] (manifest/validate m)))
+        (is (= #{[:ids :did]} (set (map :path (manifest/errors (assoc-in m [:ids :did] "did:web:x"))))))))))
 
 (deftest cron-next-fire
   (let [d (js/Date. 2026 9 7 13 0 0)]                      ; 2026-10-07 13:00 local

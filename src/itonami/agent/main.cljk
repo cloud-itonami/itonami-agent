@@ -13,6 +13,7 @@
     itonami-agent profile rail <p>|--all --to R [--dry-run] inference rail: murakumo | kotoba | itonami-p2p
     itonami-agent profile check <p>|--all [--summary]       validate itonami.edn and report drift (read-only)
     itonami-agent profile refresh <p>|--all [--dry-run]     recompute the bundle CID; re-copy capabilities
+    itonami-agent profile did <p>|--all [--registry F] [--out F]  per-profile did:key (seed from the environment)
     itonami-agent profile soul <p>|--all --registry F --worlds F [--unit U] [--dry-run]
                                                             render the world/unit/role SOUL blocks
     itonami-agent profile organize <p>|--all --registry F [--dry-run]
@@ -35,6 +36,7 @@
             [itonami.agent.profile :as profile]
             [itonami.agent.manifest :as manifest]
             [itonami.agent.soul :as soul]
+            [itonami.agent.identity :as identity]
             [itonami.agent.loop :as agent-loop]
             [itonami.agent.cron :as cron]
             [itonami.agent.p2p :as p2p]
@@ -276,6 +278,26 @@
                                       (str (get-in m [:bundle :cid]) " -> " (get-in m' [:bundle :cid])))
                                     (when (not= (:capabilities m) (:capabilities m')) "  capabilities re-copied from yakuwari.edn")))))))
       (println (str @n " manifest(s) " (if (:dry-run opts) "would be " "") "refreshed")))
+
+    "did"
+    (let [seed (identity/seed-from-env)
+          reg (try (some-> (:registry opts) profile/read-edn-file) (catch :default _ nil))
+          by-id (into {} (map (juxt :agent/id identity)) (:agents reg))
+          targets (cond (not (:all opts)) [(first args)]
+                        (seq by-id) (sort (keys by-id))
+                        :else (profile/names))]
+      (when-not seed
+        (die 2 (str "REFUSED: " identity/seed-env " is not set (64 hex characters). Fill it from the kagi item "
+                    "shared/hermes-profile-did-seed in a human session, for this one command; it is never printed.")))
+      (when-not (first targets)
+        (die 2 "usage: itonami-agent profile did <p>|--all [--registry <agent-registry.edn>] [--out <file>]"))
+      (let [out (into (sorted-map)
+                      (for [t targets :let [epoch (or (:did/epoch (get by-id t)) 0)]]
+                        [t {:did (identity/did-of seed t epoch) :epoch epoch}]))]
+        (if (:out opts)
+          (h/spit (:out opts) (str ";; per-profile did:key (ADR-2610141512 D7). Public keys only.\n" (pr-str out) "\n"))
+          (doseq [[t {:keys [did epoch]}] out] (println (str t "  " did "  epoch " epoch))))
+        (println (str (count out) " DID(s)" (when (:out opts) (str " written to " (:out opts)))))))
 
     "soul"
     (let [reg (try (some-> (:registry opts) profile/read-edn-file) (catch :default _ nil))
