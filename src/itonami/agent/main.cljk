@@ -559,7 +559,6 @@
                   (do (swap! skipped inc)
                       (println (str "skip    " n "  Kotoba tick is in progress")))
                   (try
-                    (profile/refresh-bundle-cid home)
                     (let [counts* (atom {"script" 0 "monitor_script" 0})]
                       (cron/transform-jobs!
                        home
@@ -576,7 +575,11 @@
                       (let [counts @counts*
                             nrefs (+ (get counts "script" 0) (get counts "monitor_script" 0))]
                         (if (pos? nrefs)
-                          (do (swap! converted + nrefs)
+                          (do
+                              ;; cron/jobs.json is part of the profile bundle. Refresh only
+                              ;; after the rewritten references have been atomically saved.
+                              (profile/refresh-bundle-cid home)
+                              (swap! converted + nrefs)
                               (println (str "converted " n "  script=" (get counts "script")
                                             " monitor_script=" (get counts "monitor_script"))))
                           (println (str "keep    " n "  references already converted")))))
