@@ -10,6 +10,7 @@
 
   itonami layer:
     itonami-agent profile itonamify <p>|--all [--dry-run]   write itonami.edn (additive)
+    itonami-agent profile rail <p>|--all --to R [--dry-run] inference rail: murakumo | kotoba | itonami-p2p
     itonami-agent profile adopt <p>                         itonami ticks this profile's cron; Hermes stops
     itonami-agent profile release <p>                       hand cron back to Hermes
     itonami-agent profile bundle <p>                        print the bundle CID and file list
@@ -207,6 +208,25 @@
                 (println (str (if (:dry-run opts) "would  " "wrote   ") t "  " (get-in m [:bundle :cid]))))))
           (catch :default e (println (str "skip    " t "  " (.-message e))))))
       (println (str @n " profile(s) " (if (:dry-run opts) "would be " "") "itonamified")))
+
+    "rail"
+    (let [rail (some-> (:to opts) keyword)
+          targets (if (:all opts) (profile/names) [(first args)])
+          n (atom 0)]
+      (when-not (and (#{:murakumo :kotoba :itonami-p2p} rail) (first targets))
+        (die 2 "usage: itonami-agent profile rail <p>|--all --to murakumo|kotoba|itonami-p2p [--dry-run]"))
+      (doseq [t targets]
+        (let [home (profile/home t)
+              m (try (profile/read-edn-file (h/join home "itonami.edn")) (catch :default _ nil))
+              m' (some-> m (profile/with-inference-rail rail))]
+          (cond
+            (nil? m) (println (str "skip    " t "  no itonami.edn"))
+            (= m m') (println (str "keep    " t))
+            :else (do (when-not (:dry-run opts) (profile/write-manifest! home m'))
+                      (swap! n inc)
+                      (println (str (if (:dry-run opts) "would  " "wrote   ") t "  "
+                                    (some-> (get-in m [:placement :inference-rail]) name) " -> " (name rail)))))))
+      (println (str @n " profile(s) " (if (:dry-run opts) "would be " "") "pointed at " (name rail))))
 
     "bundle"
     (let [prof (profile/load-profile (first args) {:secrets? false})

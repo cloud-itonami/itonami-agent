@@ -66,16 +66,48 @@ plain: true
               {:provider "itonami-p2p" :base-url "http://127.0.0.1:7420/v1"}]]
     (is (= ["kotoba" "itonami-p2p"] (map :provider (provider/decentralize hops {:itonami/schema "x"}))))
     (is (= "api.kotoba.cloud" (:authority (first (provider/decentralize hops {:itonami/schema "x"})))))
-    (testing "a chain of authorities alone gets the p2p rail appended"
-      (is (= ["kotoba" "itonami-p2p"] (map :provider (provider/decentralize [(first hops)] {:itonami/schema "x"})))))
+    (testing "the p2p rail is appended only when the profile opted into it"
+      (is (= ["kotoba" "itonami-p2p"]
+             (map :provider (provider/decentralize [(first hops)] {:placement {:inference-rail :itonami-p2p}}))))
+      (is (= ["kotoba" "itonami-p2p"]
+             (map :provider (provider/decentralize [(first hops)] {:inference {:rails [:itonami-p2p :murakumo]}}))))
+      (is (= ["kotoba"] (map :provider (provider/decentralize [(first hops)] {:itonami/schema "x"}))))
+      (let [mk [{:provider "murakumo" :base-url "https://api.murakumo.cloud/v1"}]
+            m (profile/with-inference-rail {:placement {:inference-rail :itonami-p2p}} :murakumo)]
+        (is (= ["murakumo"] (map :provider (provider/decentralize mk m))) "murakumo-only profile")
+        (is (= "api.murakumo.cloud" (:authority (first (provider/decentralize mk m)))))))
     (testing "breaker: a 402 parks the authority, a success clears it"
       (provider/record-authority! "api.example.test" {:status 402 :error "credit"})
       (is (provider/breaker-open? "api.example.test"))
+      (testing "a parked authority is skipped only while a hop behind it can carry the turn"
+        (let [parked {:provider "x" :authority "api.example.test"}
+              local {:provider "itonami-p2p"}]
+          (is (provider/skip-parked? parked [local]))
+          (is (not (provider/skip-parked? parked [])) "last rail: tried, not skipped")
+          (is (not (provider/skip-parked? parked [parked])) "only parked authorities behind it")
+          (is (not (provider/skip-parked? local [parked])))))
       (provider/record-authority! "api.example.test" nil)
       (is (not (provider/breaker-open? "api.example.test"))))
     (is (= 3 (count (provider/decentralize hops nil))) "plain Hermes profiles keep their chain")
-    (is (= ["itonami-p2p" "murakumo"]
-           (map #(get % "provider") (get (p2p/ensure-rail {"model" {"provider" "kotoba"}} "murakumo") "fallback_providers"))))))
+    (testing "a peer turn gets the requester's rail; itonami-p2p only when named"
+      (is (= ["murakumo"]
+             (map #(get % "provider") (get (p2p/ensure-rail {"model" {"provider" "kotoba"}} "murakumo") "fallback_providers"))))
+      (is (= ["itonami-p2p"]
+             (map #(get % "provider") (get (p2p/ensure-rail {"model" {"provider" "kotoba"}} "itonami-p2p") "fallback_providers"))))
+      (is (nil? (get (p2p/ensure-rail {"model" {"provider" "murakumo"}} "murakumo") "fallback_providers")))
+      (is (nil? (get (p2p/ensure-rail {"model" {"provider" "kotoba"}} nil) "fallback_providers"))))))
+
+(deftest inference-rail-manifest
+  (let [v1 {:itonami/schema "cloud.itonami.profile.v1" :profile/id "p"
+            :placement {:mode :p2p :order [:peer :local] :peers :trusted :inference-rail :itonami-p2p}
+            :bundle {:cid "bafy" :files 1}}
+        m (profile/with-inference-rail v1 :murakumo)]
+    (is (= :murakumo (get-in m [:placement :inference-rail])))
+    (is (= {:rails [:murakumo] :authorities ["api.murakumo.cloud"] :deny-hosts ["openrouter.ai"]} (:inference m)))
+    (is (= (dissoc v1 :placement) (dissoc m :placement :inference)) "other keys untouched")
+    (is (= m (profile/with-inference-rail m :murakumo)) "idempotent")
+    (is (not (provider/p2p-rail? m)))
+    (is (provider/p2p-rail? v1))))
 
 (deftest cron-next-fire
   (let [d (js/Date. 2026 9 7 13 0 0)]                      ; 2026-10-07 13:00 local
