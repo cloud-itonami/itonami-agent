@@ -421,18 +421,34 @@
                 (swap! hy-deps-cache assoc installs resolved)
                 resolved)))))))
 
+(declare script-path-safe?)
+
 (defn script-runtime-issues
-  "Readiness issues for runtime-specific script entry points in one cron job."
+  "Readiness issues for script paths and runtime-specific entry points in one cron job."
   [prof job]
-  (let [hy-fields (for [field ["script" "monitor_script"]
-                        :let [path (get job field)]
-                        :when (and (string? path) (re-find #"(?i)\.hy$" path))]
-                    [field path])]
-    (if (and (seq hy-fields) (nil? (hy-dependencies prof)))
-      [{:code :hy_runtime_unavailable
-        :detail (str "Hy runtime not found for "
-                     (str/join ", " (map (fn [[field path]] (str field "=" path)) hy-fields)))}]
-      [])))
+  (let [scripts (h/join (:home prof) "scripts")
+        refs (for [field ["script" "monitor_script"]
+                   :let [path (get job field)]
+                   :when (some? path)]
+               [field path])
+        path-issues (mapcat (fn [[field path]]
+                              (cond
+                                (not (script-path-safe? scripts path))
+                                [{:code :unsafe_script_path
+                                  :detail (str field "=" path)}]
+                                (not (h/file? (h/join scripts path)))
+                                [{:code :script_not_found
+                                  :detail (str field "=" path)}]
+                                :else []))
+                            refs)
+        hy-fields (filter (fn [[_ path]]
+                            (and (string? path) (re-find #"(?i)\.hy$" path)))
+                          refs)
+        hy-issues (when (and (seq hy-fields) (nil? (hy-dependencies prof)))
+                    [{:code :hy_runtime_unavailable
+                      :detail (str "Hy runtime not found for "
+                                   (str/join ", " (map (fn [[field path]] (str field "=" path)) hy-fields)))}])]
+    (concat path-issues hy-issues)))
 
 (defn script-command
   "Choose the runner from the script extension. Hy uses the job interpreter,

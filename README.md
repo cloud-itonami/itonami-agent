@@ -61,8 +61,8 @@ does not implement; it never silently narrows a caller's requested tool set.
 ## itonami profile
 
 `profile itonamify <p>|--all` adds `itonami.edn` (schema
-`cloud.itonami.profile.v1`) next to the Hermes files. Hermes ignores it;
-deleting it returns the profile to plain Hermes.
+`cloud.itonami.profile.v2`; v1 manifests stay valid) next to the Hermes
+files. Hermes ignores it; deleting it returns the profile to plain Hermes.
 
 ```clojure
 {:itonami/schema "cloud.itonami.profile.v1"
@@ -73,6 +73,33 @@ deleting it returns the profile to plain Hermes.
  :bundle    {:cid "bafkrei…" :files 5 :skills []}          ; content address of the definition
  :capabilities [...]}                                       ; copied from yakuwari.edn, grants nothing
 ```
+
+v2 adds where the profile sits in the organisation, projected from the agent
+registry by `profile organize --registry <agent-registry.edn>`. The registry
+is an index, not authority: `:authority` only points at `yakuwari.edn`.
+
+```clojure
+ :agent/kind :worker                      ; :steward :unit :role-bot :organism :worker
+ :org/world :awai                         ; :etzhayyim :awai :kotoba :host
+ :org/path [:etzhayyim :awai :hyakka]     ; governance line; a :host profile has none
+ :org/github "network-awai"  :org/unit :hyakka  :invocation :resident
+ :awai/business :hyakka                   ; when the profile works for an awai business
+ :ids {:repo "network-awai/app-hyakka" :yakuwari/id "…"}
+ :authority {:default-decision :approval-required :source :yakuwari :ref "yakuwari.edn"}
+```
+
+- `profile check <p>|--all [--summary]` validates the manifest
+  (`itonami.agent.manifest/validate`, no dependencies) and reports drift: a
+  bundle CID that no longer matches the files, a config provider other than
+  the declared rail, a missing managed SOUL block. Read-only; exit 1 on
+  errors. Capability decisions follow yakuwari's vocabulary
+  (`:autonomous :voice-required :approval-required :blocked`); a legacy or
+  unknown word is a warning, because yakuwari.edn, not itonami.edn, is where
+  it is fixed.
+- `profile refresh <p>|--all [--dry-run]` rewrites a stale bundle CID.
+  Peers verify the bundle against it, so a stale CID fails peer runs.
+- `itonamify --refresh` keeps the declared runtime, placement, rails,
+  terminal/web policy and organisation keys.
 
 Exactly one scheduler ticks a profile:
 
@@ -233,17 +260,24 @@ any OpenAI client on node A (itonami-agent, Hermes)
   peer can answer which model.
 - For an itonami profile, hops whose base URL is a relay in
   `:inference :deny-hosts` (default `openrouter.ai`) are dropped from the
-  chain; a profile without `itonami.edn` keeps its Hermes chain. Turns run for
-  a peer always get `itonami-p2p` on their chain.
+  chain; a profile without `itonami.edn` keeps its Hermes chain.
+- **`itonami-p2p` is opt-in.** A profile gets it on its chain only when it
+  names `:itonami-p2p` in `:inference :rails` or as `:placement
+  :inference-rail`. New profiles use murakumo only (`:inference-rail
+  :murakumo`, `:inference {:rails [:murakumo]}`); a turn run for a peer gets
+  the requester's `:inference-rail`. `profile rail <p>|--all --to R
+  [--dry-run]` repoints existing manifests (`murakumo`, `kotoba` or
+  `itonami-p2p`).
 - **Authority servers, used but not depended on.** kotoba
   (`api.kotoba.cloud`) and murakumo (`api.murakumo.cloud`) are the few
   authority servers of the plane (`:inference :authorities`). They keep their
   place on a profile's chain while healthy, but each sits behind a circuit
   breaker shared by the node (`~/.itonami/authority-health.json`): a failure
   parks the authority (402/401/403 → 30 min, 429 → 2 min, 5xx/transport → 5
-  min) and later turns skip it at no cost; a success clears it. The chain of
-  an itonami profile always also carries `itonami-p2p`, so it never consists
-  of authorities alone. `peer authorities` shows the breaker state.
+  min) and later turns skip it at no cost while a hop behind it can still
+  carry the turn; a success clears it. When the authority is the last rail
+  (a murakumo-only chain) it is tried anyway, so a parked breaker never fails
+  the turn by itself. `peer authorities` shows the breaker state.
 
 ### murakumo
 
