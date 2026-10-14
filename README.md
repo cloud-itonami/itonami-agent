@@ -77,8 +77,10 @@ Exactly one scheduler ticks a profile:
 
 - `profile adopt <p>` sets `:scheduler :itonami` and writes Hermes'
   `gateway.parked` marker, so the Hermes gateway stops ticking it;
-  `gateway run` then ticks it.
-- `profile release <p>` reverses both.
+  `gateway run` then ticks it. `profile adopt --all --dry-run` previews a
+  fleet-wide ownership change; `profile adopt --all` applies it.
+- `profile release <p>` reverses both. `profile release --all --dry-run`
+  previews a fleet rollback; `profile release --all` applies it.
 - `profile refresh-bundle <p>` recomputes the CID after files change without
   replacing the rest of `itonami.edn` (including custom bundle directories and
   scheduler ownership).
