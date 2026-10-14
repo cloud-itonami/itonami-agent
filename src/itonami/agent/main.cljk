@@ -306,13 +306,18 @@
 (defn- browser-cdp-configured? [prof]
   (let [dotenv (profile/parse-dotenv
                 (let [path (h/join (:home prof) ".env")]
-                  (when (h/file? path) (h/slurp path))))]
-    (boolean (some (complement str/blank?)
-                   [(get-in prof [:config "browser" "cdp_url"])
-                    (get-in prof [:config "browser" "cdp_endpoint"])
-                    (get (:env prof) "BROWSER_CDP_URL")
-                    (get dotenv "BROWSER_CDP_URL")
-                    (h/env "BROWSER_CDP_URL")]))))
+                  (when (h/file? path) (h/slurp path))))
+        secret-command (get-in prof [:config "secrets" "command"])
+        secret-command-may-export-cdp? (and (map? secret-command)
+                                            (true? (get secret-command "enabled"))
+                                            (not (str/blank? (get secret-command "command"))))]
+    (boolean (or secret-command-may-export-cdp?
+                 (some (complement str/blank?)
+                       [(get-in prof [:config "browser" "cdp_url"])
+                        (get-in prof [:config "browser" "cdp_endpoint"])
+                        (get (:env prof) "BROWSER_CDP_URL")
+                        (get dotenv "BROWSER_CDP_URL")
+                        (h/env "BROWSER_CDP_URL")])))))
 
 (defn- kotoba-job-issues [prof job]
   "Read-only compatibility gate for a single active Hermes cron job."
