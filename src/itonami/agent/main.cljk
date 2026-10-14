@@ -396,10 +396,17 @@
   (when (and (string? rel) (str/ends-with? rel ".py"))
     (let [scripts (h/join home "scripts")
           target (str (subs rel 0 (- (count rel) 3)) ".hy")
-          abs (h/join scripts target)]
-      (when (and (cron/script-path-safe? scripts rel)
-                 (cron/script-path-safe? scripts target)
-                 (h/file? (h/join scripts rel))
+          source (h/join scripts rel)
+          abs (h/join scripts target)
+          source-contained? (try
+                              (let [root (h/realpath scripts)
+                                    resolved (h/realpath source)
+                                    separator (if (= "win32" (.-platform js/process)) "\\" "/")]
+                                (str/starts-with? resolved (str root separator)))
+                              (catch :default _ false))]
+      (when (and (cron/script-path-safe? scripts target)
+                 source-contained?
+                 (h/file? source)
                  (h/file? abs))
         target))))
 
