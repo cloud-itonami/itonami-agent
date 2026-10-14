@@ -70,7 +70,7 @@
 (defn unit-text
   "The unit block's text for a registry entry."
   [entry worlds]
-  (let [{:keys [org/unit org/world org/parent org/layer agent/kind invocation awai/business source]} entry
+  (let [{:keys [org/unit org/world org/parent org/layer agent/kind invocation awai/business source outward]} entry
         u (get-in worlds [:worlds world :units (if (string? unit) (keyword unit) unit)])
         what (or (:what u) (:question u))]
     (str "## 所属（manifest/agent-registry.edn から生成。手で直さない）\n\n"
@@ -80,7 +80,10 @@
                 (when invocation (str "　／　起動: " (label invocation))))
            (when-let [r (:repo source)] (str "担当 repo: " r))
            (when business (str "awai の事業: " (label business)))
-           (when layer (str "kotoba の層: " (label layer)))]))))
+           (when layer (str "kotoba の層: " (label layer)))
+           (when outward
+             (str "外向き役割: " (label (:business outward)) " の " (label (:role outward))
+                  "（宛先 " (:mailbox outward) "、identity " (:identity outward) "）。会社として外に向けて話すのはこの役割だけ"))]))))
 
 ;; ---------------------------------------------------------------- role
 
