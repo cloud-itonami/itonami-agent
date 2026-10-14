@@ -4,6 +4,7 @@
             [itonami.agent.yaml :as yaml]
             [itonami.agent.host :as h]
             [itonami.agent.profile :as profile]
+            [itonami.agent.manifest :as manifest]
             [itonami.agent.provider :as provider]
             [itonami.agent.cron :as cron]
             [itonami.agent.p2p :as p2p]
@@ -108,6 +109,80 @@ plain: true
     (is (= m (profile/with-inference-rail m :murakumo)) "idempotent")
     (is (not (provider/p2p-rail? m)))
     (is (provider/p2p-rail? v1))))
+
+(def v1-manifest
+  {:itonami/schema "cloud.itonami.profile.v1" :profile/id "p" :profile/hermes-compatible true
+   :runtime {:engine :itonami-agent :scheduler :hermes}
+   :placement {:mode :p2p :order [:peer :local] :peers :trusted :inference-rail :murakumo}
+   :inference {:rails [:murakumo] :authorities ["api.murakumo.cloud"] :deny-hosts ["openrouter.ai"]}
+   :state {:workspace :host-local :results :cid-receipts :secrets :never-leave-host}
+   :bundle {:cid "bafkreiabc" :files 3 :skills []}
+   :capabilities [{:capability :p.observe :decision :autonomous}]
+   :cron? true})
+
+(deftest manifest-validation
+  (let [ok v1-manifest
+        paths (fn [ps] (set (map :path ps)))]
+    (is (= [] (manifest/validate ok)))
+    (is (= #{[:runtime :scheduler]} (paths (manifest/errors (assoc-in ok [:runtime :scheduler] :cron)))))
+    (is (= #{[:placement :inference-rail]} (paths (manifest/errors (assoc-in ok [:placement :inference-rail] :kotoba))))
+        "the declared rail must be among :inference :rails")
+    (is (= #{[:bundle :cid] [:bundle :files]} (paths (manifest/errors (dissoc ok :bundle)))))
+    (is (= #{[:profile/hermes-compatible]} (paths (manifest/errors (assoc ok :profile/hermes-compatible false)))))
+    (testing "decisions follow yakuwari: legacy and unknown words warn, never error"
+      (let [m (assoc ok :capabilities [{:capability :a :decision :propose} {:capability :b :decision :ok}])]
+        (is (= [] (manifest/errors m)))
+        (is (= #{[:capabilities 0 :decision] [:capabilities 1 :decision]} (paths (manifest/validate m))))))
+    (is (= #{[:mystery]} (paths (manifest/validate (assoc ok :mystery 1)))) "an unknown key warns")
+    (is (= #{[:org/world]} (paths (manifest/validate (assoc ok :itonami/schema manifest/schema-v2))))
+        "a v2 manifest outside the organisation warns")))
+
+(deftest manifest-with-org
+  (let [entry {:agent/id "p" :agent/kind :worker :org/world :awai :org/path [:etzhayyim :awai :hyakka]
+               :org/github "network-awai" :org/unit :hyakka :invocation :resident :awai/business :hyakka
+               :source {:repo "network-awai/app-hyakka" :via "hermes-profile-repos"} :yakuwari {:id "p"}}
+        v2 (manifest/with-org v1-manifest entry {:yakuwari? true})]
+    (is (= manifest/schema-v2 (:itonami/schema v2)))
+    (is (= [] (manifest/validate v2)))
+    (is (= {:repo "network-awai/app-hyakka" :yakuwari/id "p"} (:ids v2)))
+    (is (= {:default-decision :approval-required :source :yakuwari :ref "yakuwari.edn"} (:authority v2)))
+    (is (= {:default-decision :approval-required}
+           (:authority (manifest/with-org v1-manifest entry {:yakuwari? false}))) "no yakuwari.edn: ask only")
+    (is (= v2 (manifest/with-org v2 entry {:yakuwari? true})) "idempotent")
+    (is (= (dissoc v1-manifest :itonami/schema) (apply dissoc v2 :itonami/schema manifest/org-keys))
+        "keys outside the organisation are untouched")
+    (is (not (contains? (manifest/with-org v2 (dissoc entry :awai/business) {:yakuwari? true}) :awai/business))
+        "organisation keys are replaced as a set")
+    (is (= #{[:agent/kind]} (set (map :path (manifest/errors (assoc v2 :agent/kind :boss))))))
+    (is (= #{[:org/path]} (set (map :path (manifest/errors (assoc v2 :org/path [:kotoba :build])))))
+        "the path must contain the world")
+    (let [host (manifest/with-org v1-manifest {:agent/id "p" :agent/kind :worker :org/world :host :invocation :resident} {})]
+      (is (= [] (manifest/validate host)) "a :host profile has no path")
+      (is (= #{[:org/path]} (set (map :path (manifest/errors (assoc host :org/path [:host])))))))))
+
+(deftest profile-check
+  (let [home (h/join (h/tmp-dir) (str "itonami-check-" (h/random-hex 4)) "p")
+        soul (str (:workspace-locations profile/soul-blocks) "\nhi\n" (:reward-contract profile/soul-blocks) "\n")]
+    (h/mkdirs home)
+    (h/spit (h/join home "SOUL.md") soul)
+    (h/spit (h/join home "config.yaml") "model:\n  provider: murakumo\n  default: mishima\n")
+    (let [m (profile/with-bundle home v1-manifest)]
+      (profile/write-manifest! home m)
+      (let [r (profile/check (profile/load-profile* home "p" {:secrets? false}))]
+        (is (= [] (:problems r)))
+        (is (= [] (:drift r)) "a fresh bundle CID, the declared rail in config, both SOUL blocks"))
+      (h/spit (h/join home "SOUL.md") (str soul "changed\n"))
+      (h/spit (h/join home "config.yaml") "model:\n  provider: kotoba\n")
+      (let [r (profile/check (profile/load-profile* home "p" {:secrets? false}))]
+        (is (= #{:bundle-cid :config-provider} (set (map :drift (:drift r)))))
+        (is (= (:cid (:bundle (profile/with-bundle home m))) (:actual (first (filter #(= :bundle-cid (:drift %)) (:drift r))))))))
+    (let [other (h/join (h/tmp-dir) (str "itonami-check-" (h/random-hex 4)) "q")]
+      (h/mkdirs other)
+      (h/spit (h/join other "SOUL.md") "plain\n")
+      (profile/write-manifest! other (profile/with-bundle other v1-manifest))
+      (let [r (profile/check (profile/load-profile* other "q" {:secrets? false}))]
+        (is (= #{[:profile/id]} (set (map :path (:problems r)))) "the id must be the directory's name")
+        (is (= #{:workspace-locations :reward-contract} (set (keep :missing (:drift r)))))))))
 
 (deftest cron-next-fire
   (let [d (js/Date. 2026 9 7 13 0 0)]                      ; 2026-10-07 13:00 local

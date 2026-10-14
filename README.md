@@ -33,8 +33,8 @@ the two can be swapped per profile.
 ## itonami profile
 
 `profile itonamify <p>|--all` adds `itonami.edn` (schema
-`cloud.itonami.profile.v1`) next to the Hermes files. Hermes ignores it;
-deleting it returns the profile to plain Hermes.
+`cloud.itonami.profile.v2`; v1 manifests stay valid) next to the Hermes
+files. Hermes ignores it; deleting it returns the profile to plain Hermes.
 
 ```clojure
 {:itonami/schema "cloud.itonami.profile.v1"
@@ -45,6 +45,33 @@ deleting it returns the profile to plain Hermes.
  :bundle    {:cid "bafkrei…" :files 5 :skills []}          ; content address of the definition
  :capabilities [...]}                                       ; copied from yakuwari.edn, grants nothing
 ```
+
+v2 adds where the profile sits in the organisation, projected from the agent
+registry by `profile organize --registry <agent-registry.edn>`. The registry
+is an index, not authority: `:authority` only points at `yakuwari.edn`.
+
+```clojure
+ :agent/kind :worker                      ; :steward :unit :role-bot :organism :worker
+ :org/world :awai                         ; :etzhayyim :awai :kotoba :host
+ :org/path [:etzhayyim :awai :hyakka]     ; governance line; a :host profile has none
+ :org/github "network-awai"  :org/unit :hyakka  :invocation :resident
+ :awai/business :hyakka                   ; when the profile works for an awai business
+ :ids {:repo "network-awai/app-hyakka" :yakuwari/id "…"}
+ :authority {:default-decision :approval-required :source :yakuwari :ref "yakuwari.edn"}
+```
+
+- `profile check <p>|--all [--summary]` validates the manifest
+  (`itonami.agent.manifest/validate`, no dependencies) and reports drift: a
+  bundle CID that no longer matches the files, a config provider other than
+  the declared rail, a missing managed SOUL block. Read-only; exit 1 on
+  errors. Capability decisions follow yakuwari's vocabulary
+  (`:autonomous :voice-required :approval-required :blocked`); a legacy or
+  unknown word is a warning, because yakuwari.edn, not itonami.edn, is where
+  it is fixed.
+- `profile refresh <p>|--all [--dry-run]` rewrites a stale bundle CID.
+  Peers verify the bundle against it, so a stale CID fails peer runs.
+- `itonamify --refresh` keeps the declared runtime, placement, rails,
+  terminal/web policy and organisation keys.
 
 Exactly one scheduler ticks a profile:
 
