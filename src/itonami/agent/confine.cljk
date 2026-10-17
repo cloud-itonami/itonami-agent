@@ -43,7 +43,11 @@
                           ;; the default home of the node key and peer.env is
                           ;; protected even when ITONAMI_DIR points elsewhere
                           (j ".itonami/peer.env") (h/join (itonami-dir) "peer.env") (j ".hermes/.env")]
-                         ;; bwrap cannot match by pattern: name each profile's .env
+                         ;; bwrap cannot match by pattern: name each profile's .env —
+                         ;; in the itonami store and in the (separate) Hermes store
+                         (for [p (h/ls (h/join (itonami-dir) "profiles"))]
+                           (h/join (itonami-dir) "profiles" p ".env"))
+                         (for [p (h/ls (j ".itonami/profiles"))] (j (str ".itonami/profiles/" p "/.env")))
                          (for [p (h/ls (j ".hermes/profiles"))] (j (str ".hermes/profiles/" p "/.env")))))
      ;; any dotenv or secrets file anywhere: profile homes, workspaces, repos
      :name-patterns ["\\.env$" "\\.env\\.[^/]*$" "/secrets\\.command$" "/auth\\.json$"]}))

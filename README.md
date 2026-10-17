@@ -13,9 +13,27 @@ bin/itonami-agent peer run -p hiraku-soudan -z "質問"   # run this turn on a p
 
 ## Compatibility with Hermes Agent
 
-itonami-agent reads and writes the Hermes profile layout in place
-(`~/.hermes/profiles/<name>/`). Hermes keeps working on every profile, and
-the two can be swapped per profile.
+itonami-agent is Hermes-compatible in FORMAT, not in STORE. It keeps its own
+profiles and state under `ITONAMI_DIR` (default `~/.itonami/`): profiles at
+`~/.itonami/profiles/<name>/`, run state and receipts under the same root.
+The Hermes home (`~/.hermes/`) is a different store that itonami-agent never
+writes to. The two never share a profile directory, a sessions DB, or a run
+log — what they share is the file layout, so a profile directory copied
+between the two stores is a valid profile on either side:
+
+- `profile import <p>|--all [--from DIR] [--force]` copies a profile's
+  DEFINITION from a Hermes home (`ITONAMI_HERMES_ROOT`, default `~/.hermes`)
+  into the itonami store. The source is read-only.
+- `profile export <p>|--all [--to DIR] [--force]` copies the other way. When
+  the profile's cron scheduler is `:itonami`, the exported copy gets Hermes'
+  `gateway.parked` marker so the Hermes gateway never double-ticks it.
+
+Definition = `SOUL.md`, `profile.yaml`, `config.yaml`, `.env`,
+`secrets.command`, `yakuwari.edn`, `itonami.edn`, `cron/jobs.json`,
+`scripts/`, `skills/`. State and DBs never cross with it:
+`sessions/`, `workspace/`, `memories/`, `logs/`, `.itonami/`,
+`cron/output/`, `cron/usage_audit.jsonl`, `cron/ticker_*`,
+`cron/itonami-runs.jsonl`. Each store keeps its own.
 
 | Hermes surface | itonami-agent |
 |---|---|
@@ -33,8 +51,10 @@ the two can be swapped per profile.
 ## itonami profile
 
 `profile itonamify <p>|--all` adds `itonami.edn` (schema
-`cloud.itonami.profile.v2`; v1 manifests stay valid) next to the Hermes
-files. Hermes ignores it; deleting it returns the profile to plain Hermes.
+`cloud.itonami.profile.v2`; v1 manifests stay valid) to a profile in the
+itonami store. The manifest is additive: deleting itonami.edn returns the
+profile to a plain Hermes-format profile, and `profile export` copies such a
+profile back into a Hermes home as-is.
 
 ```clojure
 {:itonami/schema "cloud.itonami.profile.v1"
@@ -93,14 +113,16 @@ is an index, not authority: `:authority` only points at `yakuwari.edn`.
   1500 characters (capability lists shrink to fit). The body — everything
   outside these blocks — is never changed: a profile whose body would change,
   or whose blocks would not fit, is refused. Every rewrite keeps a backup
-  and a receipt under `~/.hermes/state/soul-blocks/<stamp>/`.
+  and a receipt under `~/.itonami/state/soul-blocks/<stamp>/`.
 
 Exactly one scheduler ticks a profile:
 
 - `profile adopt <p>` sets `:scheduler :itonami` and writes Hermes'
-  `gateway.parked` marker, so the Hermes gateway stops ticking it;
-  `gateway run` then ticks it.
+  `gateway.parked` marker in the profile home; `gateway run` then ticks it.
 - `profile release <p>` reverses both.
+- In a Hermes home the marker is what stops the Hermes gateway. `profile
+  export` writes it for `:itonami`-scheduled profiles, so an exported copy is
+  never ticked by both sides.
 
 ## Peer-to-peer execution
 

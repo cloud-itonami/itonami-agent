@@ -718,3 +718,60 @@ plain: true
         (-> (tools/call {} names "web_search" "{\"query\":\"x\"}")
             (p/then (fn [r] (is (str/includes? r "not available in this run"))))
             (p/finally (fn [_ _] (done))))))))
+
+(deftest separate-stores
+  ;; profiles and state live under ITONAMI_DIR, never in the Hermes home
+  (is (= (h/expand (or (h/env "ITONAMI_DIR") "~/.itonami")) (profile/itonami-root)))
+  (is (= (h/join (profile/itonami-root) "profiles" "p") (profile/home "p")))
+  (is (= (profile/itonami-root) (profile/home "default")) "default is the store root, as in the Hermes layout")
+  (is (str/starts-with? (profile/profiles-root) (str (profile/itonami-root) "/")))
+  (is (not (str/includes? (profile/home "p") ".hermes")) "the itonami store never resolves into the Hermes home"))
+
+(deftest import-export-definition-only
+  (let [src (h/join (h/tmp-dir) (str "itonami-stores-" (h/random-hex 4)))
+        hermes (h/join src "hermes")     ; a fake Hermes home
+        itonami (h/join src "itonami")   ; a fake itonami home
+        p (h/join hermes "profiles" "p")]
+    ;; a Hermes-side profile: definition AND state
+    (doseq [f ["SOUL.md" "config.yaml" ".env" "yakuwari.edn"]]
+      (h/spit (h/join p f) (str f " content\n")))
+    (h/spit (h/join p "cron" "jobs.json") "{\"jobs\": []}")
+    (h/spit (h/join p "scripts" "x.cljk") ";; x")
+    (h/spit (h/join p "sessions" "s.jsonl") "{}")
+    (h/spit (h/join p "workspace" "w.txt") "w")
+    (h/spit (h/join p "cron" "output" "j1" "2026-01-01_00-00-00.md") "run")
+    (h/spit (h/join p "cron" "usage_audit.jsonl") "{}")
+    (h/spit (h/join p "cron" "itonami-runs.jsonl") "{}")
+    (let [to (h/join itonami "profiles" "p")
+          r (profile/copy-profile! p to {})]
+      (testing "the definition crosses, byte for byte"
+        (is (= #{"SOUL.md" "config.yaml" ".env" "yakuwari.edn" "cron/jobs.json" "scripts/x.cljk"}
+               (set (:copied r))))
+        (is (= "SOUL.md content\n" (h/slurp (h/join to "SOUL.md")))))
+      (testing "state and DBs never cross with it"
+        (is (not (h/exists? (h/join to "sessions"))))
+        (is (not (h/exists? (h/join to "workspace"))))
+        (is (not (h/exists? (h/join to "cron" "output"))))
+        (is (not (h/exists? (h/join to "cron" "usage_audit.jsonl"))))
+        (is (not (h/exists? (h/join to "cron" "itonami-runs.jsonl")))))
+      (testing "names-in lists a store's own profiles"
+        (is (= ["p"] (profile/names-in hermes)))
+        (is (= ["p"] (profile/names-in itonami))))
+      (testing "a non-empty target is refused without :force?"
+        (is (thrown? js/Error (profile/copy-profile! p to {})))
+        (is (map? (profile/copy-profile! p to {:force? true}))))
+      (testing "the other direction is the same function"
+        (let [back (h/join hermes "profiles" "q")]
+          (profile/copy-profile! to back {})
+          (is (= "SOUL.md content\n" (h/slurp (h/join back "SOUL.md")))))))
+    (h/rm src)))
+
+(deftest rebase-paths-both-stores
+  (let [paths {:origin-home "/home/u/.itonami/profiles/p" :profile "p" :ws "/run/ws" :home "/run/home"}]
+    (is (= "see /run/ws/a" (p2p/rebase-paths "see /home/u/.itonami/profiles/p/workspace/a" paths)))
+    (is (= "see /run/home/a" (p2p/rebase-paths "see /home/u/.itonami/profiles/p/a" paths)))
+    (is (= "see /run/ws/a" (p2p/rebase-paths "see ~/.itonami/profiles/p/workspace/a" paths)))
+    (is (= "see /run/home/a" (p2p/rebase-paths "see ~/.itonami/profiles/p/a" paths)))
+    (testing "a Hermes-side requester's tilde paths still rebase (format compatibility)"
+      (is (= "see /run/ws/a" (p2p/rebase-paths "see ~/.hermes/profiles/p/workspace/a" paths)))
+      (is (= "see /run/home/a" (p2p/rebase-paths "see ~/.hermes/profiles/p/a" paths))))))
