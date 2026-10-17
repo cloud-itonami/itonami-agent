@@ -13,9 +13,27 @@ bin/itonami-agent peer run -p hiraku-soudan -z "質問"   # run this turn on a p
 
 ## Compatibility with Hermes Agent
 
-itonami-agent reads and writes the Hermes profile layout in place
-(`~/.hermes/profiles/<name>/`). Hermes keeps working on every profile, and
-the two can be swapped per profile.
+itonami-agent is Hermes-compatible in FORMAT, not in STORE. It keeps its own
+profiles and state under `ITONAMI_DIR` (default `~/.itonami/`): profiles at
+`~/.itonami/profiles/<name>/`, run state and receipts under the same root.
+The Hermes home (`~/.hermes/`) is a different store that itonami-agent never
+writes to. The two never share a profile directory, a sessions DB, or a run
+log — what they share is the file layout, so a profile directory copied
+between the two stores is a valid profile on either side:
+
+- `profile import <p>|--all [--from DIR] [--force]` copies a profile's
+  DEFINITION from a Hermes home (`ITONAMI_HERMES_ROOT`, default `~/.hermes`)
+  into the itonami store. The source is read-only.
+- `profile export <p>|--all [--to DIR] [--force]` copies the other way. When
+  the profile's cron scheduler is `:itonami`, the exported copy gets Hermes'
+  `gateway.parked` marker so the Hermes gateway never double-ticks it.
+
+Definition = `SOUL.md`, `profile.yaml`, `config.yaml`, `.env`,
+`secrets.command`, `yakuwari.edn`, `itonami.edn`, `cron/jobs.json`,
+`scripts/`, `skills/`. State and DBs never cross with it:
+`sessions/`, `workspace/`, `memories/`, `logs/`, `.itonami/`,
+`cron/output/`, `cron/usage_audit.jsonl`, `cron/ticker_*`,
+`cron/itonami-runs.jsonl`. Each store keeps its own.
 
 | Hermes surface | itonami-agent |
 |---|---|
@@ -61,8 +79,10 @@ does not implement; it never silently narrows a caller's requested tool set.
 ## itonami profile
 
 `profile itonamify <p>|--all` adds `itonami.edn` (schema
-`cloud.itonami.profile.v2`; v1 manifests stay valid) next to the Hermes
-files. Hermes ignores it; deleting it returns the profile to plain Hermes.
+`cloud.itonami.profile.v2`; v1 manifests stay valid) to a profile in the
+itonami store. The manifest is additive: deleting itonami.edn returns the
+profile to a plain Hermes-format profile, and `profile export` copies such a
+profile back into a Hermes home as-is.
 
 ```clojure
 {:itonami/schema "cloud.itonami.profile.v1"
@@ -96,10 +116,32 @@ is an index, not authority: `:authority` only points at `yakuwari.edn`.
   (`:autonomous :voice-required :approval-required :blocked`); a legacy or
   unknown word is a warning, because yakuwari.edn, not itonami.edn, is where
   it is fixed.
-- `profile refresh <p>|--all [--dry-run]` rewrites a stale bundle CID.
-  Peers verify the bundle against it, so a stale CID fails peer runs.
+- `profile refresh <p>|--all [--dry-run]` rewrites what is derived from the
+  profile's own files: a stale bundle CID (peers verify the bundle against
+  it, so a stale CID fails peer runs) and `:capabilities`, re-copied from
+  `yakuwari.edn` when the profile has one.
 - `itonamify --refresh` keeps the declared runtime, placement, rails,
   terminal/web policy and organisation keys.
+- `profile did <p>|--all [--registry F] [--out F]` prints each profile's
+  did:key (`itonami.agent.identity`). It is the same identity tree
+  cloud-itonami-app uses for its Bots (`bot-identity`): ed25519 seed =
+  SHA-256(fleet-seed || 0x00 || key-id), key-id = the profile id (or
+  `<profile-id>#<epoch>` after the registry raises `:did/epoch`). The key is
+  derived, never stored. The fleet seed's canonical copy is the kagi item
+  `shared/agent-identity-seed`; it reaches the one command through
+  `ITONAMI_AGENT_IDENTITY_SEED`, filled in a human session; without it the
+  command refuses. `profile organize` projects the
+  registry's `:did` into `:ids :did`.
+- `profile soul <p>|--all --registry F --worlds F [--unit U] [--dry-run]`
+  renders the generated SOUL blocks (`itonami.agent.soul`): **world** (the
+  `:soul` lines of every world on the profile's `:org/path`, then
+  `:soul/common`, from `manifest/worlds.edn`), **unit** (the registry entry)
+  and **role** (a summary of `yakuwari.edn`, which stays the authority). They
+  sit right after the workspace-locations block; together they stay under
+  1500 characters (capability lists shrink to fit). The body — everything
+  outside these blocks — is never changed: a profile whose body would change,
+  or whose blocks would not fit, is refused. Every rewrite keeps a backup
+  and a receipt under `~/.itonami/state/soul-blocks/<stamp>/`.
 
 Exactly one scheduler ticks a profile:
 

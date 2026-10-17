@@ -59,6 +59,7 @@
 (defn ls [p] (if (dir? p) (vec (sort (js->clj (fs/readdirSync p)))) []))
 (defn mtime-ms [p] (.-mtimeMs (fs/statSync p)))
 (defn rm [p] (when (exists? p) (fs/rmSync p #js {:recursive true :force true})))
+(defn copy-file! [from to] (mkdirs (dirname to)) (fs/copyFileSync from to) to)
 
 (defn walk-files
   "Relative paths of the regular files under dir, sorted, skipping names in

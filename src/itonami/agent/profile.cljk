@@ -1,10 +1,15 @@
 (ns itonami.agent.profile
   "A profile, read the way Hermes reads it, plus the itonami layer.
 
-  Hermes layout (unchanged, still authoritative for Hermes):
+  Layout (identical format in both stores; the stores themselves are separate):
     <home>/SOUL.md profile.yaml config.yaml .env cron/jobs.json scripts/ skills/ workspace/
 
-  itonami layer (additive; Hermes never reads it):
+  The itonami store is <itonami-root>/profiles/<name>/ (ITONAMI_DIR,
+  default ~/.itonami). The Hermes home (~/.hermes) is a different store that
+  this agent never writes to; `profile import` / `profile export` copy a
+  profile's DEFINITION between the two, and state and DBs never cross.
+
+  itonami layer (additive; a plain Hermes profile has none of it):
     <home>/itonami.edn          what the profile is on the itonami plane:
                                 identity, placement (local | p2p), inference
                                 rail, state policy, bundle CID
@@ -12,7 +17,7 @@
                                 bundle cache). Never exported, never sent.
 
   A profile with an itonami.edn is an *itonami profile*. It stays a valid
-  Hermes profile: deleting itonami.edn returns it to plain Hermes."
+  Hermes-format profile: deleting itonami.edn returns it to plain Hermes."
   (:require [clojure.string :as str]
             [cljs.reader :as reader]
             [itonami.agent.host :as h]
@@ -21,21 +26,77 @@
 
 (def manifest-schema manifest/schema-v2)
 
-(defn hermes-root []
+(defn itonami-root
+  "The itonami home: profiles and state live here. The Hermes home is a
+  different store — the two share file FORMATS (a profile directory is a
+  valid profile directory on either side), never files."
+  []
+  (h/expand (or (h/env "ITONAMI_DIR") "~/.itonami")))
+
+(defn profiles-root [] (h/join (itonami-root) "profiles"))
+
+(defn hermes-root
+  "The Hermes home. itonami-agent never writes here: `profile import` reads
+  it as the migration source (ITONAMI_HERMES_ROOT points it elsewhere)."
+  []
   (h/expand (or (h/env "ITONAMI_HERMES_ROOT") "~/.hermes")))
 
 (defn valid-name? [n] (boolean (re-matches #"^[a-z0-9][a-z0-9_-]{0,63}$" (str n))))
 
-(defn home
-  "Profile name -> its home directory. `default` is the root itself."
-  [name]
+(defn home-in
+  "Profile name -> its home directory in an explicit store root. `default` is
+  the root itself, as in the Hermes layout."
+  [root name]
   (if (or (nil? name) (= name "default"))
-    (hermes-root)
-    (h/join (hermes-root) "profiles" name)))
+    root
+    (h/join root "profiles" name)))
 
-(defn names []
-  (let [d (h/join (hermes-root) "profiles")]
+(defn home
+  "Profile name -> its home directory in the itonami store. `default` is the
+  root itself."
+  [name]
+  (home-in (itonami-root) name))
+
+(defn names-in [root]
+  (let [d (h/join root "profiles")]
     (vec (filter #(and (valid-name? %) (h/dir? (h/join d %))) (h/ls d)))))
+
+(defn names [] (names-in (itonami-root)))
+
+;; ---------------------------------------------------------------- definition copy (store -> store)
+
+(def definition-files
+  "What a profile IS, in the format both stores share. Everything else under
+  a profile home is state (sessions, run logs, cron output) and stays with
+  the store that produced it: profiles move, DBs never do."
+  ["SOUL.md" "profile.yaml" "config.yaml" ".env" "secrets.command"
+   "yakuwari.edn" "itonami.edn" "cron/jobs.json"])
+
+(def definition-dirs ["scripts" "skills"])
+
+(defn copy-profile!
+  "Copy one profile's DEFINITION from one store's home to another's, byte for
+  byte (the formats are identical on both sides). State and DBs — sessions/,
+  workspace/, memories/, logs/, .itonami/, cron/output/, cron/usage_audit.jsonl,
+  cron/ticker_*, cron/itonami-runs.jsonl — never cross. Returns
+  {:copied [rel ...]}. A non-empty target is refused unless :force?."
+  [from-home to-home {:keys [force?]}]
+  (when-not (h/dir? from-home)
+    (throw (ex-info (str "profile not found: " from-home) {:itonami/error :profile-not-found :home from-home})))
+  (when (and (not force?) (h/dir? to-home) (seq (h/ls to-home)))
+    (throw (ex-info (str "target is not empty: " to-home) {:itonami/error :target-not-empty :home to-home})))
+  (let [files (concat
+               (for [f definition-files
+                     :let [p (h/join from-home f)]
+                     :when (h/file? p)]
+                 [f p])
+               (for [d definition-dirs
+                     r (h/walk-files (h/join from-home d) #(str/starts-with? (h/basename %) "."))
+                     :let [p (h/join from-home d r)]]
+                 [(str d "/" r) p]))]
+    (doseq [[rel p] files]
+      (h/copy-file! p (h/join to-home rel)))
+    {:copied (mapv first files)}))
 
 ;; ---------------------------------------------------------------- env
 
@@ -92,7 +153,7 @@
     (when-not (h/dir? home)
       (throw (ex-info (str "profile not found: " name) {:itonami/error :profile-not-found :profile name})))
     (let [config (read-yaml-file (h/join home "config.yaml"))
-          root-env (when (= home (hermes-root)) (parse-dotenv (when (h/file? (h/join home ".env")) (h/slurp (h/join home ".env")))))
+          root-env (when (= home (itonami-root)) (parse-dotenv (when (h/file? (h/join home ".env")) (h/slurp (h/join home ".env")))))
           prof-env (parse-dotenv (when (h/file? (h/join home ".env")) (h/slurp (h/join home ".env"))))
           env (if secrets? (merge (h/process-env) root-env (secrets-command-env config) prof-env) {})]
       {:name (or name "default")
@@ -248,6 +309,18 @@
   [home m]
   (let [files (bundle-files home (select-keys (:bundle m) [:skills :dirs]))]
     (assoc m :bundle (merge (:bundle m) {:cid (bundle-cid files) :files (count files)}))))
+
+(defn with-derived
+  "The manifest with everything derived from the profile's own files
+  recomputed: the bundle (`with-bundle`) and, when the profile has a
+  yakuwari.edn, :capabilities — a verbatim copy of what yakuwari.edn decides
+  (itonami.edn grants nothing itself). Without yakuwari.edn the
+  capabilities are left as they are."
+  [home m]
+  (let [m (with-bundle home m)]
+    (if (h/file? (h/join home "yakuwari.edn"))
+      (assoc m :capabilities (or (capabilities-from-yakuwari home) []))
+      m)))
 
 (defn refresh-bundle-cid
   "Recompute the bundle CID of an itonami profile (after its SOUL, config,

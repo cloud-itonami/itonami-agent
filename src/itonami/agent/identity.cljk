@@ -1,0 +1,64 @@
+(ns itonami.agent.identity
+  "Per-profile DIDs (owner decision D7, com-junkawasaki/root ADR-2610141512).
+
+  One identity tree for every agent. cloud-itonami-app already names its
+  workforce Bots this way (cloud.itonami.app.bot-identity): one 32-byte fleet
+  seed, and for each agent
+
+    ed25519 seed = SHA-256(fleet-seed || 0x00 || key-id)
+
+  A Hermes profile uses the same construction with key-id = its profile id
+  (epoch 0) or \"<profile-id>#<epoch>\" after a rotation, so a profile and a
+  Bot keyed on the same id are one identity. The key is derived when needed
+  and stored nowhere; the registry publishes the DIDs. Replacing the seed
+  renames every agent. Nothing here prints the seed or a private key."
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]
+            [itonami.agent.p2p :as p2p]
+            ["node:crypto" :as crypto]))
+
+(def seed-env
+  "The environment variable a human session fills from kagi
+  (item shared/agent-identity-seed) for the one command that needs it."
+  "ITONAMI_AGENT_IDENTITY_SEED")
+
+(def ^:private pkcs8-ed25519-prefix (js/Buffer.from "302e020100300506032b657004220420" "hex"))
+
+(defn parse-seed
+  "A 32-byte seed from 64 hex characters, or nil."
+  [s]
+  (when (and (string? s) (re-matches #"^[0-9a-fA-F]{64}$" (str/trim s)))
+    (js/Buffer.from (str/trim s) "hex")))
+
+(defn seed-from-env [] (parse-seed (h/env seed-env)))
+
+(defn- valid-epoch? [e] (and (int? e) (not (neg? e))))
+
+(defn key-id
+  "What the derivation is keyed on: the profile id, plus #<epoch> after a rotation."
+  [profile-id epoch]
+  (if (zero? epoch) (str profile-id) (str profile-id "#" epoch)))
+
+(defn derive-key
+  "{:did :epoch :private} for a profile. `seed` is a 32-byte Buffer."
+  [seed profile-id epoch]
+  (when-not (= 32 (some-> seed .-length))
+    (throw (ex-info "agent identity seed must be 32 bytes" {:itonami/error :bad-seed})))
+  (when-not (valid-epoch? epoch)
+    (throw (ex-info "epoch must be a non-negative integer" {:itonami/error :bad-epoch :epoch epoch})))
+  (let [okm (-> (crypto/createHash "sha256")
+                (.update seed)
+                (.update (js/Buffer.alloc 1))
+                (.update (js/Buffer.from (key-id profile-id epoch) "utf8"))
+                (.digest))
+        private (crypto/createPrivateKey #js {:key (js/Buffer.concat #js [pkcs8-ed25519-prefix okm])
+                                              :format "der" :type "pkcs8"})
+        spki (.export (crypto/createPublicKey private) #js {:type "spki" :format "der"})]
+    {:did (p2p/pub->did (.subarray spki (- (.-length spki) 32)))
+     :epoch epoch
+     :private private}))
+
+(defn did-of
+  "Just the DID — what the registry publishes."
+  [seed profile-id epoch]
+  (:did (derive-key seed profile-id epoch)))

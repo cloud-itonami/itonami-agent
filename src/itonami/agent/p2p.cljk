@@ -252,17 +252,19 @@
 
 (defn rebase-paths
   "The requester's prompt and SOUL name paths in ITS profile home
-  (/Users/x/.hermes/profiles/p/workspace/...). On the peer those become the
-  run's own copy: <origin-home>/workspace -> the run workspace (whose files
-  travel back), <origin-home> -> the materialized bundle home."
+  (~/.itonami/profiles/p/workspace/..., or ~/.hermes/profiles/p/... for a
+  Hermes-side requester). On the peer those become the run's own copy:
+  <origin-home>/workspace -> the run workspace (whose files travel back),
+  <origin-home> -> the materialized bundle home."
   [text {:keys [origin-home profile ws home]}]
   (if (or (nil? text) (nil? origin-home))
     text
-    (let [tilde (str "~/.hermes/profiles/" profile)]
+    (let [tildes [(str "~/.itonami/profiles/" profile) (str "~/.hermes/profiles/" profile)]]
       (reduce (fn [t [from to]] (str/replace t from to))
               text
-              [[(str origin-home "/workspace") ws] [(str tilde "/workspace") ws]
-               [origin-home home] [tilde home]]))))
+              (concat [[(str origin-home "/workspace") ws] [origin-home home]]
+                      (for [td tildes] [(str td "/workspace") ws])
+                      (for [td tildes] [td home]))))))
 
 (defn execute-for-peer
   "Run a turn this node accepted. Resolves to the signed result envelope map."
