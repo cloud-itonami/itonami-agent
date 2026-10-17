@@ -1,7 +1,12 @@
 (ns itonami.agent.main
   "itonami-agent — a Hermes-compatible agent written in kotoba.
 
-  Hermes-compatible surface (same profile homes, same files):
+  Hermes-compatible in format, in its own store: the same profile files, the
+  same flags, but profiles and state live under ITONAMI_DIR (default
+  ~/.itonami), never in the Hermes home. `profile import` / `profile export`
+  copy a profile's definition between the two stores; DBs never cross.
+
+  Hermes-compatible surface (same files):
     itonami-agent [-p P] -z PROMPT [-m MODEL] [--provider P] [-t toolsets]
     itonami-agent [-p P] chat
     itonami-agent [-p P] cron list | create <schedule> [prompt] [--name n --script s --deliver d]
@@ -9,6 +14,10 @@
     itonami-agent profile list | show <p>
 
   itonami layer:
+    itonami-agent profile import <p>|--all [--from DIR] [--force] [--dry-run]
+                                                            copy a profile definition in from a Hermes home
+    itonami-agent profile export <p>|--all [--to DIR] [--force] [--dry-run]
+                                                            copy a profile definition out to a Hermes home
     itonami-agent profile itonamify <p>|--all [--dry-run]   write itonami.edn (additive)
     itonami-agent profile rail <p>|--all --to R [--dry-run] inference rail: murakumo | kotoba | itonami-p2p
     itonami-agent profile check <p>|--all [--summary]       validate itonami.edn and report drift (read-only)
@@ -203,6 +212,35 @@
                     "\njobs: " (count (get-in prof [:jobs "jobs"]))
                     "\nitonami: " (if (:itonami prof) (pr-str (select-keys (:itonami prof) [:runtime :placement :bundle])) "no"))))
 
+    ("import" "export")
+    (let [out? (= "export" sub)
+          src-root (h/expand (if out? (profile/itonami-root) (or (:from opts) (profile/hermes-root))))
+          dst-root (h/expand (if out? (or (:to opts) (profile/hermes-root)) (profile/itonami-root)))
+          targets (if (:all opts) (profile/names-in src-root) [(first args)])
+          _ (when-not (first targets)
+              (die 2 (str "usage: itonami-agent profile " sub " <p>|--all"
+                          (if out? " [--to DIR]" " [--from DIR]") " [--force] [--dry-run]")))
+          n (atom 0)]
+      (doseq [t targets]
+        (try
+          (let [from (profile/home-in src-root t)
+                to (profile/home-in dst-root t)]
+            (if (:dry-run opts)
+              (println (str "would  " sub " " t "  " from " -> " to))
+              (let [r (profile/copy-profile! from to {:force? (:force opts)})
+                    scheduled (get-in (try (profile/read-edn-file (h/join from "itonami.edn"))
+                                           (catch :default _ nil))
+                                      [:runtime :scheduler])]
+                ;; an exported copy whose cron is itonami's must not also be
+                ;; ticked by the Hermes gateway: leave it parked, as
+                ;; `hermes -p X gateway stop` would
+                (when (and out? (= :itonami scheduled))
+                  (set-hermes-parked! to true))
+                (swap! n inc)
+                (println (str "copied  " t "  " (count (:copied r)) " file(s)  " from " -> " to)))))
+          (catch :default e (println (str "skip    " t "  " (.-message e))))))
+      (println (str @n " profile(s) " (if (:dry-run opts) "would be " "") "copied")))
+
     "itonamify"
     (let [targets (if (:all opts) (profile/names) [(first args)])
           n (atom 0)]
@@ -305,7 +343,7 @@
           by-id (into {} (map (juxt :agent/id identity)) (:agents reg))
           targets (if (:all opts) (profile/names) [(first args)])
           stamp (str/replace (subs (h/iso-local) 0 19) #"[^0-9T]" "")
-          backup-dir (h/join (profile/hermes-root) "state" "soul-blocks" stamp)
+          backup-dir (h/join (profile/itonami-root) "state" "soul-blocks" stamp)
           written (atom [])
           refused (atom 0)]
       (when-not (and (seq by-id) (map? (:worlds worlds)) (first targets))
