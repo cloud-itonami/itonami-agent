@@ -83,7 +83,10 @@
 
 (defn- run-opts [opts]
   (cond-> {:model (:model opts) :provider (:provider opts) :pinned? (boolean (:model opts))
-           :toolsets (:toolsets opts) :platform "cli" :load-context? true :cwd (js/process.cwd)}
+           :toolsets (:toolsets opts) :platform "cli" :load-context? true :cwd (js/process.cwd)
+           ;; delegate_task children of a CLI turn run through the placement
+           ;; executor too (a trusted peer first — bot profiles are distributed)
+           :delegate-run (when-not (:peer opts) (executor opts))}
     (:verbose opts) (assoc :on-event log-event)))
 
 ;; ---------------------------------------------------------------- -z / chat
