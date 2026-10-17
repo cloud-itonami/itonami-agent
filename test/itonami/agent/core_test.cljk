@@ -707,7 +707,7 @@ plain: true
 
 (deftest disabled-toolsets
   (testing "agent.disabled_toolsets is subtracted after every enable, as in Hermes"
-    (is (= ["terminal" "read_file" "write_file" "patch" "search_files" "skill_view" "memory"]
+    (is (= ["terminal" "read_file" "write_file" "patch" "search_files" "skill_view" "memory" "delegate_task"]
            (tools/enabled-tool-names ["hermes-cli"] ["web" "search" "browser" "x_search"])))
     (is (= [] (tools/enabled-tool-names ["web"] ["web"])) "an explicit -t web cannot re-add it")
     (is (= ["web_extract"] (tools/enabled-tool-names ["web"] ["search"])) "search removes web_search only")
@@ -765,6 +765,56 @@ plain: true
           (profile/copy-profile! to back {})
           (is (= "SOUL.md content\n" (h/slurp (h/join back "SOUL.md")))))))
     (h/rm src)))
+
+(deftest delegate-task-hermes-api
+  ;; delegate_task, the Hermes delegation API: same name, same argument
+  ;; shape, children run through the injected :run-child (placement).
+  (async done
+    (let [ran (atom [])
+          run-child (fn [prompt _] (swap! ran conj prompt) (p/resolved {:exit-reason "completed" :final "done" :turns 1}))
+          call (fn [args] (p/let [s (tools/call {:run-child run-child} ["delegate_task"] "delegate_task" args)]
+                            (h/json-parse s)))]
+      (-> (p/let [r (call "{\"tasks\":[{\"goal\":\"g1\"},{\"goal\":\"g2\",\"context\":\"c\"}]}")
+                  _ (do (is (= 2 (count (get r "tasks"))))
+                        (is (= ["done" "done"] (map #(get % "summary") (get r "tasks"))))
+                        (is (every? #(= "completed" (get % "status")) (get r "tasks")))
+                        (is (= #{"# Goal\ng1" "# Goal\ng2\n\n# Context\nc"} (set @ran))))
+                  l (call "{\"action\":\"list\"}")
+                  _ (is (= 2 (count (get l "tasks"))) "action=list stays truthful about joined children")
+                  sid (get (first (get r "tasks")) "subagent_id")
+                  s (call (h/json-str {"action" "steer" "subagent_id" sid "message" "m"}))
+                  _ (is (str/includes? (str (get s "error")) "no mid-run inbox") "steer is honest about joined children")]
+            nil)
+          (p/catch (fn [e] (is (nil? e) (str "delegate test crashed: " (.-message e)))))
+          (p/finally (fn [_ _] (done)))))))
+
+(deftest delegate-task-output-schema
+  ;; output_schema: the child is told up front, the parent validates, and one
+  ;; bounded correction retry runs; the raw summary is never discarded.
+  (async done
+    (let [calls (atom 0)
+          run-child (fn [prompt _]
+                      (swap! calls inc)
+                      (p/resolved {:exit-reason "completed"
+                                   :final (if (= 1 @calls) "not json" "{\"n\": 3}")
+                                   :turns 1}))
+          schema {"type" "object" "properties" {"n" {"type" "number"}} "required" ["n"]}
+          bad (fn [_ _] (p/resolved {:exit-reason "completed" :final "{\"x\": 1}" :turns 1}))
+          call (fn [rc args] (p/let [s (tools/call {:run-child rc} ["delegate_task"] "delegate_task" args)]
+                               (h/json-parse s)))]
+      (-> (p/let [r (call run-child (h/json-str {"tasks" [{"goal" "g" "output_schema" schema}]}))
+                  t (first (get r "tasks"))
+                  _ (do (is (= 2 @calls) "one bounded correction retry")
+                        (is (true? (get t "schema_valid")))
+                        (is (= "{\"n\": 3}" (get t "summary"))))
+                  r2 (call bad (h/json-str {"tasks" [{"goal" "g" "output_schema" schema}]}))
+                  t2 (first (get r2 "tasks"))
+                  _ (do (is (false? (get t2 "schema_valid")))
+                        (is (= ["n"] (get t2 "schema_errors")))
+                        (is (= "{\"x\": 1}" (get t2 "summary"))) "the raw summary is never discarded")]
+            nil)
+          (p/catch (fn [e] (is (nil? e) (str "delegate schema test crashed: " (.-message e)))))
+          (p/finally (fn [_ _] (done)))))))
 
 (deftest rebase-paths-both-stores
   (let [paths {:origin-home "/home/u/.itonami/profiles/p" :profile "p" :ws "/run/ws" :home "/run/home"}]

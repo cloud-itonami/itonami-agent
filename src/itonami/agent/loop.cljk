@@ -74,7 +74,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
    {:final str :exit-reason str :turns n :messages [...] :usage {...}
     :provider str :model str :attempts [...] :writes [abs-paths]}"
   [{:keys [config env] :as prof} prompt {:keys [model provider pinned? toolsets cwd roots platform
-                                                load-context? max-turns budget-s on-event peer?]}]
+                                                load-context? max-turns budget-s on-event peer? delegate-run]}]
   (let [max-turns (or max-turns (get-in config ["agent" "max_turns"]) (get config "max_turns") 90)
         budget-ms (* 1000 (or budget-s (get-in config ["agent" "run_budget_seconds"]) 0))
         hops (provider/decentralize (provider/chain config {:model model :provider provider :pinned? pinned?})
@@ -89,7 +89,18 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         cwd (or cwd (some-> (get-in config ["terminal" "cwd"]) h/expand) (h/join (:home prof) "workspace"))
         _ (h/mkdirs cwd)
         ctx {:cwd cwd :home (:home prof) :profile (:name prof) :roots roots :writes writes :tool-env env
-             :terminal-policy (confine/policy (:itonami prof) {:peer? peer?})}
+             :terminal-policy (confine/policy (:itonami prof) {:peer? peer?})
+             ;; delegate_task children run where this turn may run: the
+             ;; placement executor the caller injected (peer first), else a
+             ;; local child turn. Children get no memory / delegate / cron
+             ;; tools (the Hermes delegation rule).
+             :run-child (fn [child-prompt child-opts]
+                          (let [o (merge {:toolsets ["hermes-cron" "web"]
+                                          :platform "delegate" :load-context? false}
+                                         child-opts)]
+                            (if delegate-run
+                              (delegate-run prof child-prompt o)
+                              (run prof child-prompt o))))}
         t0 (h/now-ms)
         emit (or on-event (fn [_]))
         usage (atom {"prompt_tokens" 0 "completion_tokens" 0 "total_tokens" 0})

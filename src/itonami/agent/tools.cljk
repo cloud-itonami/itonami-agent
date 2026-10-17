@@ -15,7 +15,8 @@
             [promesa.core :as p]
             [itonami.agent.host :as h]
             [itonami.agent.confine :as confine]
-            [itonami.agent.webguard :as webguard]))
+            [itonami.agent.webguard :as webguard]
+            [itonami.agent.delegate :as delegate]))
 
 (defn- fn-schema [name desc props required]
   {"type" "function"
@@ -66,7 +67,23 @@
               {"action" {"type" "string" "enum" ["add" "replace" "remove"]}
                "target" {"type" "string" "enum" ["memory" "user"]}
                "content" {"type" "string"} "old_text" {"type" "string"} "new_text" {"type" "string"}}
-              ["action"])})
+              ["action"])
+   "delegate_task"
+   (fn-schema "delegate_task"
+              "Spawn subagents in isolated contexts; each gets its own conversation and toolset, and only its final summary returns to you. Pass every task in `tasks` — one entry spawns one subagent, several run in parallel (up to 10). One-shot sessions (CLI -z, cron) join their children and return results in this call. Children run where the turn may run — a trusted peer first, this node otherwise (distributed bot profiles). Children know nothing of this conversation: pass everything via 'context'. Child summaries are SELF-REPORTS, not verified facts. Children cannot call delegate_task, memory or cronjob tools. USE FOR: reasoning-heavy subtasks, work that would flood your context, or independent parallel workstreams."
+              {"tasks" {"type" "array" "items"
+                        {"type" "object"
+                         "properties"
+                         {"goal" {"type" "string" "description" "What this subagent should accomplish. Be specific and self-contained — it knows nothing about your conversation history."}
+                          "context" {"type" "string" "description" "Background THIS child needs: file paths, error messages, constraints. Each child sees only its own context."}
+                          "output_schema" {"type" "object" "description" "Optional JSON Schema this child's final answer must validate against (told to the child up front; parent validates with one bounded correction retry; result gains schema_valid, plus schema_errors on failure — the child's raw text is still returned as summary, never discarded)."}
+                          "images" {"type" "array" "items" {"type" "string"} "description" "Optional images this child must SEE (max 8): local file paths or http(s) URLs."}}
+                         "required" ["goal"]}}
+               "action" {"type" "string" "enum" ["spawn" "list" "steer" "stop"]
+                         "description" "Default 'spawn'. 'list' = ids/goals/status; 'steer'/'stop' target one child by subagent_id (joined children have no mid-run inbox and no cancel — the error says so honestly)."}
+               "subagent_id" {"type" "string" "description" "Target for action='steer'/'stop' (ids from the spawn response or action='list')."}
+               "message" {"type" "string" "description" "For action='steer': the course correction."}}
+              [])})
 
 (def toolsets
   {"terminal" ["terminal"]
@@ -75,8 +92,9 @@
    "search" ["web_search"]
    "skills" ["skill_view"]
    "memory" ["memory"]
+   "delegate" ["delegate_task"]
    ;; the bundles Hermes names
-   "hermes-cli" ["terminal" "read_file" "write_file" "patch" "search_files" "web_search" "web_extract" "skill_view" "memory"]
+   "hermes-cli" ["terminal" "read_file" "write_file" "patch" "search_files" "web_search" "web_extract" "skill_view" "memory" "delegate_task"]
    "hermes-cron" ["terminal" "read_file" "write_file" "patch" "search_files" "skill_view"]})
 
 (defn tool-names
@@ -313,7 +331,7 @@
 (def impls
   {"terminal" terminal "read_file" read-file "write_file" write-file "patch" patch
    "search_files" search-files "web_extract" web-extract "web_search" web-search
-   "skill_view" skill-view "memory" memory})
+   "skill_view" skill-view "memory" memory "delegate_task" delegate/task})
 
 (defn call
   "Run one tool call. Always resolves to a result string."

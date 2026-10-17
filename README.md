@@ -46,7 +46,8 @@ Definition = `SOUL.md`, `profile.yaml`, `config.yaml`, `.env`,
 | `cron/output/<id>/<YYYY-MM-DD_HH-MM-SS>.md`, newest 50, mode 0600 | identical layout (adds `**Engine:**` / `**Peer:**` lines) |
 | `usage_audit.jsonl`, `ticker_heartbeat`, `ticker_last_success` | written |
 | `-p`, `-z` (stdout = final text, exit 1 + `… -z: reason` on stderr), `-m`, `--provider`, `-t`, `cron list/create/run/tick/runs/status`, `profile list/show`, `chat` | same flags |
-| `executions.db`, incidents, notepad, messaging gateway adapters, `delegate_task`, browser tools, MCP | **not implemented**; itonami logs runs to `cron/itonami-runs.jsonl` |
+| `delegate_task` (`tasks` / `action` spawn·list·steer·stop / `subagent_id` / `message`) | same name and argument shape. Children are full agent turns that run where the turn may run — a trusted peer first, this node otherwise (bot profiles are distributed) — and one-shot sessions (CLI `-z`, cron) join their children and return summaries in the call. `output_schema` is told to the child up front and validated by the parent with one bounded correction retry (`schema_valid` / `schema_errors`; the raw summary is never discarded). Children cannot call `delegate_task`, `memory` or cron tools. `steer`/`stop` are honest about joined children (no mid-run inbox, no cancel) |
+| `executions.db`, incidents, notepad, messaging gateway adapters, browser tools, MCP | **not implemented**; itonami logs runs to `cron/itonami-runs.jsonl` |
 
 ## itonami profile
 
