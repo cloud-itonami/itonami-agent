@@ -81,3 +81,19 @@
         (is (= #{"proc_live000001"} ids))))
     (try (js/process.kill pid) (catch :default _ nil))
     (h/rm home)))
+
+(deftest process-handoff-hermes-outcome
+  ;; Hermes `_handoff_process` (tools/process_registry.py): a caller with no live
+  ;; parent is refused before the session is resolved. Kotoba has no
+  ;; subagent-with-live-parent concept (owner fields are empty strings), so every
+  ;; `handoff` call is legitimately "not one" — the reachable-case outcome is
+  ;; Hermes' exact error. The `data`/cap checks only run past the parent gate.
+  (let [home (fresh-home "handoff")
+        res (parse-json (process/manage {:home home} {"action" "handoff" "session_id" "proc_x"}))]
+    (testing "handoff returns Hermes' exact parent-gate error"
+      (is (= "handoff is only available to a running subagent with a live parent; you are not one."
+             (get res "error"))))
+    (testing "handoff requires session_id, as in Hermes"
+      (let [r (parse-json (process/manage {:home home} {"action" "handoff"}))]
+        (is (= "session_id is required for handoff" (get r "error")))))
+    (h/rm home)))
