@@ -117,7 +117,7 @@
               {"category" {"type" "string" "description" "Optional category filter"}}
               [])
    "skill_manage"
-   (fn-schema "skill_manage" "Create, patch, or delete profile skills and supporting files. Up to 20 operations apply as one approved transaction; any failure rolls the touched skills back. Delete must be the only operation. Read first with skill_view."
+   (fn-schema "skill_manage" "Create, patch, or delete profile skills and supporting files. Up to 20 operations apply as one approved transaction; any failure rolls the touched skills back. Delete must be the only operation and may declare absorbed_into=<umbrella> to record a verified consolidation. Read first with skill_view. Essential or pinned skills cannot be deleted (patches and edits stay allowed)."
               {"operations" {"type" "array" "minItems" 1 "maxItems" 20
                              "items" {"type" "object" "properties"
                                       {"action" {"type" "string" "enum" ["create" "patch" "write_file" "remove_file" "delete"]}
@@ -128,7 +128,8 @@
                                        "new_string" {"type" "string"}
                                        "replace_all" {"type" "boolean"}
                                        "file_path" {"type" "string"}
-                                       "file_content" {"type" "string"}}
+                                       "file_content" {"type" "string"}
+                                       "absorbed_into" {"type" "string" "description" "For delete: the umbrella skill this one was absorbed into (must already exist, must differ from the deleted name). Required by background curator consolidation; elsewhere it records the consolidation."}}
                                       "required" ["action" "name"]}}}
               ["operations"])
    "todo_list"
@@ -947,6 +948,152 @@
       (seq assets) (assoc "assets" (vec assets))
       (seq scripts) (assoc "scripts" (vec scripts)))))
 
+;; ---------------------------------------------------------------- skill guards
+;; Hermes tools/skill_manager_guards.py + tools/skill_usage.py, same verdicts.
+
+(def essential-skills
+  "Hermes ESSENTIAL_SKILLS: the agent's own operating manual referenced by
+  the system prompt. Permanently pinned — never deletable."
+  #{"hermes-agent"})
+
+(defn- usage-file [home] (h/join home "skills" ".usage.json"))
+
+(defn load-skill-usage
+  "The whole .usage.json map (skills/.usage.json, the Hermes skill_usage
+  store); {} on missing/corrupt."
+  [home]
+  (try (let [m (h/json-parse (h/slurp (usage-file home)))] (if (map? m) m {}))
+       (catch :default _ {})))
+
+(defn skill-usage-record [home name] (get (load-skill-usage home) (str name)))
+
+(defn- curator-managed?
+  "created_by is a curator-management OPT-IN flag, not proof of authorship
+  (curator adopt flips it). A missing record and created_by null resolve
+  identically."
+  [rec] (= "agent" (get rec "created_by")))
+
+(defn- safe-resolve [p] (try (h/realpath p) (catch :default _ (str p))))
+
+(defn- review-read? [ctx target]
+  (contains? (some-> (:review-read ctx) deref) (safe-resolve target)))
+
+(defn- review-mark-read! [ctx target]
+  (when-let [a (:review-read ctx)]
+    (swap! a conj (safe-resolve target))))
+
+(defn- review-read-before-write
+  "Hermes _background_review_read_before_write_guard: review forks must load
+  the exact target before mutating it — the fork must not patch content it
+  only inferred from the transcript. Only existing targets are gated."
+  [ctx name target action file-label]
+  (when (and (:review? ctx) (h/file? target) (not (review-read? ctx target)))
+    (str "Refusing background curator " action " for skill '" name "': the current " file-label
+         " content has not been loaded in this review turn. Call skill_view(name) for SKILL.md, or "
+         "skill_view(name, file_path=...) for a supporting file, then retry the write using the "
+         "content just returned.")))
+
+(defn- pinned-delete-guard
+  "Hermes _pinned_guard: pin only guards DELETION; patches/edits stay
+  allowed. Best-effort on an unreadable sidecar (the delete goes through)."
+  [home name]
+  (cond
+    (contains? essential-skills name)
+    (str "Skill '" name "' is essential (the agent's own operating manual referenced by the "
+         "system prompt) and cannot be deleted. Patches and edits are still allowed.")
+    (true? (get (skill-usage-record home name) "pinned"))
+    (str "Skill '" name "' is pinned and cannot be deleted by skill_manage. Ask the user to "
+         "run `hermes curator unpin " name "` if they want to delete it. Patches and edits "
+         "are allowed on pinned skills; only deletion is blocked.")
+    :else nil))
+
+(defn- review-delete-guard
+  "Hermes _background_review_delete_guard: autonomous review forks may only
+  archive curator-managed skills. Content writes are not gated by ownership —
+  an archive removes a skill the user relies on. Provenance that cannot be
+  verified fails closed."
+  [home name]
+  (let [rec (skill-usage-record home name)]
+    (cond
+      (contains? essential-skills name)
+      (str "Refusing background curator delete of pinned skill '" name "': pinned skills are "
+           "off-limits to autonomous maintenance. Ask the user to run `hermes curator unpin "
+           name "` if they want it changed.")
+      (true? (get rec "pinned"))
+      (str "Refusing background curator delete of pinned skill '" name "': pinned skills are "
+           "off-limits to autonomous maintenance. Ask the user to run `hermes curator unpin "
+           name "` if they want it changed.")
+      (not (map? rec))
+      (str "Refusing background curator delete of skill '" name "': skill ownership could not "
+           "be verified because the provenance record is unavailable or unreadable.")
+      (not (curator-managed? rec))
+      (str "Refusing background curator delete of skill '" name "': the skill is not "
+           "curator-managed (created_by=" (pr-str (get rec "created_by")) "). Only "
+           "curator-managed skills may be archived autonomously. Run `hermes curator adopt "
+           name "` to opt it in.")
+      :else nil)))
+
+(defn- consolidation-delete-guard
+  "Hermes _curator_consolidation_delete_guard: the review fork's only
+  legitimate delete is a consolidation declared via absorbed_into=<umbrella>.
+  A bare delete can only be the LLM pass pruning without evidence (#29912:
+  whole clusters of active skills archived with zero verified
+  consolidations). Fail closed; keep the skill active."
+  [name absorbed-into]
+  (when-not (and (string? absorbed-into) (not (str/blank? (str/trim absorbed-into))))
+    (str "Refusing background curator delete of skill '" name "': the consolidation pass may only "
+         "archive a skill it has absorbed into an umbrella. Pass absorbed_into=<umbrella> (the "
+         "umbrella must already exist) to record a verified consolidation. Pruning a skill with no "
+         "forwarding target is not permitted here. Keeping '" name "' active.")))
+
+(defn- validate-delete-target
+  "Hermes _validate_delete_target: the last-line guard before rmtree — even a
+  poisoned tree must never delete a symlink/junction (rmtree follows it), the
+  skills root itself, or a path outside the skills root (#11227)."
+  [skills-root dir]
+  (let [resolved (safe-resolve dir)
+        root (safe-resolve skills-root)]
+    (cond
+      (h/symlink? dir)
+      (str "Refusing to delete '" dir "': the skill directory is a symlink/junction. "
+           "Remove the link target manually if intended.")
+      (= resolved root)
+      (str "Refusing to delete '" dir "': resolves to the skills root itself, "
+           "which would remove every installed skill.")
+      (not (str/starts-with? resolved (str root "/")))
+      (str "Refusing to delete '" dir "': path does not resolve inside the skills root.")
+      :else nil)))
+
+(defn- find-skill-dir
+  "The directory of a skill name or category/name under the profile's skills
+  root (the umbrella existence check for absorbed_into)."
+  [ctx name]
+  (let [skills (h/join (:home ctx) "skills")
+        parts (when (safe-skill-relative? name) (str/split (str name) #"/"))]
+    (when (and (#{1 2} (count parts)) (every? skill-name? parts))
+      (first (for [rel (if (h/dir? skills) (h/walk-files skills (fn [_] false)) [])
+                   :when (and (str/ends-with? rel "/SKILL.md")
+                              (let [segments (str/split rel #"/")
+                                    skill-path (vec (butlast segments))]
+                                (and (= (count skill-path) (count parts))
+                                     (if (= 1 (count parts))
+                                       (= (first parts) (first skill-path))
+                                       (= parts skill-path)))))]
+               (h/join skills (subs rel 0 (- (count rel) (count "/SKILL.md")))))))))
+
+(defn- absorbed-into-error
+  "Hermes _delete_skill's absorbed_into validation: the forwarding target
+  must already exist and must differ from the skill being deleted. Empty
+  means an explicit prune; absent means undeclared (legacy, accepted)."
+  [ctx name absorbed]
+  (when (some? absorbed)
+    (let [t (str/trim (str absorbed))]
+      (cond
+        (str/blank? t) nil
+        (= t name) (str "absorbed_into='" t "' cannot equal the skill being deleted.")
+        (not (find-skill-dir ctx t)) (str "absorbed_into='" t "' does not exist.")
+        :else nil))))
+
 (defn skill-view [ctx {:strs [name file_path]}]
   (let [skills (h/join (:home ctx) "skills")
         parts (when (safe-skill-relative? name) (str/split name #"/"))
@@ -976,6 +1123,7 @@
           (not (readable? ctx "skill_view" f)) (err "skill file is outside this run's readable roots")
           :else
           (let [content (h/slurp f)
+                _ (review-mark-read! ctx f)
                 fm (when (= relative "SKILL.md")
                      (second (re-find #"(?s)^---\s*\n(.*?)\n---(?:\n|$)" content)))
                 meta (when fm (try (yaml/parse fm) (catch :default _ {})))
@@ -1059,12 +1207,24 @@
       (= action "delete")
       (if-not (and (h/dir? dir) (h/file? skill-file))
         (fail (str "skill not found: " name))
-        (do (h/rm dir) (record-write! ctx dir)
-            (ok {"success" true "action" action "name" name})))
+        (if-let [why (or (pinned-delete-guard (:home ctx) name)
+                         (when (:review? ctx)
+                           (or (review-delete-guard (:home ctx) name)
+                               (consolidation-delete-guard name (get op "absorbed_into"))))
+                         (absorbed-into-error ctx name (get op "absorbed_into"))
+                         ;; last line before rmtree, even against a poisoned tree
+                         (validate-delete-target skills-root dir))]
+          (fail why)
+          (do (h/rm dir) (record-write! ctx dir)
+              (ok {"success" true "action" action "name" name}))))
 
       (contains? #{"patch" "write_file" "remove_file"} action)
-      (let [target (if (= action "patch") (or support skill-file) support)]
+      (let [target (if (= action "patch") (or support skill-file) support)
+            review-why (review-read-before-write
+                        ctx name target action
+                        (if (= action "patch") (or (get op "file_path") "SKILL.md") (get op "file_path")))]
         (cond
+          review-why (fail review-why)
           (and (not= action "patch") (nil? support)) (fail "file_path must be a relative path under references/, templates/, scripts/, or assets/")
           (and (= action "patch") (get op "file_path") (nil? support)) (fail "file_path must be a relative path under references/, templates/, scripts/, or assets/")
           (not (h/file? skill-file)) (fail (str "skill not found: " name))
