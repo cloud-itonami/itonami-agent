@@ -33,9 +33,28 @@
 
 ;; ---- Hermes processes.json checkpoint (crash recovery) ----
 ;; Entry shape is Hermes' ProcessRegistry._CHECKPOINT_FIELDS plus `session_id`;
-;; `command` is redacted before persisting and `owner_task_id` defaulted on
-;; write. Missing keys fall back to the ProcessSession dataclass defaults where
-;; the session map consumes them (command, pid_scope, host_start_time, started_at).
+;; `command` is redacted before persisting and `owner_task_id` is the RAW
+;; spawning task id (`ProcessSession.owner_task_id`, defaulted to the
+;; container key exactly as `terminal_tool_background._spawn` does:
+;; `owner_task_id=task_id or effective_task_id`). Missing keys fall back to
+;; the ProcessSession dataclass defaults where the session map consumes them
+;; (command, pid_scope, host_start_time, started_at), and recovery defaults
+;; `owner_task_id` to `task_id` as `process_registry_checkpoint` does.
+
+(def ^:private max-handoffs-per-child
+  "Hermes tools/process_registry.py `_MAX_HANDOFFS_PER_CHILD`."
+  3)
+
+(defn container-task-id
+  "Hermes `tools/terminal_tool._resolve_container_task_id` for a non-container
+  backend (Kotoba has no Docker/SSH environments; delegate children share the
+  parent's home): a session key keys `session:<key>`, everything else —
+  including subagent ids — collapses onto `\"default\"`, exactly as Hermes'
+  branch 4 describes (\"default, which subagent ids collapse onto to share the
+  parent's container\")."
+  [session-key]
+  (let [k (str session-key)]
+    (if (str/blank? k) "default" (str "session:" k))))
 
 (defn- redact-command
   "Kotoba's equivalent of Hermes `redact_sensitive_text(command, code_file=True)`:
@@ -108,9 +127,9 @@
      "wsl_chain" false
      "cwd" (:cwd session)
      "started_at" (/ (:started-at session) 1000)
-     "task_id" ""
-     "owner_task_id" ""
-     "session_key" ""
+     "task_id" @(:task-id session)
+     "owner_task_id" @(:owner-task-id session)
+     "session_key" @(:session-key session)
      "watcher_platform" ""
      "watcher_chat_id" ""
      "watcher_user_id" ""
@@ -190,12 +209,16 @@
   (if (= :running @(:state session)) "running" "exited"))
 
 (defn- result-base [session]
-  {"session_id" (:id session)
-   "command" (:command session)
-   "status" (process-status session)
-   "pid" (session-pid session)
-   "cwd" (:cwd session)
-   "uptime_seconds" (max 0 (quot (- (h/now-ms) (:started-at session)) 1000))})
+  (merge {"session_id" (:id session)
+          "command" (:command session)
+          "status" (process-status session)
+          "pid" (session-pid session)
+          "cwd" (:cwd session)
+          "uptime_seconds" (max 0 (quot (- (h/now-ms) (:started-at session)) 1000))
+          "task_id" @(:task-id session)
+          "owner_task_id" @(:owner-task-id session)}
+         (when-not (str/blank? @(:handoff-note session))
+           {"handoff_note" @(:handoff-note session)})))
 
 (defn- adopt-entry! [home entry]
   (let [id (get entry "session_id")
@@ -213,6 +236,11 @@
                 session {:id id :home home :command (get entry "command" "unknown")
                          :cwd (get entry "cwd") :pid pid :child nil :detached? true
                          :host-start-time expected
+                         :task-id (atom (str (or (get entry "task_id") "")))
+                         :owner-task-id (atom (str (or (get entry "owner_task_id")
+                                                      (get entry "task_id") "")))
+                         :session-key (atom (str (or (get entry "session_key") "")))
+                         :handoff-note (atom "")
                          :started-at (long (* 1000 (if (number? started)
                                                      started
                                                      (/ (h/now-ms) 1000))))
@@ -268,6 +296,12 @@
 
       :else
       (let [id (str "proc_" (h/random-hex 6))
+            raw-task (str (or (:task-id ctx) ""))
+            session-key (str (or (:session-key ctx) ""))
+            task-key (container-task-id session-key)
+            ;; Hermes terminal_tool_background._spawn:
+            ;; `owner_task_id=task_id or effective_task_id`
+            owner (if (str/blank? raw-task) task-key raw-task)
             child (try
                     (.spawn child-process (first argv) (clj->js (subvec (vec argv) 1))
                             #js {:cwd cwd :env (clj->js env) :detached true
@@ -275,6 +309,10 @@
                     (catch :default e e))
             session {:id id :home home :command command :cwd cwd :child child
                      :pid (when-not (instance? js/Error child) (.-pid child))
+                     :task-id (atom task-key)
+                     :owner-task-id (atom owner)
+                     :session-key (atom session-key)
+                     :handoff-note (atom "")
                      :started-at (h/now-ms) :finished-at (atom nil)
                      :state (atom :running) :exit-code (atom nil)
                      :output (atom "")}]
@@ -327,6 +365,76 @@
           (>= (- (h/now-ms) started) timeout-ms) (assoc (snapshot s) "timed_out" true)
           :else (p/let [_ (p/delay 100)] (p/recur)))))))
 
+(defn transfer-ownership!
+  "Hermes `ProcessRegistry.transfer_ownership`: move a RUNNING session from
+  `from-owner` to `to-owner` — flipping `owner_task_id`, the container
+  `task_id`, `session_key` and `handoff_note` is the whole transfer (completion
+  notices are stamped from the owner at exit time). Returns the session, or
+  nil when it is unknown, already exited, or not owned by `from-owner` — the
+  caller must not report a transfer that did not happen."
+  [session {:keys [from-owner to-owner to-task-id to-session-key note]}]
+  (when (and (= :running @(:state session))
+             (= (str from-owner) @(:owner-task-id session)))
+    (reset! (:owner-task-id session) (str to-owner))
+    (reset! (:task-id session) (str to-task-id))
+    (reset! (:session-key session) (str to-session-key))
+    (reset! (:handoff-note session) (str note))
+    session))
+
+(defn handoff!
+  "Hermes `_handoff_process` (tools/process_registry.py): subagent-only —
+  transfer a running background process to the parent agent so its completion
+  is delivered THERE. Validated against the live spawn tree: the caller must
+  be a registered child (`ctx :subagent`, as `delegate_tool_registry
+  ._active_subagents` gates it) with a live parent and must own the process;
+  anything else is an error, never a silent no-op, so a PID mentioned in prose
+  can't masquerade as a transfer. The parent's owner id is its task id
+  (`parent._current_task_id or parent.session_id` in Hermes; Kotoba binds one
+  task id per run)."
+  [ctx session-id data]
+  (let [task-id (str (or (:task-id ctx) ""))
+        sub (:subagent ctx)
+        parent-owner (str (or (:parent-owner sub) ""))
+        parent-session-key (str (or (:parent-session-key sub) ""))
+        handed (:handed sub)
+        note (str/trim (str (or data "")))]
+    (cond
+      (nil? sub)
+      {"error" "handoff is only available to a running subagent with a live parent; you are not one."}
+
+      (str/blank? parent-owner)
+      {"error" "parent has no process owner id yet; retry after the parent's turn has started."}
+
+      (>= (count @handed) max-handoffs-per-child)
+      {"error" (str "handoff cap reached (" max-handoffs-per-child
+                    " per subagent); wait on or kill the rest yourself.")}
+
+      (str/blank? note)
+      {"error" "handoff requires `data`: one sentence saying what the process is for and what the parent should do with its result."}
+
+      :else
+      (let [resolved (resolve-session ctx session-id)
+            session (when-not (:error resolved) (refresh-detached! resolved))
+            transferred (when session
+                          (transfer-ownership! session
+                                               {:from-owner task-id
+                                                :to-owner parent-owner
+                                                :to-task-id (container-task-id parent-session-key)
+                                                :to-session-key parent-session-key
+                                                :note note}))]
+        (if transferred
+          (do
+            (swap! handed conj {"session_id" (:id transferred)
+                                "command" (:command transferred)
+                                "note" note})
+            {"status" "handed_off"
+             "session_id" (:id transferred)
+             "command" (:command transferred)
+             "note" (str "Your parent now owns this process and will receive its "
+                         "completion; you will not. Mention the handoff in your final answer.")})
+          {"error" (str "cannot hand off " session-id ": not a running process you own "
+                        "(already exited? read its result with poll/log and report it instead).")})))))
+
 (defn manage
   "Hermes-shaped background process actions, scoped to this profile home."
   [ctx {:strs [action session_id data timeout offset limit]}]
@@ -343,7 +451,7 @@
                         {:error (str "process not found: " session_id)}))]
       (cond
         (nil? session_id) (h/json-str {"error" (str "session_id is required for " action)})
-        (= action "handoff") (h/json-str {"error" "handoff is only available to a running subagent with a live parent; you are not one."})
+        (= action "handoff") (h/json-str (handoff! ctx session_id data))
         (:error session) (h/json-str session)
         (= action "poll") (h/json-str (snapshot session))
         (= action "log") (h/json-str (read-log session offset (max 1 (min 2000 (or limit 200)))))

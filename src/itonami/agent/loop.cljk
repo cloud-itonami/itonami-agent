@@ -195,6 +195,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
   [{:keys [config env] :as prof} prompt {:keys [model provider pinned? toolsets tool-names cwd roots platform
                                                 load-context? max-turns budget-s on-event peer? steer-queue cancelled?
                                                 reasoning-effort max-tokens
+                                                task-id session-key subagent
                                                 history instructions before-tool tool-overrides]
                                          :as options}]
   (let [max-turns (resolve-max-turns max-turns config (h/env "HERMES_MAX_ITERATIONS"))
@@ -235,7 +236,13 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         todo-state (tools/todo-history-state history)
         cwd (or cwd (some-> (get-in config ["terminal" "cwd"]) h/expand) (h/join (:home prof) "workspace"))
         _ (h/mkdirs cwd)
+        ;; one task id per agent run (Hermes binds a fresh one per turn in
+        ;; `turn_context._bind_turn_identity`): the raw owner id under which
+        ;; this run's background processes register
+        task-id (or task-id (str "task-" (h/random-hex 8)))
+        session-key (or session-key "")
         ctx {:cwd cwd :home (:home prof) :profile (:name prof) :roots roots :writes writes :tool-env env
+             :task-id task-id :session-key session-key :subagent subagent
              :browser-config (get config "browser" {})
              :browser-session (str "kotoba-" (h/random-hex 12))
              :browser-used? (atom false)
@@ -335,7 +342,10 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                               out-result (if approved?
                                                     (if (= nm "delegate_task")
                                                       (if (map? args-map)
-                                                        (delegated-tasks prof names options args-map)
+                                                        (delegated-tasks prof names (assoc options
+                                                                                           :task-id task-id
+                                                                                           :session-key session-key)
+                                                                         args-map)
                                                         (h/json-str {"error" "delegate_task arguments must be a JSON object"}))
                                                       (tools/call (assoc ctx :tool-approved? approved?) names nm args))
                                                     (h/json-str {"error" "Tool call denied by user."}))
@@ -481,6 +491,16 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                      :tool-names child-names
                                                      :toolsets nil
                                                      :history []
+                                                     :task-id id
+                                                     :session-key (str (or (:session-key parent-options) ""))
+                                                     ;; the child's live-parent record
+                                                     ;; (Hermes tools/delegate_tool_registry
+                                                     ;; ._active_subagents + the child agent's
+                                                     ;; _delegate_parent_ref): gates
+                                                     ;; process_manage handoff
+                                                     :subagent {:parent-owner (str (or (:task-id parent-options) ""))
+                                                                :parent-session-key (str (or (:session-key parent-options) ""))
+                                                                :handed (atom [])}
                                                      :steer-queue (:steer ctl)
                                                      :cancelled? (:cancel ctl)
                                                      :instructions "You are a Kotoba child agent. Return a concise result for the parent task.")
