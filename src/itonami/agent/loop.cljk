@@ -283,6 +283,20 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
   run and kept afterwards, so action=list stays truthful."
   (atom {}))
 
+(def delegate-delivered (atom #{}))
+
+(defn delegate-pending-results!
+  "Finished background children not yet delivered — one message per call, as
+  Hermes delivers background results between turns. Marked delivered."
+  []
+  (let [pending (vec (for [[id c] @delegate-children
+                           :when (and (not= "running" (get c "status"))
+                                      (not (contains? @delegate-delivered id)))]
+                       (assoc c "subagent_id" id)))]
+    (when (seq pending)
+      (swap! delegate-delivered into (map #(get % "subagent_id") pending)))
+    pending))
+
 (def delegate-ctl
   "subagent_id -> {:steer (atom [message]) :cancel (atom bool)}. steer queues
   the correction into the child's next tool result; cancel ends the child
