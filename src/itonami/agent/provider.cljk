@@ -46,7 +46,8 @@
      :key-env (or key_env (get pc "key_env") (get pc "api_key_env") (get bi "key_env"))
      :headers (merge default-headers (get pc "extra_headers"))
      :extra-body (get pc "extra_body")
-     :timeout-s (or (get mc "timeout_seconds") (get pc "request_timeout_seconds") 900)}))
+     :timeout-s (or (get mc "timeout_seconds") (get pc "request_timeout_seconds") 900)
+     :timeout-explicit? (boolean (or (get mc "timeout_seconds") (get pc "request_timeout_seconds")))}))
 
 (defn chain
   "The ordered hops for a run. opts: {:model :provider :pinned?} from a job or
@@ -191,6 +192,27 @@
   [hop more]
   (boolean (and (parked? hop) (some (complement parked?) more))))
 
+(defn cap-to-run-budget
+  "Hermes agent/chat_completion_helpers.cap_to_run_budget: cap an implicit
+  call timeout at half the run budget still left (>= 60 s floor), so one hung
+  call can't outlive the run and the wrap-up notice stays reachable. The cap
+  only ever tightens; nil remaining (no run budget) leaves the timeout alone."
+  [timeout-s remaining-ms]
+  (if (nil? remaining-ms)
+    timeout-s
+    (min timeout-s (max 60 (/ remaining-ms 2000)))))
+
+(defn cap-hop-timeout
+  "Hermes' caller contract (chat_completion_helpers.cap_to_run_budget is
+  unconditional; its callers skip it for explicit user settings): cap a hop's
+  implicit :timeout-s at half the run budget left; an explicit hop timeout
+  (models.<m>.timeout_seconds / providers.<p>.request_timeout_seconds) and a
+  run without a budget are left untouched."
+  [hop remaining-ms]
+  (if (or (nil? remaining-ms) (:timeout-explicit? hop))
+    hop
+    (update hop :timeout-s cap-to-run-budget remaining-ms)))
+
 (defn- complete-round
   [hops env {:keys [deadline-ms on-hop] :as req} attempts]
   (p/loop [[hop & more] hops attempts attempts]
@@ -200,11 +222,11 @@
         ;; authority known to be down: skip at no cost, the rails behind it carry the turn
         (p/recur more (conj attempts {:provider (:provider hop) :model (:model hop) :status nil
                                       :error (str "skipped: authority " (:authority hop) " breaker open")}))
-      (p/let [;; share the time left fairly among the hops still to try, so one
-              ;; slow rail cannot starve the fallbacks behind it
+      (p/let [;; Hermes cap_to_run_budget: half the run budget left (min 60 s),
+              ;; recomputed per hop — never the whole remainder, so one slow
+              ;; rail cannot outlive the run or starve the fallbacks behind it
               hop (if deadline-ms
-                    (update hop :timeout-s #(min % (max 60 (js/Math.floor (/ (- deadline-ms (h/now-ms))
-                                                                            (* 1000 (inc (count more))))))))
+                    (cap-hop-timeout hop (- deadline-ms (h/now-ms)))
                     hop)
               t0 (h/now-ms)
               r (complete-hop hop env req)
@@ -216,8 +238,9 @@
 
 (defn complete
   "Walk the chain. Resolves to {:ok resp :attempts [...]} or {:err last :attempts [...]}.
-  req may carry :deadline-ms (epoch ms): each hop's timeout is capped at the
-  time left divided by the hops still to try in the round (min 60 s).
+  req may carry :deadline-ms (epoch ms): each hop's implicit timeout is capped
+  at half the time left (min 60 s) — Hermes agent/chat_completion_helpers.
+  cap_to_run_budget, recomputed per hop; an explicit hop timeout wins untouched.
   When every hop of a round failed with a transient error (429 / 5xx /
   transport), wait and walk the chain again — up to :rounds (default 3) and
   only while the deadline leaves room — instead of failing the turn on a

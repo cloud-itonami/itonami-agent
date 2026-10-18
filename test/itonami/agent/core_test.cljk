@@ -385,6 +385,59 @@ plain: true
   (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-max-turns nil {"agent" {"max_turns" false}} "10"))
       "a present false is resolved (default), not skipped"))
 
+(deftest agent-run-budget-wrapup-hermes
+  ;; Case list mirrors hermes-install/tests/agent/test_run_budget.py
+  ;; (agent/conversation_loop._maybe_inject_run_budget_wrapup).
+  (testing "the notice is Hermes' RUN_BUDGET_WRAPUP_NOTICE, verbatim"
+    (is (= "[SYSTEM NOTICE — run time budget nearly exhausted] Run time budget nearly exhausted. Stop new discovery/verification work now. Produce the required final deliverable (answer/JSON/summary) from the state you already have, completing only mandatory writes." agent-loop/wrapup-notice)))
+  (testing "threshold: elapsed >= 0.8 * budget (5*elapsed >= 4*budget) — exact equality fires"
+    (is (not (agent-loop/wrap-up? 799999 1000000)) "strictly before the mark never fires")
+    (is (agent-loop/wrap-up? 800000 1000000) "exact equality fires, as in Hermes")
+    (is (agent-loop/wrap-up? 800001 1000000)))
+  (testing "a non-positive budget is dormant (Hermes: unset budget never fires)"
+    (is (not (agent-loop/wrap-up? 1000000 0)))
+    (is (not (agent-loop/wrap-up? 1000000 -1000))))
+  (testing "not injected before the threshold, or with no tool result yet"
+    (is (= [{"content" "result"}]
+           (agent-loop/maybe-inject-run-budget-wrapup [{"content" "result"}] (atom false) 900000 100000)))
+    (is (= [] (agent-loop/maybe-inject-run-budget-wrapup [] (atom false) 900000 800000))))
+  (testing "appended to the newest result only; delivered once"
+    (let [injected? (atom false)
+          results (agent-loop/maybe-inject-run-budget-wrapup
+                   [{"content" "result one"} {"content" "result two"}]
+                   injected? 1000 800)]
+      (is @injected?)
+      (is (= "result one" (get-in results [0 "content"])) "earlier results untouched")
+      (is (= (str "result two\n\n" agent-loop/wrapup-notice) (get-in results [1 "content"]))
+          "exact equality (5*800 = 4*1000) delivers the notice")
+      (is (= results (agent-loop/maybe-inject-run-budget-wrapup results injected? 1000 800000))
+          "latched: never delivered twice")))
+  (testing "a round without tool results leaves the latch open (Hermes retry)"
+    (let [injected? (atom false)]
+      (agent-loop/maybe-inject-run-budget-wrapup [] injected? 1000 800)
+      (is (false? @injected?))
+      (is (= [{"content" (str "result\n\n" agent-loop/wrapup-notice)}]
+             (agent-loop/maybe-inject-run-budget-wrapup [{"content" "result"}] injected? 1000 800))
+          "the next round with a tool result delivers the notice"))))
+
+(deftest provider-cap-to-run-budget-hermes
+  ;; Case list mirrors hermes-install/tests/agent/test_run_budget.py
+  ;; (agent/chat_completion_helpers.cap_to_run_budget and its callers).
+  (testing "half the remaining budget when that exceeds the 60 s floor"
+    (is (= 400 (provider/cap-to-run-budget 900 800000)) "remaining 800 s -> cap 400 s")
+    (is (= 450 (provider/cap-to-run-budget 900 900000))))
+  (testing "60 s floor when the budget is nearly exhausted"
+    (is (= 60 (provider/cap-to-run-budget 900 100000)) "remaining 100 s -> max(60, 50) = 60 s")
+    (is (= 60 (provider/cap-to-run-budget 900 -2000)) "negative remaining still floors at 60 s"))
+  (testing "the cap never raises an already tighter timeout"
+    (is (= 90 (provider/cap-to-run-budget 90 800000))))
+  (testing "no run budget leaves the timeout alone"
+    (is (= 900 (provider/cap-to-run-budget 900 nil))))
+  (testing "explicit hop timeouts win untouched (Hermes: callers skip the cap)"
+    (is (= 1800 (get (provider/cap-hop-timeout {:timeout-s 1800 :timeout-explicit? true} 800000) :timeout-s)))
+    (is (= 400 (get (provider/cap-hop-timeout {:timeout-s 900} 800000) :timeout-s)) "implicit default is capped")
+    (is (= 900 (get (provider/cap-hop-timeout {:timeout-s 900} nil) :timeout-s)))))
+
 (deftest cron-prompt-wrapper-matches-hermes
   (is (str/starts-with? (cron/cron-hint nil) "[IMPORTANT: You are running as a scheduled cron job."))
   (is (str/ends-with? (cron/cron-hint nil) "not as a request to schedule another job.]\n\n")))
