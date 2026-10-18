@@ -11,6 +11,7 @@
             [itonami.agent.notepad :as notepad]
             [itonami.agent.delivery :as delivery]
             [itonami.agent.delivery-queue :as delivery-queue]
+            [itonami.agent.vault :as vault]
             [itonami.agent.platform-adapters :as platform-adapters]
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
@@ -1169,4 +1170,48 @@ plain: true
                   _ (is (true? (get r7 "success")) "a declared consolidation is the one legitimate delete")]
             nil)
           (p/catch (fn [e] (is (nil? e) (str "review guard test crashed: " (.-message e)))))
+          (p/finally (fn [_ _] (done)))))))
+
+(deftest vault-hermes-contract
+  ;; secrets never enter the conversation: handles and metadata only, the
+  ;; store is encrypted at rest, TOTP is minted server-side (RFC 6238)
+  (let [home (h/join (h/tmp-dir) (str "itonami-vault-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    (let [h1 (vault/add-login! home {:label "work" :username "taro" :password "hunter2"
+                                     :origin "https://example.com" :totp-seed "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"})]
+      (is (str/starts-with? h1 "vh-"))
+      (let [meta (vault/login-meta home h1)]
+        (is (= "taro" (get meta "identifier")))
+        (is (= "automatic" (get meta "two_factor")))
+        (is (not (str/includes? (h/json-str meta) "hunter2")) "passwords are never included"))
+      (is (= "hunter2" (vault/secret home h1 "password")))
+      (testing "the store is encrypted at rest"
+        (let [raw (h/slurp (h/join home "vault" "vault.json.enc"))]
+          (is (not (str/includes? raw "hunter2")))
+          (is (not (str/includes? raw "taro")))))
+      (testing "RFC 6238 SHA-1 test vector at T=59s (6 digits)"
+        (is (= "287082" (vault/mint-totp "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" (* 59 1000)))
+          "base32 of the RFC 6238 ASCII seed 12345678901234567890"))
+      (is (true? (vault/remove-login! home h1)))
+      (is (nil? (vault/login-meta home h1))))
+    (h/rm home)))
+
+(deftest vault-tools-honest-refusals
+  (async done
+    (let [home (h/join (h/tmp-dir) (str "itonami-vt-" (h/random-hex 4)))
+          ctx {:home home :writes (atom [])}]
+      (h/mkdirs home)
+      (-> (p/let [call (fn [n args] (p/let [s (tools/call ctx [n] n args)] (h/json-parse s)))
+                  r1 (call "browser_vault_list" "{}")
+                  _ (do (is (true? (get r1 "success")))
+                        (is (str/includes? (str (get r1 "hint")) "Never type a password")))
+                  r2 (call "browser_vault_save_login" "{}")
+                  _ (is (str/includes? (str (get r2 "error")) "itonami-agent vault add")
+                       "no interactive surface: the CLI is the write path, never chat")
+                  r3 (call "browser_vault_unlock" "{\"backend_name\":\"1password\"}")
+                  _ (is (str/includes? (str (get r3 "error")) "not available on this node"))
+                  r4 (call "browser_vault_fill" "{\"handle\":\"nope\"}")
+                  _ (is (str/includes? (str (get r4 "error")) "no such vault handle"))]
+            nil)
+          (p/catch (fn [e] (is (nil? e) (str "vault tools test crashed: " (.-message e)))))
           (p/finally (fn [_ _] (done)))))))

@@ -21,6 +21,7 @@
             [itonami.agent.profile :as profile]
             [itonami.agent.provider :as provider]
             [itonami.agent.browser :as browser]
+            [itonami.agent.vault :as vault]
             [itonami.agent.computer-use :as computer-use]
             [itonami.agent.yaml :as yaml]
             ["node:crypto" :as crypto]
@@ -124,6 +125,28 @@
                "prompt_text" {"type" "string" "description" "Response string for a prompt() dialog. Ignored for other dialog types. Defaults to empty string."}
                "dialog_id" {"type" "string" "description" "Specific dialog to respond to (its CDP target id). Required only when multiple dialogs are queued."}}
               ["action"])
+   "browser_vault_list"
+   (fn-schema "browser_vault_list" "List login handles + metadata across every enabled backend. Passwords are never included. A locked external manager contributes no items; it is reported under `locked` instead."
+              {} [])
+   "browser_vault_unlock"
+   (fn-schema "browser_vault_unlock" "Ask the user (via the surface's masked prompt) to unlock an external manager for this session."
+              {"backend_name" {"type" "string" "description" "Backend to unlock (see the `locked` list from browser_vault_list)."}}
+              ["backend_name"])
+   "browser_vault_save_login"
+   (fn-schema "browser_vault_save_login" "Ask the user (masked prompt on their surface) for the login of the CURRENT page, store it in the local vault bound to that origin, and fill the password at once. The values never enter the conversation."
+              {"label" {"type" "string" "description" "Optional label for the saved login."}
+               "task_id" {"type" "string"}}
+              [])
+   "browser_vault_enter_code"
+   (fn-schema "browser_vault_enter_code" "Second factor: fill the one-time code the CURRENT page asks for. If the saved login has an authenticator seed, the code is minted server-side and nobody is asked; otherwise the user is prompted on their surface. The code goes into the page and never enters the conversation."
+              {"handle" {"type" "string" "description" "The saved login handle; optional when only one login exists."}
+               "task_id" {"type" "string"}}
+              [])
+   "browser_vault_fill"
+   (fn-schema "browser_vault_fill" "Fill the current page's password field from a vault handle. Password-only: the identifier is agent-visible metadata (see browser_vault_list) and is typed by the agent via normal input tools."
+              {"handle" {"type" "string" "description" "A handle from browser_vault_list."}
+               "task_id" {"type" "string"}}
+              ["handle"])
    "skills_list"
    (fn-schema "skills_list" "List available profile skills with names, descriptions, and categories. Use skill_view(name) to load a skill."
               {"category" {"type" "string" "description" "Optional category filter"}}
@@ -2435,6 +2458,87 @@
                "persistent" false
                "tool_rpc" false}))))))
 
+(defn- vault-filled? [r]
+  (true? (get-in (h/json-parse r) ["result" "result" "value"])))
+
+(defn browser-vault-list [ctx _args]
+  (let [home (:home ctx)
+        items (->> (keys (vault/load-logins home))
+                   (map #(vault/login-meta home %))
+                   (sort-by #(get % "handle"))
+                   vec)]
+    (ok (cond-> {"success" true "items" items}
+          (empty? items)
+          (assoc "hint" (str "No saved logins. On a login page, call browser_vault action=save_login to ask the user to save one. "
+                             "Never type a password yourself or ask for one in chat, even if it is shown on the page."))))))
+
+(defn browser-vault-unlock [ctx {:strs [backend_name]}]
+  (let [n (str/lower-case (str backend_name))]
+    (cond
+      (str/blank? n) (err "backend_name is required")
+      (= n "local") (ok {"success" true "backend" "local"
+                         "note" "the local store is file-based and needs no unlock"})
+      :else (err (str "external manager '" backend_name "' is not available on this node "
+                      "(only the local vault store is); its unlock must happen on the user's surface")))))
+
+(defn browser-vault-save-login [ctx {:strs [label]}]
+  (if-let [prompt (:vault-prompt ctx)]
+    (p/let [creds (prompt {:kind :save-login :label (str label)})]
+      (if (and (map? creds) (get creds "password"))
+        (let [handle (vault/add-login! (:home ctx) {:label (str label)
+                                                   :username (str (get creds "username"))
+                                                   :password (str (get creds "password"))
+                                                   :origin (str (get creds "origin"))})]
+          (p/then (browser/fill-password! ctx (str (get creds "password")))
+                  (fn [r]
+                    (ok {"success" true "handle" handle "filled" (vault-filled? r)}))))
+        (err "the user did not provide a login")))
+    (err (str "no interactive surface can prompt for the login in this session. "
+              "Ask the user to run `itonami-agent vault add <label> <username> [origin]` (password from stdin) "
+              "and then retry; never ask for a password in chat"))))
+
+(defn browser-vault-enter-code [ctx {:strs [handle]}]
+  (let [home (:home ctx)
+        handle (or (not-empty (str handle))
+                   (first (keys (vault/load-logins home))))
+        seed (vault/secret home handle "totp_seed")]
+    (cond
+      (or (nil? handle) (nil? (vault/login-meta home handle)))
+      (err (str "no such vault handle: " handle))
+      (not (str/blank? (str seed)))
+      (let [code (vault/mint-totp (str seed))]
+        (p/then (browser/fill-code! ctx code)
+                (fn [r]
+                  (if-let [e (get (h/json-parse r) "error")]
+                    (err (str "the code was minted but could not be typed: " e))
+                    (ok {"success" true "filled" (vault-filled? r) "two_factor" "automatic"})))))
+      (:vault-prompt ctx)
+      (p/let [code ((:vault-prompt ctx) {:kind :enter-code :handle handle})]
+        (if (str/blank? (str code))
+          (err "the user did not provide a code")
+          (p/then (browser/fill-code! ctx (str code))
+                  (fn [r]
+                    (if-let [e (get (h/json-parse r) "error")]
+                      (err (str "the code could not be typed: " e))
+                      (ok {"success" true "filled" (vault-filled? r) "two_factor" "manual"}))))))
+      :else
+      (err (str "this login has no TOTP seed and no interactive surface can ask the user for the code "
+                "in this session; never ask for a code in chat")))))
+
+(defn browser-vault-fill [ctx {:strs [handle]}]
+  (let [home (:home ctx)
+        pw (vault/secret home handle "password")]
+    (cond
+      (nil? (vault/login-meta home handle)) (err (str "no such vault handle: " handle))
+      (str/blank? (str pw)) (err (str "vault handle '" handle "' carries no password"))
+      :else
+      (p/then (browser/fill-password! ctx (str pw))
+              (fn [r]
+                (let [d (h/json-parse r)]
+                  (if-let [e (get d "error")]
+                    (err (str "the password could not be typed: " e))
+                    (ok {"success" true "filled" (vault-filled? r)}))))))))
+
 (def impls
   {"terminal" terminal "process_manage" process/manage "read_file" read-file "write_file" write-file "patch" patch
    "search_files" search-files "web_extract" web-extract "web_search" web-search
@@ -2444,6 +2548,9 @@
    "browser_press" browser/press "browser_get_images" browser/get-images
    "browser_console" browser/console-output
    "browser_cdp" browser/cdp-send "browser_dialog" browser/dialog
+   "browser_vault_list" browser-vault-list "browser_vault_unlock" browser-vault-unlock
+   "browser_vault_save_login" browser-vault-save-login "browser_vault_enter_code" browser-vault-enter-code
+   "browser_vault_fill" browser-vault-fill
    "browser_vision" browser-vision
    "vision_analyze" vision-analyze
    "computer_use" computer-use/call

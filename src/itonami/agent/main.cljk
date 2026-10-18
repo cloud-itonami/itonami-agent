@@ -47,6 +47,7 @@
             [itonami.agent.computer-use :as computer-use]
             [itonami.agent.cron :as cron]
             [itonami.agent.notepad :as notepad]
+            [itonami.agent.vault :as vault]
             [itonami.agent.mcp :as mcp]
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
@@ -343,6 +344,36 @@
         (println (str "last itonami tick: " (if (h/file? hb) (h/iso-local (js/Date. (* 1000 (js/parseFloat (h/slurp hb))))) "never"))))
 
       (die 2 (str "unknown cron command: " sub)))))
+
+(defn vault-cmd
+  "The vault write path (Hermes `hermes vault add`): the browser_vault tools
+  never carry secrets, so logins are added here. The password is read from
+  stdin; run this in a private terminal."
+  [opts [sub & args]]
+  (let [home (profile/home (:profile opts))]
+    (case sub
+      ("list" nil)
+      (if-let [entries (seq (sort-by key (vault/load-logins home)))]
+        (doseq [[handle r] entries]
+          (println (str (.padEnd handle 14) (.padEnd (str (get r "username")) 20)
+                        (str (get r "origin")) "  " (get r "label"))))
+        (println "no saved logins"))
+
+      "add"
+      (let [[label username origin totp-seed] args]
+        (when-not (and label username)
+          (die 2 "usage: itonami-agent vault add <label> <username> [origin] [totp-seed]   (the password is read from stdin)"))
+        (let [pw (str/trim (str (.readFileSync (js/require "node:fs") 0 "utf8")))
+              handle (vault/add-login! home {:label label :username username :password pw
+                                             :origin (or origin "") :totp-seed (or totp-seed "")})]
+          (println (str "stored " handle))))
+
+      "remove"
+      (let [[handle] args]
+        (when-not handle (die 2 "usage: itonami-agent vault remove <handle>"))
+        (println (if (vault/remove-login! home handle) "removed" (str "no such handle: " handle))))
+
+      (die 2 "usage: itonami-agent vault add|list|remove"))))
 
 ;; ---------------------------------------------------------------- profile
 
@@ -1005,6 +1036,7 @@
             (case (first pos)
               "bridge" (bridge)
               "chat" (chat opts)
+              "vault" (vault-cmd opts (rest pos))
               "cron" (cron-cmd opts (rest pos))
               "profile" (profile-cmd opts (rest pos))
               "gateway" (if (= "run" (second pos)) (gateway-run opts) (die 2 "usage: itonami-agent gateway run"))
