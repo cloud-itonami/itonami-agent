@@ -1,8 +1,12 @@
 model:
   provider: murakumo
-  default: mishima
+  default: murakumo/free
   max_tokens: 16384
   context_length: 131072
+fallback_providers:
+  - provider: murakumo
+    model: mishima
+    base_url: https://api.murakumo.cloud/v1
 providers:
   murakumo:
     base_url: https://api.murakumo.cloud/v1
