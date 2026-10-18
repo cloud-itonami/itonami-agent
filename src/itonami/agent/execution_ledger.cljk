@@ -234,6 +234,53 @@
       true
       (finally (.close db)))))
 
+(def default-failure-repeat-alert-hours 6.0)
+
+(defn- repeat-alert-hours [config]
+  (let [cfg (get-in config ["cron" "failure_repeat_alert_hours"])
+        v (cond (number? cfg) cfg
+                (string? cfg) (js/parseFloat cfg)
+                :else default-failure-repeat-alert-hours)]
+    (if (js/isNaN v) default-failure-repeat-alert-hours v)))
+
+(defn get-incident [home incident-id]
+  (let [db (open-db home)]
+    (try
+      (when-let [r (.get (.prepare db "SELECT * FROM cron_incidents WHERE id=?") (str incident-id))]
+        (into {} (for [k ["id" "job_id" "error_sig" "state" "failure_type" "first_seen_at"
+                          "last_seen_at" "alerted_at" "acked_at" "closed_at"]]
+                   [k (aget r k)])))
+      (finally (.close db)))))
+
+(defn- repeat-alert-withheld?
+  "An alerted incident withholds the per-run ping until the reminder cooldown
+  has elapsed. A missing/unparseable alerted_at delivers rather than
+  swallowing an alert; 0 (or negative) re-alerts on every failing run (the
+  pre-gate behaviour)."
+  [incident config]
+  (let [hours (repeat-alert-hours config)]
+    (if (<= hours 0)
+      false
+      (let [alerted-at (get incident "alerted_at")]
+        (if (str/blank? (str alerted-at))
+          false
+          (if-let [last (h/parse-time (str alerted-at))]
+            (< (- (h/now-ms) (.getTime last)) (* hours 3600000))
+            false))))))
+
+(defn upsert-incident-for-failure!
+  "Hermes scheduler._upsert_incident_for_failure: record the durable failure
+  incident and answer whether the per-run ping is withheld — the signature's
+  incident is already `closed` (operator ack) or `alerted` inside the
+  cron.failure_repeat_alert_hours cooldown (a ping already went out)."
+  [home job config error output-file]
+  (let [{:keys [id]} (upsert-incident! home (get job "id") error output-file)
+        incident (get-incident home id)
+        state (get incident "state")
+        withheld (or (= "closed" state)
+                     (and (= "alerted" state) (repeat-alert-withheld? incident config)))]
+    {:withheld withheld :incident-id id}))
+
 (defn ack-incident! [home incident-id]
   "Close one incident signature until the error changes."
   (let [db (open-db home)
