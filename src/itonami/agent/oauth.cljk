@@ -1,0 +1,237 @@
+(ns itonami.agent.oauth
+  "MCP interactive OAuth login (Hermes tools/mcp_oauth*.py): discovery,
+  dynamic client registration, PKCE authorization-code login over a loopback
+  redirect, and the device grant for headless surfaces. Tokens land in the
+  profile's mcp-tokens store exactly as the Hermes token cache reads it
+  (<name>.json / <name>.meta.json / <name>.client.json, issuer-bound).
+
+  The interactive step is the user's: this module hands out the authorization
+  URL and waits for the redirect or polls the device grant — it never types
+  credentials and never sees a password."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            ["node:crypto" :as crypto]
+            ["node:http" :as http]))
+
+;; ---------------------------------------------------------------- PKCE
+
+(defn- b64url [buf]
+  (-> (.toString buf "base64") (str/replace #"=" "") (str/replace #"\+" "-") (str/replace #"/" "_")))
+
+(defn verify-challenge
+  "The S256 challenge of a verifier (RFC 7636)."
+  [verifier]
+  (b64url (crypto/createHash "sha256" (str verifier))))
+
+(defn pkce
+  "RFC 7636: a verifier (43-128 chars) and its S256 challenge."
+  []
+  (let [verifier (b64url (crypto/randomBytes 48))
+        challenge (verify-challenge verifier)]
+    {"code_verifier" verifier "code_challenge" challenge "code_challenge_method" "S256"}))
+
+;; ---------------------------------------------------------------- discovery
+
+(defn- origin-of [url]
+  (let [u (js/URL. (str url))]
+    (str (.-protocol u) "//" (.-host u))))
+
+(defn discover!
+  "OAuth metadata for an MCP server URL: the well-known
+  oauth-authorization-server document, then the MCP-spec fallback of
+  /token and /register on the MCP host (Hermes mcp_oauth_provider)."
+  [server-url]
+  (let [origin (origin-of server-url)]
+    (-> (js/fetch (str origin "/.well-known/oauth-authorization-server"))
+        (.then (fn [r] (if (.-ok r) (.json r) nil)))
+        (.catch (fn [_] nil))
+        (.then (fn [doc]
+                 (let [m (js->clj (or doc #js {}))]
+                   {"issuer" (or (get m "issuer") origin)
+                    "authorization_endpoint" (get m "authorization_endpoint" (str origin "/authorize"))
+                    "token_endpoint" (or (get m "token_endpoint") (str origin "/token"))
+                    "registration_endpoint" (or (get m "registration_endpoint") (str origin "/register"))
+                    "device_authorization_endpoint" (get m "device_authorization_endpoint")}))))))
+
+;; ---------------------------------------------------------------- registration
+
+(defn register-client!
+  "Dynamic client registration (RFC 7591) at the metadata's registration
+  endpoint — never a fabricated {origin}/register guess when the metadata
+  names a different one (Hermes #78190)."
+  [meta redirect-uris]
+  (-> (js/fetch (str (get meta "registration_endpoint"))
+                #js {:method "POST"
+                     :headers #js {"Content-Type" "application/json"}
+                     :body (h/json-str {"client_name" "itonami-agent"
+                                        "redirect_uris" (vec redirect-uris)
+                                        "grant_types" ["authorization_code" "refresh_token" "urn:ietf:params:oauth:grant-type:device_code"]
+                                        "response_types" ["code"]
+                                        "token_endpoint_auth_method" "none"})})
+      (.then (fn [r] (if (.-ok r) (.json r) (throw (js/Error. (str "client registration failed: HTTP " (.-status r)))))))
+      (.then (fn [j] (let [m (js->clj j)]
+                       {"client_id" (get m "client_id")
+                        "client_secret" (get m "client_secret")
+                        "token_endpoint_auth_method" (get m "token_endpoint_auth_method" "none")})))
+      (.catch (fn [e] (throw (js/Error. (str "client registration failed: " (.-message e))))))))
+
+;; ---------------------------------------------------------------- token store
+
+(defn- store-name [server]
+  (subs (str/replace (str server) #"[^A-Za-z0-9_]" "_") 0 128))
+
+(defn save-login!
+  "Write the three token-cache files the Hermes MCP token cache reads.
+  Tokens are 0600 and the issuer binding (hermes_issuer) is stamped, so the
+  cache is only refreshable against the issuer that minted it."
+  [home server tokens meta client]
+  (let [name (store-name server)
+        dir (h/join home "mcp-tokens")
+        _ (h/mkdirs dir)
+        now (quot (h/now-ms) 1000)
+        expires-in (let [n (js/parseInt (str (get tokens "expires_in" "3600")) 10)] (if (js/isNaN n) 3600 n))
+        record (merge (select-keys tokens ["access_token" "refresh_token" "expires_in" "token_type"])
+                      {"expires_at" (+ now expires-in)
+                       "hermes_issuer" (get meta "issuer")})]
+    (h/spit (h/join dir (str name ".json")) (h/json-str record) {:mode 384})
+    (h/spit (h/join dir (str name ".meta.json"))
+            (h/json-str {"issuer" (get meta "issuer") "token_endpoint" (get meta "token_endpoint")}) {:mode 384})
+    (h/spit (h/join dir (str name ".client.json")) (h/json-str client) {:mode 384})
+    record))
+
+;; ---------------------------------------------------------------- token exchange
+
+(defn- token-exchange!
+  [meta client body]
+  (let [method (str (get client "token_endpoint_auth_method" "none"))
+        secret (get client "client_secret")
+        body (cond-> body
+               (and (= "client_secret_post" method) secret) (assoc "client_secret" secret))
+        headers (cond-> {"Content-Type" "application/x-www-form-urlencoded"}
+                  (and (= "client_secret_basic" method) secret)
+                  (assoc "Authorization" (str "Basic " (.toString (js/Buffer.from (str (get client "client_id") ":" secret)) "base64"))))]
+    (-> (js/fetch (str (get meta "token_endpoint"))
+                  #js {:method "POST"
+                       :headers (clj->js headers)
+                       :body (str (js/URLSearchParams. (clj->js body)))})
+        (.then (fn [r] (.then (.json r) (fn [j] [r j]))))
+        (.then (fn [[r j]]
+                 (let [m (js->clj j)]
+                   (if (.-ok r)
+                     m
+                     (throw (js/Error. (str "token exchange failed: HTTP " (.-status r) " "
+                                            (or (get m "error_description") (get m "error") ""))))))))
+        (.catch (fn [e] (throw (js/Error. (str "token exchange failed: " (.-message e)))))))))
+
+;; ---------------------------------------------------------------- authorization-code login
+
+(defn- loopback-listener []
+  ;; -> promise of {:port n :done (promise of {:code :state})}
+  (p/create
+   (fn [resolve _]
+     (let [res (atom nil)
+           done (p/create (fn [r _] (reset! res r)))
+           server (atom nil)
+           s (http/createServer
+              (fn [req qres]
+                (let [u (js/URL. (.-url req) "http://127.0.0.1")
+                      code (.searchParams.get u "code")
+                      state (.searchParams.get u "state")]
+                  (.writeHead qres 200 #js {"Content-Type" "text/plain"})
+                  (.end qres "OAuth login received; you may close this window and return to the terminal.")
+                  (when @server (.close @server))
+                  (when code (@res {"code" code "state" state})))))]
+       (reset! server s)
+       (.listen s 0 "127.0.0.1"
+                (fn [] (resolve {:port (.-port (.address s)) :done done})))))))
+
+(defn auth-url
+  "The authorization URL the user visits."
+  [meta client redirect-uri challenge state scope]
+  (let [u (js/URL. (str (get meta "authorization_endpoint")))]
+    (doseq [[k v] (cond-> {"response_type" "code"
+                           "client_id" (str (get client "client_id"))
+                           "redirect_uri" redirect-uri
+                           "state" state
+                           "code_challenge" (get challenge "code_challenge")
+                           "code_challenge_method" "S256"}
+                    (not (str/blank? (str scope))) (assoc "scope" (str scope)))]
+      (.set (.-searchParams u) k (str v)))
+    (str u)))
+
+(defn login!
+  "Interactive PKCE login. :open-url receives the authorization URL (the
+  caller shows it to the user; default prints it). A loopback listener on
+  127.0.0.1 captures the redirect; the code is exchanged and the token cache
+  written with its issuer binding. Resolves the saved record."
+  [home server server-url {:keys [open-url scope]}]
+  (p/let [meta (discover! server-url)
+          {:keys [port done]} (loopback-listener)
+          redirect-uri (str "http://127.0.0.1:" port "/callback")
+          client (register-client! meta [redirect-uri])
+          challenge (pkce)
+          state (h/random-hex 16)
+          url (auth-url meta client redirect-uri challenge state scope)
+          _ ((or open-url (fn [u] (println (str "Open this URL to log in:\n" u)))) url)
+          got done
+          _ (when-not (and got (= state (get got "state")))
+              (throw (js/Error. "OAuth redirect state mismatch")))
+          tokens (token-exchange! meta client {"grant_type" "authorization_code"
+                                              "code" (get got "code")
+                                              "redirect_uri" redirect-uri
+                                              "code_verifier" (get challenge "code_verifier")
+                                              "client_id" (str (get client "client_id"))})]
+    (save-login! home server tokens meta client)))
+
+;; ---------------------------------------------------------------- device grant
+
+(defn device-start!
+  "RFC 8628 device authorization request. Resolves
+  {device_code user_code verification_uri [verification_uri_complete] interval}."
+  [meta client scope]
+  (-> (js/fetch (str (get meta "device_authorization_endpoint"))
+                #js {:method "POST"
+                     :headers #js {"Content-Type" "application/x-www-form-urlencoded"}
+                     :body (str (js/URLSearchParams. (clj->js (cond-> {"client_id" (str (get client "client_id"))}
+                                                               (not (str/blank? (str scope))) (assoc "scope" (str scope))))))})
+      (.then (fn [r] (if (.-ok r) (.json r) (throw (js/Error. (str "device authorization failed: HTTP " (.-status r)))))))
+      (.then (fn [j] (js->clj j)))))
+
+(defn- device-poll!
+  [meta client device-code interval attempt]
+  (if (> attempt 120)
+    (p/rejected (js/Error. "device login timed out waiting for authorization"))
+    (-> (js/fetch (str (get meta "token_endpoint"))
+                  #js {:method "POST"
+                       :headers #js {"Content-Type" "application/x-www-form-urlencoded"}
+                       :body (str (js/URLSearchParams. #js {"grant_type" "urn:ietf:params:oauth:grant-type:device_code"
+                                                            "device_code" device-code
+                                                            "client_id" (str (get client "client_id"))}))})
+        (.then (fn [r] (.then (.json r) (fn [j] [r j]))))
+        (.then (fn [[r j]]
+                 (let [m (js->clj j)
+                       e (get m "error")]
+                   (cond
+                     (.-ok r) m
+                     (or (= e "authorization_pending") (= e "slow_down"))
+                     (p/then (p/create (fn [res _] (js/setTimeout res (* 1000 (max 1 (or (js/parseInt (str interval) 10) 5))))))
+                             (fn [_] (device-poll! meta client device-code interval (inc attempt))))
+                     :else (throw (js/Error. (str "device login failed: " (or (get m "error_description") e "")))))))))))
+
+(defn device-login!
+  "Headless login: the user opens verification_uri (or
+  verification_uri_complete) and enters user_code; this polls the token
+  endpoint and writes the same issuer-bound cache."
+  [home server server-url {:keys [scope on-device]}]
+  (p/let [meta (discover! server-url)
+          _ (when-not (get meta "device_authorization_endpoint")
+              (throw (js/Error. "this server advertises no device_authorization_endpoint")))
+          client (register-client! meta [])
+          d (device-start! meta client scope)
+          _ ((or on-device (fn [info]
+                             (println (str "Open " (get info "verification_uri") " and enter code "
+                                           (get info "user_code")))))
+             d)
+          tokens (device-poll! meta client (get d "device_code") (get d "interval") 0)]
+    (save-login! home server tokens meta client)))
