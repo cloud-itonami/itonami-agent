@@ -1008,3 +1008,37 @@ plain: true
                         "no live mid-run inbox"))
     (reset! agent-loop/delegate-children {})
     (reset! agent-loop/delegate-ctl {})))
+
+(deftest delivery-settle-fencing
+  (let [home (h/join (h/tmp-dir) (str "itonami-settle-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    (cron/write-jobs! home [(assoc (cron/new-job {:schedule "0 0 * * *" :prompt "p" :name "job1"}) "id" "job1")])
+    (let [id1 (execution-ledger/claim! home {"id" "job1"} "direct")
+          _ (execution-ledger/mark-running! home id1)]
+      (is (true? (cron/settle-queued-delivery! home id1 "job1" "boom" "failed"))
+          "the latest run for the job settles")
+      (is (= "delivery_failed" (get (cron/find-job home "job1") "last_status")))
+      (execution-ledger/finish! home id1 false "failed")
+      (let [id2 (execution-ledger/claim! home {"id" "job1"} "direct")]
+        (is (nil? (cron/settle-queued-delivery! home id1 "job1" "boom" "failed"))
+            "a later run exists: the earlier settle never rewrites it")
+        (is (some? (cron/settle-queued-delivery! home id2 "job1" nil "delivered")))))
+    (h/rm home)))
+
+(deftest delivery-drain-claims-at-most-once
+  (async done
+    (let [home (h/join (h/tmp-dir) (str "itonami-drain-" (h/random-hex 4)))
+          sent (atom 0)]
+      (h/mkdirs home)
+      (delivery/register-adapter! "tg-test" (fn [& _] (swap! sent inc) (p/resolved nil)))
+      (-> (p/let [id1 (execution-ledger/claim! home {"id" "j1"} "direct")
+                  _ (execution-ledger/mark-running! home id1)
+                  _ (delivery-queue/enqueue! home id1 {"id" "j1" "deliver" "tg-test"} "c" false)
+                  n (cron/drain-queued! {:home home :config {}})
+                  _ (do (is (= 1 n) "drained the queued send")
+                        (is (= 1 @sent) "the adapter sent once"))
+                  n2 (cron/drain-queued! {:home home :config {}})
+                  _ (is (zero? n2) "claimed at most once; nothing left pending")]
+            nil)
+          (p/catch (fn [e] (is (nil? e) (str "drain test crashed: " (.-message e)))))
+          (p/finally (fn [_ _] (done)))))))

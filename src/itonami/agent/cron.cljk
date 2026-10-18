@@ -737,6 +737,64 @@
                                   (when-not (str/blank? joined) joined))
           (when-not (str/blank? joined) joined))))))
 
+(defn settle-queued-delivery!
+  "Hermes settle_queued_delivery: write a queued delivery's terminal outcome
+  back onto the run that queued it. Fenced on the execution id — the ledger's
+  latest attempt for the job must still be this run (the job record carries
+  no completion ids, so the ledger is the fence) — and idempotent: a later
+  run's status is never rewritten. Called by the drain and by the recovery
+  sweep, exactly as in Hermes."
+  [home execution-id job-id delivery-error queue-status]
+  (let [latest (first (execution-ledger/rows home job-id))]
+    (when (and latest (= (str execution-id) (str (get latest "id"))))
+      (update-job! home job-id
+                   (fn [job]
+                     (assoc job "last_status" (if delivery-error "delivery_failed" "ok")
+                            "last_delivery_error" delivery-error)))
+      (execution-ledger/set-delivery-outcome!
+       home execution-id (get delivery-queue/ledger-outcome (str queue-status) "failed"))
+      true)))
+
+(defn- deliver-row!
+  "Send one queued row through the lane's adapter and settle it."
+  [prof row]
+  (let [home (:home prof)
+        job (try (h/json-parse (str (get row "job_json"))) (catch :default _ {}))
+        content (str (get row "content"))
+        failed? (= 1 (js/parseInt (str (get row "for_failure")) 10))
+        execution-id (str (get row "execution_id"))
+        lane (delivery-lane job failed?)
+        targets (remove #(= "local" (str/lower-case %)) (delivery/lanes lane))
+        send-one (fn [l]
+                   (let [f (or (delivery/adapter-for l) (platform-adapters/for-lane l (:config prof)))]
+                     (if (fn? f)
+                       (-> (p/let [r (f job l content {:for-failure failed?})]
+                             (cond
+                               (and (map? r) (:error r)) (str (:error r))
+                               (false? r) "delivery adapter returned false"
+                               :else nil))
+                           (p/catch (fn [e] (str "delivery adapter failed: " (.-message e)))))
+                       (p/resolved (str "delivery requested for '" l "' but no Kotoba delivery adapter is configured")))))]
+    (p/let [errs (if (seq targets) (p/all (map send-one targets)) (p/resolved []))]
+      (let [joined (str/join "; " (remove str/blank? errs))
+            status (if (str/blank? joined) "delivered" "failed")
+            error (when-not (str/blank? joined) joined)]
+        (delivery-queue/finish! home execution-id status error)
+        (settle-queued-delivery! home execution-id (str (get job "id")) error status)
+        status))))
+
+(defn drain-queued!
+  "The delivery drain: claim every pending queued send at most once, deliver
+  it through its lane's adapter, and settle the run's record. Returns the
+  number of rows drained."
+  [prof]
+  (let [home (:home prof)
+        step (fn step [n]
+               (if-let [row (delivery-queue/claim-next! home)]
+                 (p/then (deliver-row! prof row) (fn [_] (step (inc n))))
+                 (p/resolved n)))]
+    (step 0)))
+
 (declare run-job-core)
 
 (defn run-job
@@ -878,19 +936,24 @@
               ;; surfaces as an incident; it is never retried
               abandoned (delivery-queue/recover-abandoned! home)
               _ (doseq [r abandoned]
-                  (execution-ledger/upsert-incident!
-                   home (str (get (h/json-parse (str (get r "job_json"))) "id"))
-                   (str "delivery outcome unknown (owner died mid-send): " (get r "execution_id"))
-                   nil))
+                  (let [job-id (str (get (h/json-parse (str (get r "job_json"))) "id"))]
+                    (execution-ledger/upsert-incident!
+                     home job-id
+                     (str "delivery outcome unknown (owner died mid-send): " (get r "execution_id"))
+                     nil)
+                    (settle-queued-delivery! home (get r "execution_id") job-id
+                                             "delivery outcome unknown (owner died mid-send)"
+                                             "unknown")))
               due (filter #(due? % now) (read-jobs home))]
           ;; advance first: a crash mid-run must not re-fire the same slot
           (doseq [j due]
             (update-job! home (get j "id") #(assoc % "next_run_at" (some-> (next-run % now) h/iso-local))))
-          (-> (p/loop [[j & more] due acc []]
+          (-> (p/do (drain-queued! prof)
+                (p/loop [[j & more] due acc []]
                 (if (nil? j)
                   acc
                   (p/let [r (run-job prof j {:executor executor :delivery-fn delivery-fn})]
-                    (p/recur more (conj acc (assoc r :job (get j "id")))))))
+                    (p/recur more (conj acc (assoc r :job (get j "id"))))))))
               (p/then (fn [rs]
                         (let [t (str (/ (h/now-ms) 1000))]
                           (h/spit (h/join home "cron" "ticker_heartbeat") t)
