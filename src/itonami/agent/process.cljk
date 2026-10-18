@@ -1,7 +1,10 @@
 (ns itonami.agent.process
   "Background terminal processes for one Kotoba agent runtime. A registry is
-  scoped to the profile home; results stay bounded in memory and are not
-  restored after the agent process restarts."
+  scoped to the profile home; results stay bounded in memory. Running sessions
+  are checkpointed to `processes.json` in Hermes' crash-recovery format
+  (`tools/process_registry_checkpoint.py`) and re-attached as detached
+  sessions — status and kill, no pipes — when a later runtime touches the
+  home."
   (:require [clojure.string :as str]
             [promesa.core :as p]
             [itonami.agent.host :as h]))
@@ -12,6 +15,7 @@
 (def ^:private max-retained-results 64)
 (def ^:private retention-ms (* 7 24 60 60 1000))
 (defonce ^:private sessions (atom {}))
+(defonce ^:private recovered-homes (atom #{}))
 
 (defn- prune-sessions! [home]
   (let [now (h/now-ms)
@@ -27,6 +31,144 @@
       (doseq [[id _] (take excess remaining)]
         (swap! sessions dissoc id)))))
 
+;; ---- Hermes processes.json checkpoint (crash recovery) ----
+;; Entry shape is Hermes' ProcessRegistry._CHECKPOINT_FIELDS plus `session_id`;
+;; `command` is redacted before persisting and `owner_task_id` defaulted on
+;; write. Missing keys fall back to the ProcessSession dataclass defaults where
+;; the session map consumes them (command, pid_scope, host_start_time, started_at).
+
+(defn- redact-command
+  "Kotoba's equivalent of Hermes `redact_sensitive_text(command, code_file=True)`:
+  inline credentials never reach processes.json. Recovery uses command for
+  display only (adoption re-validates the PID, never re-runs it), so masking
+  is lossless."
+  [command]
+  (-> (str command)
+      (str/replace #"://[^/@\s]+:[^/@\s]*@" "://[redacted]@")
+      (str/replace #"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+" "Bearer [redacted]")
+      (str/replace #"(?i)(^|[?&\s])([A-Za-z0-9_-]*(?:token|api[-_]?key|secret|password|passwd|pwd)[A-Za-z0-9_-]*[=:\s]+)[^\s\"']+"
+                   "$1$2[redacted]")))
+
+(defn- session-pid [session]
+  (or (:pid session) (when-let [c (:child session)] (.-pid c))))
+
+(defn- ps-probe
+  "One `ps` read of a host PID: process state and start wall time, or nil when
+  the PID is gone. Zombies report dead, as Hermes `_pid_exists` does."
+  [pid]
+  (try
+    (let [out (str/trim (or (:stdout (h/run-process ["ps" "-o" "state=,lstart=" "-p" (str pid)] {})) ""))]
+      (when-not (str/blank? out)
+        (let [[state lstart] (str/split out #"\s+" 2)
+              t (.getTime (js/Date. (str/trim (or lstart ""))))]
+          {:zombie? (= state "Z")
+           :start (when-not (js/isNaN t) (/ t 1000))})))
+    (catch :default _ nil)))
+
+(defn- host-start-time
+  "PID-reuse fingerprint for `host_start_time`: field 22 of /proc/<pid>/stat
+  (Linux, kernel start ticks), else the ps start wall time as epoch seconds —
+  the same dual semantics as Hermes `get_process_start_time` (int ticks /
+  float epoch). nil when the probe cannot be read."
+  [pid]
+  (try
+    (let [stat-path (str "/proc/" pid "/stat")]
+      (if (h/exists? stat-path)
+        (let [raw (h/slurp stat-path)
+              tail (subs raw (inc (.lastIndexOf raw ")")))
+              toks (str/split (str/trim tail) #"\s+")]
+          (when (> (count toks) 19)
+            (js/parseInt (nth toks 19))))
+        (:start (ps-probe pid))))
+    (catch :default _ nil)))
+
+(defn- pid-fate
+  "Hermes `_detached_host_fate`:
+  `running` — alive and still ours (start time matches, no baseline, or the
+  start-time probe could not be read: re-attach, do not invent an exit).
+  `reused` — alive and the start time positively differs: the number belongs
+  to someone else; never adopt it and never signal it.
+  `gone` — the PID is not alive (zombies report dead): prune it."
+  [pid expected-start]
+  (let [p (when pid (ps-probe pid))]
+    (cond
+      (or (nil? p) (:zombie? p)) "gone"
+      (nil? expected-start) "running"
+      :else (let [cur (host-start-time pid)]
+              (if (or (nil? cur) (= cur expected-start)) "running" "reused")))))
+
+(defn- checkpoint-entry [session]
+  (let [pid (session-pid session)]
+    {"session_id" (:id session)
+     "command" (redact-command (:command session))
+     "pid" pid
+     "pid_scope" "host"
+     "host_start_time" (or (:host-start-time session) (host-start-time pid))
+     "systemd_unit" ""
+     "wsl_chain" false
+     "cwd" (:cwd session)
+     "started_at" (/ (:started-at session) 1000)
+     "task_id" ""
+     "owner_task_id" ""
+     "session_key" ""
+     "watcher_platform" ""
+     "watcher_chat_id" ""
+     "watcher_user_id" ""
+     "watcher_user_name" ""
+     "watcher_thread_id" ""
+     "watcher_message_id" ""
+     "watcher_interval" 0
+     "parent_session_id" ""
+     "notify_on_complete" false
+     "completion_output_chars" 0
+     "watch_patterns" []
+     "heartbeat_seconds" 0
+     "persist_on_release" false
+     "output_log" ""}))
+
+(defn- read-checkpoint [path]
+  (try
+    (let [parsed (js->clj (js/JSON.parse (h/slurp path)))]
+      (if (vector? parsed) parsed []))
+    (catch :default _ [])))
+
+(defn- adoptable-log
+  "Hermes `adoptable_log`: a checkpointed log path only when it names a process
+  output log (`.log` suffix). Kotoba spawns never set `output_log`."
+  [p]
+  (when (and (string? p) (str/ends-with? p ".log")) p))
+
+(defn- exit-path
+  "Hermes `_exit_path`: the recorded exit status beside the log."
+  [log]
+  (str/replace log #"\.log$" ".exit"))
+
+(defn- foreign-handoffs
+  "On-disk entries this registry never tracked whose log still decides an
+  outcome (Hermes `_foreign_handoffs`): an adoptable output log that exists,
+  with a recorded exit or the process still alive. Entries without a log —
+  every Kotoba spawn — are dropped by the rewrite, exactly as Hermes drops
+  them; read-merge-write only preserves worker-log handoffs."
+  [path known]
+  (filterv (fn [entry]
+             (and (map? entry)
+                  (not (contains? known (get entry "session_id")))
+                  (when-let [log (adoptable-log (get entry "output_log"))]
+                    (and (h/exists? log)
+                         (or (h/exists? (exit-path log))
+                             (= "running" (pid-fate (get entry "pid")
+                                                    (get entry "host_start_time"))))))))
+           (read-checkpoint path)))
+
+(defn- write-checkpoint! [home]
+  (let [path (h/join home "processes.json")
+        mine (->> @sessions
+                  (filter (fn [[_ s]] (and (= home (:home s)) (= :running @(:state s)))))
+                  (mapv (fn [[_ s]] (checkpoint-entry s))))
+        known (set (keys @sessions))
+        entries (into mine (foreign-handoffs path known))]
+    (h/spit-atomic path (h/json-str entries))))
+
 (defn- finish! [session code detail on-exit tmpdir]
   (when (compare-and-set! (:state session) :running :exited)
     (reset! (:exit-code session) code)
@@ -35,7 +177,8 @@
       (when on-exit (on-exit code detail))
       (finally
         (when tmpdir (h/rm tmpdir))
-        (prune-sessions! (:home session))))))
+        (prune-sessions! (:home session))
+        (write-checkpoint! (:home session))))))
 
 (defn- append-output! [session chunk]
   (swap! (:output session)
@@ -50,15 +193,73 @@
   {"session_id" (:id session)
    "command" (:command session)
    "status" (process-status session)
-   "pid" (.-pid (:child session))
+   "pid" (session-pid session)
    "cwd" (:cwd session)
    "uptime_seconds" (max 0 (quot (- (h/now-ms) (:started-at session)) 1000))})
+
+(defn- adopt-entry! [home entry]
+  (let [id (get entry "session_id")
+        pid (get entry "pid")
+        scope (or (get entry "pid_scope") "host")]
+    (when (and (string? id) (number? pid)
+               (not (contains? @sessions id))
+               ;; in-sandbox PIDs mean nothing once the env handle is gone
+               (= "host" scope))
+      (let [expected (get entry "host_start_time")]
+        ;; A start-time probe that cannot be read is not proof the PID was
+        ;; reused; only a positive mismatch refuses adoption.
+        (when (= "running" (pid-fate pid expected))
+          (let [started (get entry "started_at")
+                session {:id id :home home :command (get entry "command" "unknown")
+                         :cwd (get entry "cwd") :pid pid :child nil :detached? true
+                         :host-start-time expected
+                         :started-at (long (* 1000 (if (number? started)
+                                                     started
+                                                     (/ (h/now-ms) 1000))))
+                         :finished-at (atom nil) :state (atom :running)
+                         :exit-code (atom nil) :output (atom "")}]
+            (swap! sessions assoc id session)
+            session))))))
+
+(defn restore-checkpoint!
+  "Hermes `recover_from_checkpoint`: probe the checkpoint's PIDs and re-attach
+  the ones still ours as detached sessions (status and kill; the pipes died
+  with the old runtime, so no output survives). A recycled PID is never
+  adopted and never signalled. Returns how many sessions were adopted."
+  [home]
+  (let [path (h/join home "processes.json")
+        adopted (count (keep #(adopt-entry! home %) (read-checkpoint path)))]
+    ;; rewrite so the entries recovery did not adopt leave the checkpoint
+    (write-checkpoint! home)
+    adopted))
+
+(defn- ensure-recovered! [home]
+  (when-not (contains? @recovered-homes home)
+    (swap! recovered-homes conj home)
+    (restore-checkpoint! home)))
+
+(defn- refresh-detached!
+  "Hermes `_refresh_detached_session`: re-attach while the PID is still ours,
+  close without a collected exit status when it is gone, and drop (never
+  signal) a recycled PID."
+  [session]
+  (if-not (and (:detached? session) (= :running @(:state session)))
+    session
+    (let [fate (pid-fate (:pid session) (:host-start-time session))]
+      (case fate
+        "running" session
+        "reused" (do (swap! sessions dissoc (:id session)) nil)
+        (do (when (compare-and-set! (:state session) :running :exited)
+              (reset! (:finished-at session) (h/now-ms))
+              (prune-sessions! (:home session)))
+            session)))))
 
 (defn spawn!
   "Start the already-confined argv from confine/command. The caller owns the
   policy decision and audit record; this namespace only manages the child."
   [ctx {:keys [argv env cwd tmpdir command on-exit]}]
   (let [home (:home ctx)
+        _ (ensure-recovered! home)
         _ (prune-sessions! home)
         running (filter #(and (= home (:home %)) (= :running @(:state %))) (vals @sessions))]
     (cond
@@ -73,6 +274,7 @@
                                  :stdio #js ["pipe" "pipe" "pipe"]})
                     (catch :default e e))
             session {:id id :home home :command command :cwd cwd :child child
+                     :pid (when-not (instance? js/Error child) (.-pid child))
                      :started-at (h/now-ms) :finished-at (atom nil)
                      :state (atom :running) :exit-code (atom nil)
                      :output (atom "")}]
@@ -87,6 +289,7 @@
                                  (finish! session -1 (str (.-message e)) on-exit tmpdir)))
             (.on child "close" (fn [code signal]
                                  (finish! session code (when signal (str "signal " signal)) on-exit tmpdir)))
+            (write-checkpoint! home)
             (h/json-str (merge (result-base session)
                                {"status" "running"
                                 "note" "Use process_manage to poll, wait, read logs, send stdin, or terminate."}))))))))
@@ -118,18 +321,26 @@
   (let [timeout-ms (* 1000 (max 1 (min 1800 (or timeout-s 180))))
         started (h/now-ms)]
     (p/loop []
-      (cond
-        (= :exited @(:state session)) (snapshot session)
-        (>= (- (h/now-ms) started) timeout-ms) (assoc (snapshot session) "timed_out" true)
-        :else (p/let [_ (p/delay 100)] (p/recur))))))
+      (let [s (or (refresh-detached! session) session)]
+        (cond
+          (= :exited @(:state s)) (snapshot s)
+          (>= (- (h/now-ms) started) timeout-ms) (assoc (snapshot s) "timed_out" true)
+          :else (p/let [_ (p/delay 100)] (p/recur)))))))
 
 (defn manage
   "Hermes-shaped background process actions, scoped to this profile home."
   [ctx {:strs [action session_id data timeout offset limit]}]
+  (ensure-recovered! (:home ctx))
   (prune-sessions! (:home ctx))
   (if (= action "list")
-    (h/json-str {"processes" (mapv snapshot (filter #(= (:home ctx) (:home %)) (vals @sessions)))})
-    (let [session (when session_id (resolve-session ctx session_id))]
+    (h/json-str {"processes" (->> (vals @sessions)
+                                  (filter #(= (:home ctx) (:home %)))
+                                  (keep refresh-detached!)
+                                  (mapv snapshot))})
+    (let [session (when session_id (resolve-session ctx session_id))
+          session (when session
+                    (or (refresh-detached! session)
+                        {:error (str "process not found: " session_id)}))]
       (cond
         (nil? session_id) (h/json-str {"error" (str "session_id is required for " action)})
         (:error session) (h/json-str session)
@@ -140,18 +351,23 @@
         (if (= :exited @(:state session))
           (h/json-str (merge (snapshot session) {"status" "already_exited"}))
           (try
-            (js/process.kill (- (.-pid (:child session))) "SIGTERM")
+            ;; a detached session owns no group we track: signal the PID itself
+            (js/process.kill (if (:detached? session)
+                               (session-pid session)
+                               (- (session-pid session)))
+                             "SIGTERM")
             (h/json-str {"status" "terminating" "session_id" (:id session)})
             (catch :default e (h/json-str {"status" "error" "error" (.-message e)}))))
         (or (= action "write") (= action "submit") (= action "close"))
-        (if (or (= :exited @(:state session)) (nil? (.-stdin (:child session))))
-          (h/json-str {"status" "error" "error" "process stdin is unavailable or already closed"})
-          (try
-            (case action
-              "write" (.write (.-stdin (:child session)) (str data))
-              "submit" (.write (.-stdin (:child session)) (str data "\n"))
-              "close" (.end (.-stdin (:child session))))
-            (h/json-str {"status" "ok" "session_id" (:id session)})
-            (catch :default e (h/json-str {"status" "error" "error" (.-message e)}))))
+        (let [stdin (when-let [c (:child session)] (.-stdin c))]
+          (if (or (= :exited @(:state session)) (nil? stdin))
+            (h/json-str {"status" "error" "error" "process stdin is unavailable or already closed"})
+            (try
+              (case action
+                "write" (.write stdin (str data))
+                "submit" (.write stdin (str data "\n"))
+                "close" (.end stdin))
+              (h/json-str {"status" "ok" "session_id" (:id session)})
+              (catch :default e (h/json-str {"status" "error" "error" (.-message e)})))))
         (= action "handoff") (h/json-str {"error" "process handoff is unavailable because Kotoba delegation ownership is not implemented"})
         :else (h/json-str {"error" (str "unknown process action: " action)})))))
