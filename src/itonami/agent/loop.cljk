@@ -269,48 +269,129 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                (inc n) attempts resp))))))))))
        (fn [] (browser-runtime/close-session ctx)))))
 
+(def delegate-children
+  "subagent_id -> {goal status}. Foreground children are registered while
+  they run and kept afterwards, so action=list stays truthful."
+  (atom {}))
+
+(defn- delegate-validate-schema
+  "The parent-side check after a child returns: the final answer must parse
+  as a JSON object carrying every required key. {\"schema_valid\" …} plus
+  \"schema_errors\" on failure; the raw text is always kept as the summary."
+  [schema final]
+  (let [required (vec (get schema "required"))]
+    (if (empty? required)
+      {"schema_valid" true}
+      (let [obj (try (h/json-parse (str final)) (catch :default _ nil))]
+        (if (and (map? obj) (every? #(contains? obj %) required))
+          {"schema_valid" true}
+          {"schema_valid" false
+           "schema_errors" (if (map? obj)
+                             (vec (remove #(contains? obj %) required))
+                             ["final answer is not a JSON object"])})))))
+
+(defn- delegate-child-prompt
+  "goal + context + image hints + output_schema instruction — everything the
+  child needs, because it knows nothing of this conversation."
+  [{:strs [goal context images output_schema]}]
+  (str "## Delegated goal\n" goal
+       (when-not (str/blank? (str context))
+         (str "\n\n## Context\n" (subs (str context) 0 (min 20000 (count (str context))))))
+       (when (seq images)
+         (str "\n\n## Images (max 8; read them yourself if your tools allow)\n"
+              (str/join ", " (take 8 images))))
+       (when output_schema
+         (str "\n\n## Output\nYour final answer must be a single JSON object matching "
+              "this JSON Schema — no prose outside the JSON:\n" (h/json-str output_schema)))
+       "\n\nWork only on this delegated task. Do not delegate further."))
+
 (defn delegated-tasks
-  "Run bounded foreground child turns in Kotoba with recursive delegation and
-  persistent memory/cron tools removed. Each child receives only its own goal
-  and explicit context, never the parent's transcript."
-  [prof parent-names parent-options {:strs [tasks]}]
-  (let [tasks (if (vector? tasks) tasks [])
-        configured-max (get-in (:config prof) ["delegation" "max_concurrent_children"])
-        max-children (if (and (number? configured-max) (pos? configured-max))
-                       (min 3 (js/Math.floor configured-max))
-                       3)]
-    (cond
-      (empty? tasks) (h/json-str {"error" "delegate_task requires at least one task"})
-      (> (count tasks) max-children)
-      (h/json-str {"error" (str "delegate_task accepts at most " max-children " tasks for this profile")})
-      (some #(or (not (map? %)) (not (string? (get % "goal"))) (str/blank? (get % "goal"))) tasks)
-      (h/json-str {"error" "each delegated task needs a non-empty goal"})
-      :else
-      (let [child-names (vec (remove #(or (#{"delegate_task" "memory" "cronjob_manage"} %)
-                                             (str/starts-with? % "kanban_")) parent-names))
-            configured-budget (:budget-s parent-options)
-            budget-s (if (and (number? configured-budget) (pos? configured-budget))
-                       (min 300 configured-budget)
-                       300)
-            child-runs (mapv (fn [task]
-                               (let [raw-context (get task "context")
-                                     context (when (string? raw-context)
-                                               (subs raw-context 0 (min 20000 (count raw-context))))
-                                     prompt (str "## Delegated goal\n" (get task "goal")
-                                                 (when (and (string? context) (not (str/blank? context)))
-                                                   (str "\n\n## Context\n" context))
-                                                 "\n\nWork only on this delegated task. Do not delegate further.")
-                                     child-options (assoc parent-options
-                                                          :tool-names child-names
-                                                          :toolsets nil
-                                                          :history []
-                                                          :instructions "You are a Kotoba child agent. Return a concise result for the parent task.")]
-                                 (p/then (run prof prompt (assoc child-options :budget-s budget-s))
-                                         (fn [result]
-                                           {"goal" (get task "goal")
-                                            "status" (:exit-reason result)
-                                            "summary" (when-let [summary (:final result)]
-                                                        (subs summary 0 (min 8000 (count summary))))
-                                            "error" (get-in result [:error :error])}))))
-                             tasks)]
-        (p/then (p/all child-runs) (fn [results] (h/json-str {"results" (vec results)})))))))
+  "delegate_task, the Hermes delegation API: same name and same argument
+  shape (tasks[].goal/context/output_schema/images, action spawn|list|steer|
+  stop, subagent_id, message). Children are bounded foreground turns in
+  Kotoba with recursive delegation, clarify, memory and cron management
+  removed; each receives only its own goal and explicit context, never the
+  parent's transcript. One-shot sessions (CLI -z, cron) join their children
+  and return the results in this call, as Hermes does for a session without
+  a later-result consumer. Foreground children have no mid-run inbox and no
+  cancel: steer/stop answer honestly instead of pretending."
+  [prof parent-names parent-options {:strs [tasks action subagent_id message]}]
+  (case (or action "spawn")
+    "list" (h/json-str {"results" (vec (for [[id c] (sort-by key @delegate-children)]
+                                         (merge {"subagent_id" id} c)))})
+
+    "stop" (if-let [c (get @delegate-children subagent_id)]
+             (if (= "running" (get c "status"))
+               (h/json-str {"error" (str "stop: " subagent_id " runs joined in this call and cannot be "
+                                         "cancelled mid-turn; its partial summary arrives when the turn ends")})
+               (h/json-str {"subagent_id" subagent_id "status" (get c "status")}))
+             (h/json-str {"error" (str "no such subagent: " subagent_id)}))
+
+    "steer" (if (contains? @delegate-children subagent_id)
+              (h/json-str {"error" (str "steer: a joined child has no mid-run inbox (message: "
+                                        (pr-str message) ") — re-delegate with the correction in the goal")})
+              (h/json-str {"error" (str "no such subagent: " subagent_id)}))
+
+    ;; spawn (default)
+    (let [tasks (if (vector? tasks) tasks [])
+          configured-max (get-in (:config prof) ["delegation" "max_concurrent_children"])
+          max-children (if (and (number? configured-max) (pos? configured-max))
+                         (min 10 (js/Math.floor configured-max))
+                         10)]
+      (cond
+        (empty? tasks) (h/json-str {"error" "delegate_task requires at least one task"})
+        (> (count tasks) max-children)
+        (h/json-str {"error" (str "delegate_task accepts at most " max-children " tasks for this profile")})
+        (some #(or (not (map? %)) (not (string? (get % "goal"))) (str/blank? (get % "goal"))) tasks)
+        (h/json-str {"error" "each delegated task needs a non-empty goal"})
+        :else
+        (let [child-names (vec (remove #(or (#{"delegate_task" "clarify" "memory" "cronjob_manage"} %)
+                                            (str/starts-with? % "kanban_")) parent-names))
+              configured-budget (:budget-s parent-options)
+              budget-s (if (and (number? configured-budget) (pos? configured-budget))
+                         (min 300 configured-budget)
+                         300)
+              t0 (h/now-ms)
+              child-run (fn [task]
+                          (let [id (str "sub-" (h/random-hex 6))
+                                goal (get task "goal")
+                                schema (get task "output_schema")
+                                prompt (delegate-child-prompt task)
+                                child-options (assoc parent-options
+                                                     :tool-names child-names
+                                                     :toolsets nil
+                                                     :history []
+                                                     :instructions "You are a Kotoba child agent. Return a concise result for the parent task.")
+                                done (fn [result extra]
+                                       (let [base (merge {"subagent_id" id
+                                                          "goal" goal
+                                                          "status" (:exit-reason result)
+                                                          "summary" (when-let [summary (:final result)]
+                                                                      (subs summary 0 (min 8000 (count summary))))
+                                                          "error" (get-in result [:error :error])} extra)]
+                                         (swap! delegate-children assoc id {"goal" goal "status" (get base "status")})
+                                         base))]
+                            (swap! delegate-children assoc id {"goal" goal "status" "running"})
+                            (-> (run prof prompt (assoc child-options :budget-s budget-s))
+                                (p/then (fn [result]
+                                          (if-not schema
+                                            (done result nil)
+                                            (let [v (delegate-validate-schema schema (:final result))]
+                                              (if (get v "schema_valid")
+                                                (done result v)
+                                                ;; one bounded correction retry, then keep the raw
+                                                ;; summary and report the errors beside it
+                                                (-> (run prof (str prompt "\n\n# Correction\nYour previous answer "
+                                                                   "failed validation: " (str/join ", " (get v "schema_errors"))
+                                                                   "\nPrevious answer:\n" (subs (str (:final result)) 0 (min 4000 (count (str (:final result))))))
+                                                         (assoc child-options :budget-s budget-s))
+                                                    (p/then (fn [r2] (done r2 (delegate-validate-schema schema (:final r2)))))
+                                                    (p/catch (fn [_] (done result v)))))))))
+                                (p/catch (fn [e]
+                                           (swap! delegate-children assoc id {"goal" goal "status" "failed"})
+                                           {"subagent_id" id "goal" goal "status" "failed" "error" (.-message e)})))))
+              child-runs (mapv child-run tasks)]
+          (p/then (p/all child-runs)
+                  (fn [results]
+                    (h/json-str {"results" (vec results)
+                                 "total_duration_seconds" (/ (- (h/now-ms) t0) 1000)}))))))))

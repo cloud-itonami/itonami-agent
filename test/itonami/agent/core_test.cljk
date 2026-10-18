@@ -835,3 +835,29 @@ plain: true
     (testing "a Hermes-side requester's tilde paths still rebase (format compatibility)"
       (is (= "see /run/ws/a" (p2p/rebase-paths "see ~/.hermes/profiles/p/workspace/a" paths)))
       (is (= "see /run/home/a" (p2p/rebase-paths "see ~/.hermes/profiles/p/a" paths))))))
+
+(deftest delegate-task-hermes-api
+  ;; delegate_task carries Hermes' argument shape: tasks up to 10 with
+  ;; goal/context/output_schema/images, action spawn|list|steer|stop
+  (let [schema (first (tools/tool-schemas ["delegate_task"]))
+        params (get-in schema ["function" "parameters"])]
+    (is (= ["spawn" "list" "steer" "stop"] (get-in params ["properties" "action" "enum"])))
+    (is (= 10 (get-in params ["properties" "tasks" "maxItems"])))
+    (is (= ["goal"] (get-in params ["properties" "tasks" "items" "required"])))
+    (is (= #{"goal" "context" "output_schema" "images"}
+           (set (keys (get-in params ["properties" "tasks" "items" "properties"])))))))
+
+(deftest delegate-task-actions-and-guards
+  (let [prof {:config {}}
+        call (fn [args] (h/json-parse (agent-loop/delegated-tasks prof ["terminal" "clarify" "memory"] {} args)))]
+    (testing "spawn without tasks is refused"
+      (is (str/includes? (str (get (call {}) "error")) "at least one task")))
+    (testing "more than 10 tasks is refused (Hermes cap)"
+      (is (str/includes? (str (get (call {"tasks" (vec (repeat 11 {"goal" "g"}))}) "error")) "at most 10")))
+    (testing "a task without a non-empty goal is refused"
+      (is (str/includes? (str (get (call {"tasks" [{"context" "c"}]}) "error")) "non-empty goal")))
+    (testing "action=list answers with the joined children registry"
+      (is (vector? (get (call {"action" "list"}) "results"))))
+    (testing "steer/stop on an unknown child answer honestly"
+      (is (str/includes? (str (get (call {"action" "steer" "subagent_id" "sub-none" "message" "m"}) "error")) "no such subagent"))
+      (is (str/includes? (str (get (call {"action" "stop" "subagent_id" "sub-none"}) "error")) "no such subagent")))))
