@@ -1242,9 +1242,9 @@ plain: true
                        (do (.writeHead res 200 #js {"Content-Type" "application/json"})
                            (.end res (h/json-str {"client_id" "test-client" "token_endpoint_auth_method" "none"})))
                        (= path "/authorize")
-                       (let [redirect (.searchParams.get u "redirect_uri")
-                             state (.searchParams.get u "state")
-                             ch (.searchParams.get u "code_challenge")]
+                       (let [redirect (.get (.-searchParams u) "redirect_uri")
+                             state (.get (.-searchParams u) "state")
+                             ch (.get (.-searchParams u) "code_challenge")]
                          (reset! challenge-store ch)
                          (.writeHead res 302 #js {"Location" (str redirect "?code=mock-code&state=" state)})
                          (.end res))

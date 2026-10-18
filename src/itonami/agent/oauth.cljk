@@ -136,8 +136,8 @@
            s (http/createServer
               (fn [req qres]
                 (let [u (js/URL. (.-url req) "http://127.0.0.1")
-                      code (.searchParams.get u "code")
-                      state (.searchParams.get u "state")]
+                      code (.get (.-searchParams u) "code")
+                      state (.get (.-searchParams u) "state")]
                   (.writeHead qres 200 #js {"Content-Type" "text/plain"})
                   (.end qres "OAuth login received; you may close this window and return to the terminal.")
                   (when @server (.close @server))
