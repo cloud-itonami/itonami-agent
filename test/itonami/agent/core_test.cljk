@@ -990,3 +990,21 @@ plain: true
     (do (aset (.-env js/process) "ITONAMI_TEST_TG_TOKEN" "x")
         (is (fn? (platform-adapters/for-lane "Telegram" {"delivery" {"telegram" {"token_env" "ITONAMI_TEST_TG_TOKEN" "chat_id" "42"}}}))
             "lane names are case-insensitive"))))
+
+(deftest delegate-live-controls
+  ;; steer queues the correction into the child's next tool result; stop ends
+  ;; the child early (interrupted completion, partial output kept)
+  (let [prof {:config {}}]
+    (swap! agent-loop/delegate-children assoc "sub-live" {"goal" "g" "status" "running"})
+    (swap! agent-loop/delegate-ctl assoc "sub-live" {:steer (atom []) :cancel (atom false)})
+    (let [s (h/json-parse (agent-loop/delegated-tasks prof ["terminal"] {} {"action" "steer" "subagent_id" "sub-live" "message" "do X"}))]
+      (is (true? (get s "steered")))
+      (is (= 1 (count @(:steer (get @agent-loop/delegate-ctl "sub-live"))))))
+    (let [r (h/json-parse (agent-loop/delegated-tasks prof ["terminal"] {} {"action" "stop" "subagent_id" "sub-live"}))]
+      (is (= "stopping" (get r "status")))
+      (is (true? @(:cancel (get @agent-loop/delegate-ctl "sub-live")))))
+    (swap! agent-loop/delegate-children assoc "sub-done" {"goal" "g" "status" "completed"})
+    (is (str/includes? (str (get (h/json-parse (agent-loop/delegated-tasks prof ["terminal"] {} {"action" "steer" "subagent_id" "sub-done" "message" "m"})) "error"))
+                        "no live mid-run inbox"))
+    (reset! agent-loop/delegate-children {})
+    (reset! agent-loop/delegate-ctl {})))
