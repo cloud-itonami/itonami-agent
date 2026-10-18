@@ -104,6 +104,68 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                           "- cwd: " cwd "\n"
                           "- time: " (h/iso-local))])))
 
+;; ---------------------------------------------------------------- max_turns resolution
+;; Hermes hermes_cli/config.py:resolve_turn_limit and
+;; hermes_cli/cli_init_mixin._init_turn_limits (the case list mirrors
+;; tests/hermes_cli/test_resolve_turn_limit.py).
+
+(def turn-limit-unlimited
+  "Hermes' TURN_LIMIT_UNLIMITED is sys.maxsize (2^63-1); the JS runtime plays
+  the sentinel with Number.MAX_SAFE_INTEGER. Neither is reachable as an actual
+  turn count, so only the 'no finite cap' behavior is observable."
+  (.-MAX_SAFE_INTEGER js/Number))
+
+(def unlimited-spellings
+  "Hermes' _UNLIMITED_SPELLINGS, matched against the trimmed, lowercased
+  string."
+  #{"none" "null" "unlimited" "infinite" "infinity" "inf" "∞" "-1" "0"})
+
+(defn- parse-turn-count
+  "Python's int(s), then int(float(s)) as the fallback: optional sign, decimal
+  digits (single `_` separators between digits, which Python's int/float
+  accept), optional fraction and exponent. Returns the truncated integer, or
+  nil when Python would raise (hex, garbage, non-finite)."
+  [s]
+  (let [norm (str/replace s #"(\d)_(?=\d)" "$1")]
+    (when (re-matches #"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?" norm)
+      (let [f (js/Number norm)]
+        (when (js/Number.isFinite f) (js/Math.trunc f))))))
+
+(defn resolve-turn-limit
+  "Hermes hermes_cli/config.py:resolve_turn_limit — normalize a raw
+  `agent.max_turns` value into an int iteration cap (always >= 1). nil, bools,
+  unknown types and unparseable strings return the default (unlimited at every
+  call site); numbers truncate toward zero and any n <= 0 is unlimited. The
+  spelling table maps none/null/unlimited/infinite/infinity/inf/∞/-1/0 to
+  unlimited."
+  ([raw] (resolve-turn-limit raw turn-limit-unlimited))
+  ([raw default]
+   (cond
+     (or (nil? raw) (boolean? raw)) default
+     (number? raw) (if (js/Number.isFinite raw)
+                     (let [n (js/Math.trunc raw)]
+                       (if (<= n 0) turn-limit-unlimited n))
+                     default)
+     (string? raw) (let [s (str/trim (str/lower-case raw))]
+                     (cond
+                       (str/blank? s) default
+                       (contains? unlimited-spellings s) turn-limit-unlimited
+                       :else (if-let [n (parse-turn-count s)]
+                               (if (<= n 0) turn-limit-unlimited n)
+                               default)))
+     :else default)))
+
+(defn resolve-max-turns
+  "Hermes hermes_cli/cli_init_mixin._init_turn_limits — the turn cap is the
+  first NON-nil of (CLI/API value, agent.max_turns, root-level max_turns,
+  HERMES_MAX_ITERATIONS) resolved through resolve-turn-limit. Unset is
+  unlimited, never a fixed default; a present `false` is resolved (and becomes
+  unlimited), not skipped."
+  [opt-val config env-val]
+  (resolve-turn-limit
+   (reduce (fn [_ x] (if (some? x) (reduced x) nil)) nil
+           [opt-val (get-in config ["agent" "max_turns"]) (get config "max_turns") env-val])))
+
 (declare run delegated-tasks)
 
 (defn run
@@ -115,7 +177,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                 reasoning-effort max-tokens
                                                 history instructions before-tool tool-overrides]
                                          :as options}]
-  (let [max-turns (or max-turns (get-in config ["agent" "max_turns"]) (get config "max_turns") 90)
+  (let [max-turns (resolve-max-turns max-turns config (h/env "HERMES_MAX_ITERATIONS"))
         budget-ms (* 1000 (or budget-s (get-in config ["agent" "run_budget_seconds"]) 0))
         hops (provider/decentralize (provider/chain config {:model model :provider provider :pinned? pinned?})
                                     (:itonami prof) config)
