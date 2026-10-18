@@ -83,11 +83,12 @@
     (h/rm home)))
 
 (deftest process-handoff-hermes-outcome
-  ;; Hermes `_handoff_process` (tools/process_registry.py): a caller with no live
-  ;; parent is refused before the session is resolved. Kotoba has no
-  ;; subagent-with-live-parent concept (owner fields are empty strings), so every
-  ;; `handoff` call is legitimately "not one" — the reachable-case outcome is
-  ;; Hermes' exact error. The `data`/cap checks only run past the parent gate.
+  ;; Hermes `_handoff_process` (tools/process_registry.py): a caller with no
+  ;; live parent is refused before the session is resolved. A caller that is
+  ;; not a registered delegate child (`ctx :subagent`, the spawn-tree record
+  ;; `_active_subagents` gates on) is legitimately "not one" — the
+  ;; reachable-case outcome is Hermes' exact error. The parent-owner/cap/
+  ;; `data` checks only run past the parent gate.
   (let [home (fresh-home "handoff")
         res (parse-json (process/manage {:home home} {"action" "handoff" "session_id" "proc_x"}))]
     (testing "handoff returns Hermes' exact parent-gate error"
@@ -96,4 +97,130 @@
     (testing "handoff requires session_id, as in Hermes"
       (let [r (parse-json (process/manage {:home home} {"action" "handoff"}))]
         (is (= "session_id is required for handoff" (get r "error")))))
+    (h/rm home)))
+
+(defn- child-ctx
+  "A tool-call ctx of a running delegate child (`loop.cljk` builds this from
+  the child's `:subagent` record): raw task id = the child's subagent id."
+  [home task-id parent-owner handed]
+  {:home home :task-id task-id :session-key ""
+   :subagent {:parent-owner parent-owner :parent-session-key "" :handed handed}})
+
+(deftest process-handoff-transfers-ownership-to-parent
+  (let [home (fresh-home "handoff-transfer")
+        spawn-ctx {:home home :task-id "sub-abc123" :session-key ""}
+        res (parse-json (process/spawn! spawn-ctx {:env (h/process-env) :cwd home
+                                                   :argv ["sleep" "30"] :command "sleep 30"}))
+        id (get res "session_id")
+        handed (atom [])
+        ctx (child-ctx home "sub-abc123" "task-parent9" handed)]
+    (testing "spawn registers the raw spawning task id as owner_task_id"
+      (is (= "sub-abc123" (get res "owner_task_id")))
+      (is (= "default" (get res "task_id"))))
+    (testing "handoff transfers ownership to the parent's task id"
+      (let [r (parse-json (process/manage ctx {"action" "handoff" "session_id" id "data" "CI watcher"}))]
+        (is (= "handed_off" (get r "status")))
+        (is (= id (get r "session_id")))
+        (is (= "sleep 30" (get r "command")))
+        (is (= (str "Your parent now owns this process and will receive its "
+                    "completion; you will not. Mention the handoff in your final answer.")
+               (get r "note")))))
+    (testing "the transfer is recorded per Hermes' transfer_ownership"
+      (let [r (parse-json (process/manage ctx {"action" "poll" "session_id" id}))]
+        (is (= "task-parent9" (get r "owner_task_id")))
+        (is (= "default" (get r "task_id")))
+        (is (= "CI watcher" (get r "handoff_note"))))
+      (is (= [{"session_id" id "command" "sleep 30" "note" "CI watcher"}] @handed)))
+    (testing "the next checkpoint write persists the transferred owner"
+      (process/spawn! {:home home :task-id "other-run"} {:env (h/process-env) :cwd home
+                                                        :argv ["sleep" "30"] :command "sleep 30"})
+      (let [entries (parse-json (h/slurp (h/join home "processes.json")))
+            e (first (filter #(= id (get % "session_id")) entries))]
+        (is (some? e))
+        (is (= "task-parent9" (get e "owner_task_id")))
+        (is (= "default" (get e "task_id")))
+        (is (= "" (get e "session_key")))))
+    (doseq [p (get (parse-json (process/manage {:home home} {"action" "list"})) "processes")]
+      (try (js/process.kill (get p "pid")) (catch :default _ nil)))
+    (h/rm home)))
+
+(deftest process-handoff-refusals-match-hermes
+  (let [home (fresh-home "handoff-refuse")
+        spawn-ctx {:home home :task-id "sub-thief1" :session-key ""}
+        spawn (fn [cmd] (parse-json (process/spawn! spawn-ctx {:env (h/process-env) :cwd home
+                                                              :argv ["sleep" "30"] :command cmd})))
+        proc-a (spawn "sleep 30 a")
+        proc-b (spawn "sleep 30 b")
+        proc-c (spawn "sleep 30 c")
+        proc-d (spawn "sleep 30 d")]
+    (testing "a blank parent owner id refuses after the parent gate"
+      (let [ctx (child-ctx home "sub-thief1" "" (atom []))
+            r (parse-json (process/manage ctx {"action" "handoff"
+                                               "session_id" (get proc-a "session_id")
+                                               "data" "note"}))]
+        (is (= "parent has no process owner id yet; retry after the parent's turn has started."
+               (get r "error")))))
+    (testing "handoff requires the `data` purpose sentence"
+      (let [ctx (child-ctx home "sub-thief1" "task-parent9" (atom []))
+            r (parse-json (process/manage ctx {"action" "handoff"
+                                               "session_id" (get proc-a "session_id")}))]
+        (is (= (str "handoff requires `data`: one sentence saying what the process is for "
+                    "and what the parent should do with its result.")
+               (get r "error")))))
+    (testing "a process the caller does not own is never silently transferred"
+      (let [victim (parse-json (process/spawn! {:home home :task-id "sub-victim"}
+                                               {:env (h/process-env) :cwd home
+                                                :argv ["sleep" "30"] :command "sleep 30 victim"}))
+            ctx (child-ctx home "sub-thief1" "task-parent9" (atom []))
+            id (get victim "session_id")
+            r (parse-json (process/manage ctx {"action" "handoff" "session_id" id "data" "stolen"}))]
+        (is (= (str "cannot hand off " id ": not a running process you own (already exited? "
+                    "read its result with poll/log and report it instead).")
+               (get r "error")))))
+    (testing "an unknown session id is refused with the same outcome"
+      (let [ctx (child-ctx home "sub-thief1" "task-parent9" (atom []))
+            r (parse-json (process/manage ctx {"action" "handoff" "session_id" "proc_nope"
+                                               "data" "ghost"}))]
+        (is (= (str "cannot hand off proc_nope: not a running process you own (already exited? "
+                    "read its result with poll/log and report it instead).")
+               (get r "error")))))
+    (testing "the handoff cap is 3 per subagent, as in Hermes"
+      (let [handed (atom [])
+            ctx (child-ctx home "sub-thief1" "task-parent9" handed)
+            ids (mapv #(get % "session_id") [proc-a proc-b proc-c proc-d])
+            ok (mapv (fn [id] (parse-json (process/manage ctx {"action" "handoff"
+                                                               "session_id" id
+                                                               "data" "watcher"}))) ids)
+            r (last ok)]
+        (is (= ["handed_off" "handed_off" "handed_off"] (mapv #(get % "status") (butlast ok))))
+        (is (= (str "handoff cap reached (3 per subagent); wait on or kill the rest yourself.")
+               (get r "error")))
+        (is (= 3 (count @handed)))))
+    (doseq [p (get (parse-json (process/manage {:home home} {"action" "list"})) "processes")]
+      (try (js/process.kill (get p "pid")) (catch :default _ nil)))
+    (h/rm home)))
+
+(deftest process-ownership-survives-checkpoint-recovery
+  (let [home (fresh-home "owner-recovery")
+        child (cp/spawn "sleep" #js ["30"] #js {:detached true :stdio "ignore"})
+        pid (.-pid child)
+        path (h/join home "processes.json")
+        entries [{"session_id" "proc_owner00001" "command" "sleep 30" "pid" pid
+                  "pid_scope" "host" "host_start_time" nil "cwd" home
+                  "started_at" 1760000000.0
+                  "task_id" "session:chat7" "owner_task_id" "sub-abc123" "session_key" "chat7"}
+                 {"session_id" "proc_owner00002" "command" "sleep 30" "pid" pid
+                  "pid_scope" "host" "host_start_time" nil "cwd" home
+                  "started_at" 1760000000.0
+                  "task_id" "sub-zzz999"}]]
+    (h/spit-atomic path (h/json-str entries))
+    (let [res (parse-json (process/manage {:home home} {"action" "list"}))
+          by-id (into {} (map (juxt #(get % "session_id") identity) (get res "processes")))]
+      (testing "recovery keeps the recorded owner verbatim"
+        (is (= "sub-abc123" (get (by-id "proc_owner00001") "owner_task_id")))
+        (is (= "session:chat7" (get (by-id "proc_owner00001") "task_id"))))
+      (testing "a missing owner_task_id falls back to task_id, as in Hermes recovery"
+        (is (= "sub-zzz999" (get (by-id "proc_owner00002") "owner_task_id")))
+        (is (= "sub-zzz999" (get (by-id "proc_owner00002") "task_id")))))
+    (try (js/process.kill pid) (catch :default _ nil))
     (h/rm home)))
