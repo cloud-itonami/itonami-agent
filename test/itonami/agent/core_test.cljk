@@ -10,6 +10,7 @@
             [itonami.agent.cron :as cron]
             [itonami.agent.notepad :as notepad]
             [itonami.agent.delivery :as delivery]
+            [itonami.agent.delivery-queue :as delivery-queue]
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.tools :as tools]
@@ -938,3 +939,39 @@ plain: true
     (delivery/register-adapter! "telegram" (fn [& _] nil))
     (is (fn? (delivery/adapter-for "telegram")))
     (is (nil? (delivery/adapter-for "slack")))))
+
+(deftest delivery-queue-hermes-contract
+  (let [home (h/join (h/tmp-dir) (str "itonami-dq-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    (testing "enqueue -> claim -> finish is the durable handoff (claimed at most once)"
+      (let [q (delivery-queue/enqueue! home "exec1" {"id" "job1"} "hello" false)]
+        (is (= "pending" (get q "status")))
+        (is (true? (delivery-queue/claim-row! home "exec1")))
+        (is (false? (delivery-queue/claim-row! home "exec1")) "claimed at most once")
+        (is (true? (delivery-queue/finish! home "exec1" "delivered" nil)))
+        (is (= "delivered" (get (delivery-queue/get-status home "exec1") "status")))
+        (is (false? (delivery-queue/finish! home "exec1" "failed" "x"))
+            "a terminal row is never rewritten")))
+    (testing "terminal payloads are redacted"
+      (let [r (delivery-queue/get-status home "exec1")]
+        (is (= "" (get r "content")))
+        (is (= "{}" (get r "job_json")))))
+    (testing "a claimed send whose owner died is fenced unknown, never retried"
+      (delivery-queue/enqueue! home "exec2" {"id" "job2"} "c" false)
+      (is (true? (delivery-queue/claim-row! home "exec2")))
+      (let [db (sqlite/DatabaseSync. (delivery-queue/db-path home))]
+        (.exec db "UPDATE deliveries SET owner_pid=999999 WHERE execution_id='exec2'")
+        (.close db))
+      (let [rs (delivery-queue/recover-abandoned! home)]
+        (is (= ["exec2"] (map #(get % "execution_id") rs)))
+        (is (= "unknown" (get (delivery-queue/get-status home "exec2") "status"))))
+      (is (empty? (delivery-queue/recover-abandoned! home)) "never re-fenced"))
+    (testing "queue terminal status maps to the ledger outcome; unknown surfaces as failure"
+      (is (= "delivered" (get delivery-queue/ledger-outcome "delivered")))
+      (is (= "failed" (get delivery-queue/ledger-outcome "unknown")))
+      (is (= "suppressed" (get delivery-queue/ledger-outcome "suppressed"))))
+    (testing "claim-next claims one pending send"
+      (delivery-queue/enqueue! home "exec3" {"id" "job3"} "c3" false)
+      (is (= "exec3" (get (delivery-queue/claim-next! home) "execution_id")))
+      (is (nil? (delivery-queue/claim-next! home))))
+    (h/rm home)))

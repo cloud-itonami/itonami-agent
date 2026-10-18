@@ -1,0 +1,173 @@
+(ns itonami.agent.delivery-queue
+  "Profile-local durable handoff for cron delivery — Hermes
+  cron/delivery_queue.py + cron/delivery_outcome.py, same store
+  (`<home>/cron/deliveries.db`), same statuses and the same one-way
+  guarantees.
+
+  A run persists its send here before touching the transport. A send is
+  claimed at most once; if the claimer dies after claiming, the outcome is
+  fenced `unknown` and never retried: losing a delivery is safer than
+  duplicating a possibly-completed send. Terminal rows are pruned to
+  `delivery_tombstones` (bounded, MAX_TERMINAL_DELIVERIES) with their
+  payloads redacted."
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]
+            ["node:sqlite" :as sqlite]))
+
+(def max-terminal-deliveries 1000)
+
+(def terminal-statuses #{"delivered" "failed" "unknown" "suppressed"})
+
+(def ledger-outcome
+  "Queue terminal status -> ledger delivery_outcome. `unknown` (owner died
+  mid-send, never retried) surfaces as a failure: the user cannot be told
+  the result arrived."
+  {"delivered" "delivered" "suppressed" "suppressed" "failed" "failed" "unknown" "failed"})
+
+(defn db-path [home] (h/join home "cron" "deliveries.db"))
+
+(defn- open-db [home]
+  (let [f (db-path home)]
+    (h/mkdirs (h/dirname f))
+    (let [db (sqlite/DatabaseSync. f)]
+      (.exec db "PRAGMA journal_mode=WAL")
+      (.exec db "PRAGMA synchronous=FULL")
+      (.exec db "CREATE TABLE IF NOT EXISTS deliveries (
+        execution_id TEXT PRIMARY KEY,
+        job_json TEXT NOT NULL,
+        content TEXT NOT NULL,
+        for_failure INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL CHECK(status IN
+          ('pending','delivering','delivered','failed','unknown','suppressed')),
+        owner_process_id TEXT,
+        owner_pid INTEGER,
+        owner_started_at INTEGER,
+        created_at TEXT NOT NULL,
+        finished_at TEXT,
+        error TEXT)")
+      (.exec db "CREATE TABLE IF NOT EXISTS delivery_tombstones (
+        execution_id TEXT PRIMARY KEY,
+        terminal_status TEXT NOT NULL CHECK(terminal_status IN
+          ('delivered','failed','unknown','suppressed')),
+        finished_at TEXT)")
+      db)))
+
+(defn- row->map [r]
+  (when r
+    (into {} (for [k ["execution_id" "job_json" "content" "for_failure" "status"
+                      "owner_process_id" "owner_pid" "owner_started_at"
+                      "created_at" "finished_at" "error"]]
+               [k (aget r k)]))))
+
+(defn- prune-terminal! [db]
+  ;; Redact terminal payloads and retain only bounded outcome metadata.
+  (.exec db (str "UPDATE deliveries SET job_json='{}', content=''"
+                 " WHERE status IN ('delivered','failed','unknown','suppressed')"
+                 " AND (job_json != '{}' OR content != '')"))
+  (let [n (.get (.prepare db (str "SELECT COUNT(*) AS n FROM deliveries"
+                                  " WHERE status IN ('delivered','failed','unknown','suppressed')")))
+        excess (- (js/parseInt (str (aget n "n")) 10) max-terminal-deliveries)]
+    (when (pos? excess)
+      (.exec db (str "INSERT OR IGNORE INTO delivery_tombstones"
+                     " (execution_id, terminal_status, finished_at)"
+                     " SELECT execution_id, status, finished_at FROM deliveries"
+                     " WHERE status IN ('delivered','failed','unknown','suppressed')"
+                     " ORDER BY julianday(finished_at), finished_at,"
+                     " julianday(created_at), created_at, execution_id LIMIT " excess))
+      (.exec db (str "DELETE FROM deliveries WHERE execution_id IN ("
+                     " SELECT execution_id FROM deliveries"
+                     " WHERE status IN ('delivered','failed','unknown','suppressed')"
+                     " ORDER BY julianday(finished_at), finished_at,"
+                     " julianday(created_at), created_at, execution_id LIMIT " excess ")")))))
+
+(defn enqueue!
+  "Persist one idempotent delivery request before the send. A tombstoned
+  execution id returns its terminal outcome instead of re-queuing."
+  [home execution-id job content for-failure?]
+  (let [db (open-db home)]
+    (try
+      (let [t (.get (.prepare db (str "SELECT terminal_status, finished_at FROM delivery_tombstones"
+                                      " WHERE execution_id=?")) (str execution-id))]
+        (if t
+          {"execution_id" (str execution-id) "status" (aget t "terminal_status")
+           "finished_at" (aget t "finished_at")}
+          (do
+            (.run (.prepare db (str "INSERT OR IGNORE INTO deliveries"
+                                    " (execution_id, job_json, content, for_failure, status, created_at)"
+                                    " VALUES (?, ?, ?, ?, 'pending', ?)"))
+                  (str execution-id) (h/json-str job 2) (str content)
+                  (if for-failure? 1 0) (h/iso-local (js/Date.) true))
+            (row->map (.get (.prepare db "SELECT * FROM deliveries WHERE execution_id=?") (str execution-id))))))
+      (finally (.close db)))))
+
+(defn get-status [home execution-id]
+  (let [db (open-db home)]
+    (try
+      (if-let [r (row->map (.get (.prepare db "SELECT * FROM deliveries WHERE execution_id=?") (str execution-id)))]
+        r
+        (when-let [t (.get (.prepare db (str "SELECT execution_id, terminal_status, finished_at"
+                                             " FROM delivery_tombstones WHERE execution_id=?")) (str execution-id))]
+          {"execution_id" (aget t "execution_id") "status" (aget t "terminal_status")
+           "finished_at" (aget t "finished_at") "error" nil}))
+      (finally (.close db)))))
+
+(defn claim-row!
+  "Claim one specific pending send for this process before touching the
+  transport. false when the row is not pending (already claimed or terminal)."
+  [home execution-id]
+  (let [db (open-db home)]
+    (try
+      (let [r (.run (.prepare db (str "UPDATE deliveries SET status='delivering',"
+                                      " owner_process_id=?, owner_pid=?, owner_started_at=?"
+                                      " WHERE execution_id=? AND status='pending'"))
+                    (h/random-hex 16) (.-pid js/process) (h/now-ms) (str execution-id))]
+        (pos? (or (.-changes r) 0)))
+      (finally (.close db)))))
+
+(defn claim-next!
+  "Atomically claim one pending send (the drain's entry point). nil when the
+  queue has no pending row."
+  [home]
+  (let [db (open-db home)]
+    (try
+      (when-let [r (.get (.prepare db (str "SELECT execution_id FROM deliveries WHERE status='pending'"
+                                           " ORDER BY julianday(created_at), created_at, execution_id LIMIT 1")))]
+        (let [id (aget r "execution_id")]
+          (when (claim-row! home id)
+            (get-status home id))))
+      (finally (.close db)))))
+
+(defn finish!
+  "Terminalize a claimed send. Fenced: never rewrites a terminal row.
+  Redacts the payload and prunes terminal rows afterwards."
+  [home execution-id status error]
+  (let [db (open-db home)]
+    (try
+      (let [r (.run (.prepare db (str "UPDATE deliveries SET status=?, finished_at=?, error=?"
+                                      " WHERE execution_id=? AND status IN ('pending','delivering')"))
+                    (str status) (h/iso-local (js/Date.) true)
+                    (when error (str error)) (str execution-id))]
+        (prune-terminal! db)
+        (pos? (or (.-changes r) 0)))
+      (finally (.close db)))))
+
+(defn recover-abandoned!
+  "Rows claimed by a process that is gone are fenced `unknown` and never
+  retried (Hermes: losing a delivery is safer than duplicating a
+  possibly-completed send). Returns the recovered rows."
+  [home]
+  (let [db (open-db home)]
+    (try
+      (let [rows (.all (.prepare db (str "SELECT * FROM deliveries WHERE status='delivering'")))
+            rows (vec (for [i (range (.-length rows))] (row->map (aget rows i))))
+            dead (remove (fn [r]
+                           (let [pid (js/parseInt (str (get r "owner_pid")) 10)]
+                             (and (pos? pid) (h/pid-alive? pid))))
+                         rows)]
+        (doseq [r dead]
+          (.run (.prepare db (str "UPDATE deliveries SET status='unknown', finished_at=?"
+                                  " WHERE execution_id=? AND status='delivering'"))
+                (h/iso-local (js/Date.) true) (get r "execution_id")))
+        (when (seq dead) (prune-terminal! db))
+        (vec (map #(assoc % "status" "unknown") dead)))
+      (finally (.close db)))))

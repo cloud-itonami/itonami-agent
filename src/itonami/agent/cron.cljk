@@ -24,6 +24,7 @@
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.notepad :as notepad]
             [itonami.agent.delivery :as delivery]
+            [itonami.agent.delivery-queue :as delivery-queue]
             [itonami.agent.webguard :as webguard]))
 
 (defn cron-hint [job]
@@ -707,7 +708,7 @@
               failure (get job "deliver"))]
     (delivery/normalize-deliver-value raw)))
 
-(defn- deliver-output [job content failed? delivery-fn]
+(defn- deliver-output [home execution-id job content failed? delivery-fn]
   (let [lane (delivery-lane job failed?)
         names (delivery/lanes lane)
         targets (remove #(= "local" (str/lower-case %)) names)
@@ -723,8 +724,16 @@
                        (p/catch (fn [e] (str "delivery adapter failed: " (.-message e))))))))]
     (if (empty? targets)
       (p/resolved nil)
-      (p/let [errs (p/all (map send targets))]
+      ;; durable handoff before the transport: the send is claimed at most
+      ;; once, and a claimer that dies mid-send is fenced `unknown` (never
+      ;; retried — losing a delivery beats duplicating a completed send)
+      (p/let [_ (delivery-queue/enqueue! home execution-id job content failed?)
+              _ (delivery-queue/claim-row! home execution-id)
+              errs (p/all (map send targets))]
         (let [joined (str/join "; " (remove str/blank? errs))]
+          (delivery-queue/finish! home execution-id
+                                  (if (str/blank? joined) "delivered" "failed")
+                                  (when-not (str/blank? joined) joined))
           (when-not (str/blank? joined) joined))))))
 
 (declare run-job-core)
@@ -821,7 +830,7 @@
               f (save-output! home job doc started)
               delivery-content (or final err "")
               finished (js/Date.)]
-          (p/let [delivery-error (if silent? nil (deliver-output job delivery-content failed? delivery-fn))]
+          (p/let [delivery-error (if silent? nil (deliver-output home execution-id job delivery-content failed? delivery-fn))]
           (record-run-state! home job started failed? err delivery-error)
           (h/spit (h/join home "cron" "usage_audit.jsonl")
                   (str (h/json-str {"ts" (h/iso-local finished true) "job_id" (get job "id") "fire_id" (h/random-hex 8)
@@ -863,6 +872,14 @@
       :else
       (try
         (let [now (js/Date.)
+              ;; a claimed send whose owner died is fenced `unknown` and
+              ;; surfaces as an incident; it is never retried
+              abandoned (delivery-queue/recover-abandoned! home)
+              _ (doseq [r abandoned]
+                  (execution-ledger/upsert-incident!
+                   home (str (get (h/json-parse (str (get r "job_json"))) "id"))
+                   (str "delivery outcome unknown (owner died mid-send): " (get r "execution_id"))
+                   nil))
               due (filter #(due? % now) (read-jobs home))]
           ;; advance first: a crash mid-run must not re-fire the same slot
           (doseq [j due]
