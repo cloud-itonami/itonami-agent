@@ -448,3 +448,77 @@
                  "params" {"expression" (fill-input-js "input[autocomplete='one-time-code'],input[type=tel],input[type=text]"
                                                         (h/json-str (str code)))
                            "returnByValue" true}}))
+
+
+(defn- jerr [m] (h/json-str {"error" m}))
+(defn- jok [m] (h/json-str m))
+
+;; ---------------------------------------------------------------- browser_exec
+;; Hermes tools/browser_use_cli.py: run Python through the Browser Use CLI
+;; engine (python -m browser_harness.run) with the browser helpers the engine
+;; pre-imports; stdout comes back in the result.
+
+(defn use-engine
+  "The Browser Use CLI engine: [python -m browser_harness.run] when the
+  harness is importable, else nil. Read-only: it never installs or launches
+  a browser. The interpreter comes from browser.use_python /
+  BROWSER_USE_PYTHON / ITONAMI_PYTHON, else python3."
+  [ctx]
+  (let [py (or (some-> (get (:browser-config ctx) "use_python") str not-empty)
+               (not-empty (str (h/env "BROWSER_USE_PYTHON")))
+               (not-empty (str (h/env "ITONAMI_PYTHON")))
+               "python3")]
+    (when (zero? (:exit (h/run-process [py "-c" "import browser_harness"] {:timeout-ms 15000})))
+      [py "-m" "browser_harness.run"])))
+
+(defn- clamp-timeout [t]
+  (let [n (if (number? t) t (js/parseInt (str t) 10))]
+    (max 1 (min (if (js/isNaN n) 300 n) 1800))))
+
+(defn- redact-secrets [s] (str/replace (str s) secret-url-pattern "[redacted]"))
+
+(defn- screenshot-path [stdout]
+  (last (filter h/file? (re-seq #"(?i)/[^\s\"']+\.(?:png|jpe?g|webp)" (str stdout)))))
+
+(defn exec-code
+  "browser_exec: run Python code through the Browser Use CLI engine and
+  return its output. The session and workspace persist across calls; Python
+  variables do not. Credential-shaped strings are redacted from the output."
+  [ctx {:strs [code session timeout_s]}]
+  (cond
+    (str/blank? (str code))
+    (p/resolved (jerr (str "No code provided. Pass Python that uses the pre-imported helpers, e.g. "
+                          "new_tab(\"https://example.com\") then print(page_info()).")))
+    (and (not (str/blank? (str session))) (not (re-matches #"[A-Za-z0-9_-]{1,64}" (str session))))
+    (p/resolved (jerr (str "Invalid session name " (pr-str (str session)) ": use 1-64 letters, digits, "
+                          "dashes, or underscores (e.g. 'r7k2').")))
+    :else
+    (if-let [cmd (use-engine ctx)]
+      (let [workspace (h/join (:home ctx) "cache" "browser-use" "workspace"
+                              (str/replace (str (if (str/blank? (str session)) "default" session))
+                                           #"[^A-Za-z0-9_-]" "_"))
+            _ (h/mkdirs workspace)
+            env (cond-> {"BH_AGENT_WORKSPACE" workspace}
+                  (not (str/blank? (str session))) (assoc "BU_NAME" (str session)))
+            timeout (clamp-timeout timeout_s)
+            r (h/run-process cmd {:input (str code) :env env :timeout-ms (* 1000 timeout)})]
+        (cond
+          (:timed-out? r)
+          (p/resolved (jerr (str "browser-use exec timed out after " timeout "s. The daemon may still be "
+                                "working; retry with a larger timeout_s (max 1800), or split the work into "
+                                "several calls that append to workspace files — anything already written to "
+                                "the workspace is preserved.")))
+          :else
+          (let [stderr (redact-secrets (str/trim (str (:stderr r))))
+                shot (screenshot-path (:stdout r))
+                result (cond-> {"success" (zero? (:exit r))
+                                "exit_code" (:exit r)
+                                "output" (redact-secrets (:stdout r))
+                                "workspace" workspace}
+                         (not (str/blank? (str session))) (assoc "session" (str session))
+                         (not (str/blank? stderr)) (assoc "stderr" (if (> (count stderr) 4000) (str (subs stderr 0 4000) "\n... (stderr truncated)") stderr))
+                         shot (assoc "screenshot_path" shot))]
+            (p/resolved (jok result)))))
+      (p/resolved (jerr (str "browser-harness is missing from the Python environment. Install it into the "
+                            "interpreter named by browser.use_python (or run `hermes update` on a Hermes "
+                            "install)."))))))

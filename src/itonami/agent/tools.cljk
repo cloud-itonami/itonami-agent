@@ -147,6 +147,12 @@
               {"handle" {"type" "string" "description" "A handle from browser_vault_list."}
                "task_id" {"type" "string"}}
               ["handle"])
+   "browser_exec"
+   (fn-schema "browser_exec" "Drive a real web browser via the Browser Use CLI: `code` runs as full Python (stdlib available) with pre-imported browser helpers; stdout comes back in the result. Start `code` with a one-line comment describing the step for the user in plain language, max 60 chars. STATE: the browser session and workspace persist across calls; Python variables do NOT. The workspace dir is in every result; functions defined in agent_helpers.py there are auto-imported into every call."
+              {"code" {"type" "string" "description" "Python code to execute using the pre-imported browser helpers. Use print(...) for any data you need back."}
+               "session" {"type" "string" "description" "Named isolated browser session — its own daemon, so concurrent tasks don't share tabs. Reuse the same name on every related call; omit for the shared default session."}
+               "timeout_s" {"type" "integer" "default" 300 "description" "Max seconds to wait for the code to finish (default 300, max 1800)."}}
+              ["code"])
    "skills_list"
    (fn-schema "skills_list" "List available profile skills with names, descriptions, and categories. Use skill_view(name) to load a skill."
               {"category" {"type" "string" "description" "Optional category filter"}}
@@ -2550,7 +2556,7 @@
    "browser_cdp" browser/cdp-send "browser_dialog" browser/dialog
    "browser_vault_list" browser-vault-list "browser_vault_unlock" browser-vault-unlock
    "browser_vault_save_login" browser-vault-save-login "browser_vault_enter_code" browser-vault-enter-code
-   "browser_vault_fill" browser-vault-fill
+   "browser_vault_fill" browser-vault-fill "browser_exec" browser/exec-code
    "browser_vision" browser-vision
    "vision_analyze" vision-analyze
    "computer_use" computer-use/call
