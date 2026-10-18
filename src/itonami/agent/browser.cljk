@@ -413,3 +413,38 @@
                    "params" {"accept" (= "accept" (str action))
                              "promptText" (or prompt_text "")}
                    "target_id" dialog_id})))
+
+
+;; ---------------------------------------------------------------- vault fills over CDP
+;; The secret goes into the PAGE over the CDP socket, never into the
+;; conversation (the Hermes supervisor-socket contract).
+
+(defn- fill-input-js [selector value-js]
+  (str "(() => { const el = document.querySelector(" (h/json-str selector) ");"
+       " if (!el) return false;"
+       " const proto = Object.getPrototypeOf(el);"
+       " const desc = Object.getOwnPropertyDescriptor(proto, 'value')"
+       "   || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');"
+       " desc.set.call(el, " value-js ");"
+       " el.dispatchEvent(new Event('input', {bubbles: true}));"
+       " el.dispatchEvent(new Event('change', {bubbles: true}));"
+       " return true; })()"))
+
+(defn fill-password!
+  "Fill the current page's password field over CDP. Resolves
+  {\"success\" true \"filled\" bool} or {\"error\" ...}. The value is never
+  echoed in the result."
+  [ctx secret]
+  (cdp-send ctx {"method" "Runtime.evaluate"
+                 "params" {"expression" (fill-input-js "input[type=password]:not([disabled])"
+                                                        (h/json-str (str secret)))
+                           "returnByValue" true}}))
+
+(defn fill-code!
+  "Fill a one-time code into the current page (one-time-code input, else the
+  focused element) over CDP. The code is never echoed."
+  [ctx code]
+  (cdp-send ctx {"method" "Runtime.evaluate"
+                 "params" {"expression" (fill-input-js "input[autocomplete='one-time-code'],input[type=tel],input[type=text]"
+                                                        (h/json-str (str code)))
+                           "returnByValue" true}}))

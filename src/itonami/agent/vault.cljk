@@ -1,0 +1,113 @@
+(ns itonami.agent.vault
+  "The credential vault behind browser_vault (Hermes agent/vault_store.py +
+  tools/browser_vault_tool.py): login handles + metadata are agent-visible;
+  passwords and TOTP seeds never enter the conversation. Host-local state —
+  the store is encrypted at rest (vault.json.enc + a 0600 key file) and the
+  write path is the CLI (`itonami-agent vault add`), as in Hermes.
+
+  External managers (1Password/Bitwarden) are separate Hermes backends that
+  unlock through the user's surface; this node carries the local store only
+  and says so honestly."
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]
+            ["node:crypto" :as crypto]))
+
+(defn- vault-dir [home] (h/join home "vault"))
+(defn- vault-path [home] (h/join (vault-dir home) "vault.json.enc"))
+(defn- key-path [home] (h/join (vault-dir home) "vault.key"))
+
+(defn- key-bytes [home]
+  (let [f (key-path home)]
+    (if (h/file? f)
+      (js/Buffer.from (str/trim (h/slurp f)) "hex")
+      (let [k (crypto/randomBytes 32)]
+        (h/mkdirs (vault-dir home))
+        (h/spit f (str (.toString k "hex")) {:mode 384})
+        k))))
+
+(defn- encrypt [home plain]
+  (let [iv (crypto/randomBytes 12)
+        c (crypto/createCipheriv "aes-256-gcm" (key-bytes home) iv)
+        enc (str (.update c plain "utf8" "hex") (.final c "hex"))
+        tag (.getAuthTag c)]
+    (str (.toString iv "hex") ":" (.toString tag "hex") ":" enc)))
+
+(defn- decrypt [home blob]
+  (let [[iv-hex tag-hex data] (str/split (str blob) #":" 3)
+        d (crypto/createDecipheriv "aes-256-gcm" (key-bytes home) (js/Buffer.from iv-hex "hex"))]
+    (.setAuthTag d (js/Buffer.from tag-hex "hex"))
+    (str (.update d data "hex" "utf8") (.final d "utf8"))))
+
+(defn load-logins
+  "The whole store as a map handle -> login record. {} on missing/corrupt."
+  [home]
+  (try (if-let [raw (when (h/file? (vault-path home)) (decrypt home (h/slurp (vault-path home))))]
+         (let [m (h/json-parse raw)] (if (map? m) m {}))
+         {})
+       (catch :default _ {})))
+
+(defn- save-logins! [home m]
+  (h/mkdirs (vault-dir home))
+  (h/spit (vault-path home) (encrypt home (h/json-str m)) {:mode 384}))
+
+(defn login-meta
+  "What the agent may see: handles and metadata, never passwords."
+  [home handle]
+  (when-let [r (get (load-logins home) (str handle))]
+    {"handle" (str handle) "backend" "local" "label" (get r "label" "")
+     "kind" "login" "origin" (get r "origin" "")
+     "available" (not (str/blank? (str (get r "origin" ""))))
+     "identifier" (get r "username" "") "identifier_type" "username"
+     "two_factor" (if (not (str/blank? (str (get r "totp_seed" "")))) "automatic" nil)}))
+
+(defn add-login!
+  "Store one login (CLI write path). Returns its handle. Secrets stay in the
+  encrypted store."
+  [home {:keys [label username password origin totp-seed]}]
+  (let [handle (str "vh-" (h/random-hex 8))
+        m (load-logins home)]
+    (save-logins! home (assoc m handle {"label" (str label) "username" (str username)
+                                        "password" (str password) "origin" (str origin)
+                                        "totp_seed" (str (or totp-seed ""))}))
+    handle))
+
+(defn remove-login! [home handle]
+  (let [m (load-logins home)]
+    (when (contains? m (str handle))
+      (save-logins! home (dissoc m (str handle)))
+      true)))
+
+(defn secret
+  "The password or TOTP seed for a handle. Internal plumbing only — never
+  return this to the model."
+  [home handle field]
+  (get (get (load-logins home) (str handle)) field))
+
+;; ---------------------------------------------------------------- TOTP (RFC 6238)
+
+(defn- base32-decode [s]
+  (let [alphabet "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+        idx (into {} (map-indexed (fn [i c] [c i]) alphabet))
+        bits (apply str (for [c (str/replace (str/upper-case (str s)) #"[\s=]" "")
+                              :let [v (get idx c)]]
+                          (do (when-not v (throw (ex-info "invalid base32 TOTP seed" {})))
+                              (.padStart (.toString (js/BigInt v) 2) 5 "0"))))
+        groups (partition 8 bits)
+        bytes (mapv (fn [g] (js/parseInt (apply str g) 2)) groups)]
+    (js/Buffer.from (clj->js bytes))))
+
+(defn mint-totp
+  "RFC 6238, SHA-1, 6 digits, 30s step. The code is minted server-side and
+  goes into the page — it never enters the conversation."
+  [seed & [now-ms]]
+  (let [t (quot (or now-ms (h/now-ms)) 30000)
+        msg (doto (js/Buffer.alloc 8) (.writeBigUInt64BE (js/BigInt t)))
+        h (crypto/createHmac "sha1" (base32-decode seed))
+        _ (.update h msg)
+        digest (.digest h)
+        offset (bit-and (aget digest (dec (.-length digest))) 0x0f)
+        bin (bit-or (bit-shift-left (bit-and (aget digest offset) 0x7f) 24)
+                    (bit-shift-left (bit-and (aget digest (+ offset 1)) 0xff) 16)
+                    (bit-shift-left (bit-and (aget digest (+ offset 2)) 0xff) 8)
+                    (bit-and (aget digest (+ offset 3)) 0xff))]
+    (.padStart (str (mod bin 1000000)) 6 "0")))
