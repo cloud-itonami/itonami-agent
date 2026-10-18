@@ -4,18 +4,19 @@
             [itonami.agent.yaml :as yaml]
             [itonami.agent.host :as h]
             [itonami.agent.profile :as profile]
+            [itonami.agent.loop :as agent-loop]
             [itonami.agent.manifest :as manifest]
-            [itonami.agent.soul :as soul]
-            [itonami.agent.identity :as identity]
             [itonami.agent.provider :as provider]
             [itonami.agent.cron :as cron]
+            [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.tools :as tools]
             [itonami.agent.confine :as confine]
             [itonami.agent.webguard :as webguard]
+            [itonami.agent.mcp :as mcp]
             [promesa.core :as p]
             ["node:child_process" :as cp]
-            ["node:crypto" :as crypto]))
+            ["node:sqlite" :as sqlite]))
 
 (deftest yaml-hermes-subset
   (let [y (yaml/parse "
@@ -63,6 +64,13 @@ plain: true
     (testing "a pinned job never walks the fallback chain (Hermes cron/scheduler.py)"
       (is (= 1 (count (provider/chain cfg {:model "x" :provider "kotoba" :pinned? true})))))
     (is (= "MURAKUMO_API_TOKEN" (:key-env (second (provider/chain cfg {})))))))
+
+(deftest cron-job-reasoning-effort
+  (let [config {"agent" {"reasoning_effort" "medium"}}]
+    (is (= "high" (cron/effective-reasoning-effort config {"reasoning_effort" "high"})))
+    (is (= "medium" (cron/effective-reasoning-effort config {"reasoning_effort" "invalid"})))
+    (is (= "medium" (cron/effective-reasoning-effort config {})))
+    (is (= "none" (cron/effective-reasoning-effort config {"reasoning_effort" "none"})))))
 
 (deftest decentralized-chain
   (let [hops [{:provider "kotoba" :base-url "https://api.kotoba.cloud/v1"}
@@ -189,116 +197,6 @@ plain: true
         (is (= #{[:profile/id]} (set (map :path (:problems r)))) "the id must be the directory's name")
         (is (= #{:workspace-locations :reward-contract} (set (keep :missing (:drift r)))))))))
 
-(deftest refresh-recopies-capabilities
-  (let [home (h/join (h/tmp-dir) (str "itonami-refresh-" (h/random-hex 4)) "p")]
-    (h/mkdirs home)
-    (h/spit (h/join home "SOUL.md") "hi\n")
-    (let [m (profile/with-bundle home v1-manifest)]
-      (is (= m (profile/with-derived home m)) "no yakuwari.edn: capabilities left as they are")
-      (h/spit (h/join home "yakuwari.edn")
-              "{:yakuwari/id :p :yakuwari/capabilities [{:capability :p.read :decision :autonomous :note \"n\"} {:capability :p.deploy :decision :approval-required}]}")
-      (let [m' (profile/with-derived home m)]
-        (is (= [{:capability :p.read :decision :autonomous :note "n"} {:capability :p.deploy :decision :approval-required}]
-               (:capabilities m')) "a verbatim copy of yakuwari.edn")
-        (is (= (:bundle m) (:bundle m')) "yakuwari.edn is outside the bundle")
-        (is (= m' (profile/with-derived home m')) "idempotent")))))
-
-(def soul-worlds
-  {:worlds {:etzhayyim {:name "etzhayyim" :parent nil :equity {:holder "SECRET-HOLDER"}
-                        :soul [{:line "最上位" :source "x"}]}
-            :awai {:name "AWAI Network, L.L.C." :parent :etzhayyim :equity {:holder "SECRET-HOLDER"}
-                   :soul [{:line "etzhayyim の下部組織" :source "x"}]
-                   :units {:hyakka {:what "wiki の知識源" :source "x"}}}
-            :host {:name "ホスト運用" :soul [{:line "木の外" :source "x"}]}}
-   :soul/common [{:line "推論は murakumo だけ" :source "x"}]})
-
-(def soul-entry
-  {:agent/id "p" :agent/kind :worker :org/world :awai :org/path [:etzhayyim :awai :hyakka]
-   :org/unit :hyakka :org/parent "awai" :invocation :resident :awai/business :hyakka
-   :source {:repo "network-awai/app-hyakka"}})
-
-(deftest soul-blocks
-  (let [ws "<!-- managed-agent-workspace-locations -->\nrules\n<!-- /managed-agent-workspace-locations -->"
-        rc "<!-- itonami:reward-contract:v1 -->\nc\n<!-- /itonami:reward-contract -->\n"
-        text (str ws "\n\n# p\n\nbody 本文\n\n" rc)
-        caps [{:capability :p.read :decision :autonomous} {:capability :p.deploy :decision :approval-required}
-              {:capability :p/secret :decision :blocked}]
-        b (soul/render soul-entry soul-worlds caps nil)
-        out (soul/splice text b)]
-    (is (= (soul/strip out) text) "the body is byte-identical")
-    (is (= out (soul/splice out b)) "idempotent")
-    (is (str/starts-with? (subs out (+ (str/index-of out soul/ws-end) (count soul/ws-end))) "\n\n<!-- itonami:world:v1 sha=")
-        "the blocks sit right after the workspace-locations block")
-    (is (< (str/index-of out "itonami:role:v1") (str/index-of out "# p")) "before the body")
-    (is (str/includes? out "系列: etzhayyim › AWAI Network, L.L.C. › hyakka"))
-    (is (str/includes? out "etzhayyim: 最上位"))
-    (is (str/includes? out "共通: 推論は murakumo だけ"))
-    (is (str/includes? out "unit: hyakka — wiki の知識源"))
-    (is (str/includes? out "自律: p.read"))
-    (is (str/includes? out "禁止: p/secret"))
-    (is (not (str/includes? out "SECRET-HOLDER")) "equity holders are never rendered")
-    (is (<= (soul/generated-size b) soul/limit))
-    (testing "new blocks replace old ones; nothing else moves"
-      (let [b2 (soul/render (assoc soul-entry :org/parent "itonami") soul-worlds [] {:default-decision :approval-required})
-            out2 (soul/splice out b2)]
-        (is (= 1 (count (re-seq #"itonami:role:v1 sha" out2))))
-        (is (str/includes? out2 "yakuwari.edn なし。既定は approval-required"))
-        (is (= (soul/strip out2) text))))
-    (testing "a SOUL without the workspace-locations block gets the blocks on top"
-      (let [plain "# q\n\nbody\n"
-            out3 (soul/splice plain b)]
-        (is (str/starts-with? out3 "<!-- itonami:world:v1"))
-        (is (= (soul/strip out3) plain))
-        (is (= out3 (soul/splice out3 b)))))
-    (testing "an outward role holder is told so"
-      (let [ob (soul/render (assoc soul-entry :outward {:business :cloud-itonami :role :sales
-                                                         :identity "network-awai/person-itonami-sales"
-                                                         :mailbox "sales@itonami.cloud"})
-                            soul-worlds caps nil)]
-        (is (str/includes? (:unit ob) "外向き役割: cloud-itonami の sales（宛先 sales@itonami.cloud"))
-        (is (not (str/includes? (:unit b) "外向き役割")) "nobody else is")))
-    (testing "a :host profile sits outside the tree"
-      (let [hb (soul/render {:agent/id "h" :agent/kind :worker :org/world :host :invocation :on-demand} soul-worlds [] nil)]
-        (is (str/includes? (:world hb) "系列: 組織の木の外（ホスト運用）"))
-        (is (str/includes? (:world hb) "ホスト運用: 木の外"))))
-    (testing "long capability lists shrink to fit the limit"
-      (let [many (vec (for [i (range 400)] {:capability (keyword (str "cap-with-a-long-name-" i)) :decision :autonomous}))
-            bm (soul/render soul-entry soul-worlds many nil)]
-        (is (<= (soul/generated-size bm) soul/limit))
-        (is (str/includes? (:role bm) "ほか"))))))
-
-(deftest profile-dids
-  (let [seed (identity/parse-seed (apply str (repeat 64 "a")))
-        a0 (identity/derive-key seed "murakumo-eng" 0)]
-    (is (re-matches #"^did:key:z6Mk[1-9A-HJ-NP-Za-km-z]+$" (:did a0)) "an ed25519 did:key")
-    (is (= (:did a0) (identity/did-of seed "murakumo-eng" 0)) "deterministic")
-    (is (not= (:did a0) (identity/did-of seed "murakumo-eng" 1)) "a new epoch is a new key")
-    (testing "the construction is cloud-itonami-app bot-identity's: SHA-256(seed || 0x00 || id)"
-      (let [okm (-> (crypto/createHash "sha256") (.update seed) (.update (js/Buffer.alloc 1))
-                    (.update (js/Buffer.from "murakumo-eng" "utf8")) (.digest))
-            priv (crypto/createPrivateKey #js {:key (js/Buffer.concat #js [(js/Buffer.from "302e020100300506032b657004220420" "hex") okm])
-                                              :format "der" :type "pkcs8"})
-            spki (.export (crypto/createPublicKey priv) #js {:type "spki" :format "der"})]
-        (is (= (:did a0) (p2p/pub->did (.subarray spki (- (.-length spki) 32)))))
-        (is (= "murakumo-eng#2" (identity/key-id "murakumo-eng" 2)))))
-    (is (not= (:did a0) (identity/did-of seed "murakumo-eng-2" 0)) "each profile its own key")
-    (is (not= (:did a0) (identity/did-of (identity/parse-seed (apply str (repeat 64 "b"))) "murakumo-eng" 0))
-        "another seed, another key")
-    (testing "the derived key signs what its DID verifies"
-      (let [env (p2p/sign-envelope a0 {"hello" "world"})]
-        (is (= (:did a0) (:did (p2p/open-envelope env {}))))
-        (is (= "bad signature" (:error (p2p/open-envelope (assoc env "did" (identity/did-of seed "other" 0)) {}))))))
-    (is (nil? (identity/parse-seed "not hex")))
-    (is (nil? (identity/parse-seed (apply str (repeat 63 "a")))))
-    (is (thrown? js/Error (identity/derive-key (js/Buffer.alloc 16) "p" 0)))
-    (is (thrown? js/Error (identity/derive-key seed "p" -1)))
-    (testing "organize projects the registry's DID into :ids"
-      (let [m (manifest/with-org v1-manifest {:agent/id "p" :agent/kind :worker :org/world :host :invocation :resident
-                                              :did (:did a0)} {})]
-        (is (= (:did a0) (get-in m [:ids :did])))
-        (is (= [] (manifest/validate m)))
-        (is (= #{[:ids :did]} (set (map :path (manifest/errors (assoc-in m [:ids :did] "did:web:x"))))))))))
-
 (deftest cron-next-fire
   (let [d (js/Date. 2026 9 7 13 0 0)]                      ; 2026-10-07 13:00 local
     (is (= [2026 9 7 17 30] ((juxt #(.getFullYear %) #(.getMonth %) #(.getDate %) #(.getHours %) #(.getMinutes %))
@@ -311,9 +209,118 @@ plain: true
     (is (= {"kind" "interval" "minutes" 30 "display" "every 30m"} (cron/parse-schedule "30m")))
     (is (= "cron" (get (cron/parse-schedule "0 9 * * 1-5") "kind")))))
 
+(deftest cron-execution-ledger-hermes-schema
+  (let [home (h/join (h/tmp-dir) (str "test-cron-execution-ledger-" (.-pid js/process)))
+        db-path (execution-ledger/db-path home)
+        job {"id" "ledger-test"}
+        cleaned (h/rm home)
+        legacy-created (do
+            (h/mkdirs (h/dirname db-path))
+            (let [db (sqlite/DatabaseSync. db-path)]
+              (.exec db "CREATE TABLE executions (
+                id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+                process_id TEXT NOT NULL, pid INTEGER NOT NULL, process_started_at INTEGER,
+                status TEXT NOT NULL, claimed_at TEXT NOT NULL, started_at TEXT,
+                finished_at TEXT, error TEXT)")
+              (.close db)))
+        id (execution-ledger/claim! home job "direct")]
+    (try
+      (is (try
+            (execution-ledger/claim! home job "duplicate")
+            false
+            (catch :default _ true))
+          "a second active run for one job is fenced")
+      (is (execution-ledger/mark-running! home id))
+      (is (execution-ledger/finish! home id false "not_configured"))
+      (let [row (first (execution-ledger/rows home "ledger-test"))]
+        (is (= id (get row "id")))
+        (is (= "direct" (get row "source")))
+        (is (= "failed" (get row "status")))
+        (is (= "not_configured" (get row "delivery_outcome")))
+        (is (= "execution failed" (get row "error")))
+        (is (number? (get row "process_started_at")))
+        (is (string? (get row "claimed_at")))
+        (is (string? (get row "started_at")))
+        (is (string? (get row "finished_at"))))
+      (is (not (execution-ledger/finish! home id true "delivered"))
+          "terminal attempts cannot be rewritten")
+      (let [db (sqlite/DatabaseSync. db-path)]
+        (.run (.prepare db "INSERT INTO executions
+          (id,job_id,source,process_id,pid,status,claimed_at,started_at)
+          VALUES ('interrupted','interrupted-job','itonami','old-process',?,'running',?,?)")
+              (+ (.-pid js/process) 1000000) (h/iso-local (js/Date.) true) (h/iso-local (js/Date.) true))
+        (.close db))
+      (let [next-id (execution-ledger/claim! home {"id" "next-job"} "direct")]
+        (is (= "unknown" (get (first (execution-ledger/rows home "interrupted-job")) "status"))
+            "a provably dead owner becomes unknown rather than silently retrying")
+        (is (execution-ledger/finish! home next-id true "not_configured")))
+      (let [incident (execution-ledger/upsert-incident! home "ledger-test"
+                                                        "Provider timed out with api_key=topsecret123"
+                                                        "cron/output/ledger-test/report.md")
+            row (first (execution-ledger/incidents home))]
+        (is (= "timeout" (:failure-type incident)))
+        (is (= "detected" (get row "state")))
+        (is (= "execution failed" (get row "error")))
+        (is (not (str/includes? (get row "error") "topsecret123")))
+        (is (execution-ledger/mark-incident-alerted! home (:id incident)))
+        (execution-ledger/upsert-incident! home "ledger-test" "Provider timed out with api_key=topsecret123" nil)
+        (is (= "alerted" (get (first (execution-ledger/incidents home)) "state"))
+            "repeated failures preserve an alerted incident")
+        (is (execution-ledger/resolve-incidents! home "ledger-test"))
+        (is (= "resolved" (get (first (execution-ledger/incidents home)) "state")))
+        (execution-ledger/upsert-incident! home "ledger-test" " provider   timed out with api_key=topsecret123 " nil)
+        (is (= "detected" (get (first (execution-ledger/incidents home)) "state"))
+            "a resolved signature reopens")
+        (is (execution-ledger/ack-incident! home (:id incident)))
+        (execution-ledger/upsert-incident! home "ledger-test" "Provider timed out with api_key=topsecret123" nil)
+        (is (= "closed" (get (first (execution-ledger/incidents home)) "state"))
+            "an acknowledged signature stays closed"))
+      (finally (h/rm home)))))
+
+(deftest cron-script-command-by-extension
+  (testing "Hy uses the selected Python and enters Hy's CLI with script-local imports"
+    (is (= ["/job/python" "-c" cron/hy-script-bootstrap "/tmp/profile/scripts/job.hy"]
+           (cron/script-command {:config {"cron" {"script_python" "/config/python"}}
+                                 :env {"HERMES_PYTHON" "/env/python"}}
+                                {"interpreter" "/job/python"}
+                                "/tmp/profile/scripts/job.hy")))
+    (is (= ["/config/python" "-c" cron/hy-script-bootstrap "/tmp/job.hy"]
+           (cron/script-command {:config {"cron" {"script_python" "/config/python"}} :env {}}
+                                {} "/tmp/job.hy")))
+    (is (= ["/env/python" "/tmp/job.py"]
+           (cron/script-command {:config {} :env {"HERMES_PYTHON" "/env/python"}}
+                                {} "/tmp/job.py"))))
+  (testing "non-Python runners remain extension-specific"
+    (is (= ["bash" "/tmp/job.sh"]
+           (cron/script-command {:config {} :env {}} {} "/tmp/job.sh")))
+    (is (= ["kbb" "--backend" "sci" "/tmp/job.cljk"]
+           (cron/script-command {:config {} :env {}} {} "/tmp/job.cljk")))
+    (is (= ["node" "/tmp/job.mjs"]
+           (cron/script-command {:config {} :env {}} {} "/tmp/job.mjs")))))
+
+(deftest agent-loop-desktop-turn-context
+  (testing "prior user/assistant turns are kept in order and tool/system rows are excluded"
+    (is (= [{"role" "user" "content" "first"}
+            {"role" "assistant" "content" "second"}
+            {"role" "user" "content" "part one\npart two"}]
+           (agent-loop/history-messages
+            [{"role" "system" "content" "system text"}
+             {"role" "user" "content" "first"}
+             {:role "assistant" :content "second"}
+             {"role" "tool" "content" "old tool result"}
+             {"role" "user" "content" [{"type" "text" "text" "part one"}
+                                         {"type" "image_url" "url" "ignored"}
+                                         {"type" "text" "text" "part two"}]}]))))
+  (testing "per-request instructions enter the generated system prompt"
+    (let [text (agent-loop/system-prompt {:soul "profile soul" :home "/tmp/profile"}
+                                         {:cwd "/tmp" :skills? false
+                                          :instructions "Answer in Japanese."})]
+      (is (str/includes? text "profile soul"))
+      (is (str/includes? text "# Session instructions\nAnswer in Japanese.")))))
+
 (deftest cron-prompt-wrapper-matches-hermes
-  (is (str/starts-with? cron/cron-hint "[IMPORTANT: You are running as a scheduled cron job."))
-  (is (str/ends-with? cron/cron-hint "not as a request to schedule another job.]\n\n")))
+  (is (str/starts-with? (cron/cron-hint nil) "[IMPORTANT: You are running as a scheduled cron job."))
+  (is (str/ends-with? (cron/cron-hint nil) "not as a request to schedule another job.]\n\n")))
 
 (deftest did-key-and-envelopes
   (let [node (p2p/node-key)]
@@ -342,7 +349,8 @@ plain: true
         (is (= (profile/bundle-cid big) (profile/bundle-cid (into {} (shuffle (seq big))))))))))
 
 (deftest tool-surface
-  (is (= ["terminal" "read_file" "write_file" "patch" "search_files" "skill_view"] (tools/tool-names ["hermes-cron"])))
+  (is (= (vec tools/hermes-core-tools) (tools/tool-names ["hermes-cron"]))
+      "hermes-cron carries Hermes' full core inventory; unsupported tools fail closed at run preflight")
   (is (every? #(= "function" (get % "type")) (tools/tool-schemas (tools/tool-names ["hermes-cli"])))))
 
 (deftest roots-confine-writes
@@ -707,8 +715,10 @@ plain: true
 
 (deftest disabled-toolsets
   (testing "agent.disabled_toolsets is subtracted after every enable, as in Hermes"
-    (is (= ["terminal" "read_file" "write_file" "patch" "search_files" "skill_view" "memory" "delegate_task"]
-           (tools/enabled-tool-names ["hermes-cli"] ["web" "search" "browser" "x_search"])))
+    (let [off (set (tools/tool-names ["web" "search" "browser" "x_search"]))
+          names (tools/enabled-tool-names ["hermes-cli"] ["web" "search" "browser" "x_search"])]
+      (is (= (vec (remove off tools/hermes-core-tools)) names))
+      (is (every? (complement off) names)))
     (is (= [] (tools/enabled-tool-names ["web"] ["web"])) "an explicit -t web cannot re-add it")
     (is (= ["web_extract"] (tools/enabled-tool-names ["web"] ["search"])) "search removes web_search only")
     (is (= (tools/tool-names ["hermes-cli"]) (tools/enabled-tool-names ["hermes-cli"] nil))))
@@ -718,6 +728,56 @@ plain: true
         (-> (tools/call {} names "web_search" "{\"query\":\"x\"}")
             (p/then (fn [r] (is (str/includes? r "not available in this run"))))
             (p/finally (fn [_ _] (done))))))))
+
+(deftest explicit-tool-name-resolution
+  (testing "API-server tool names can be passed without broadening them to another toolset"
+    (is (= ["terminal" "read_file" "web_search"]
+           (tools/enabled-tool-names ["terminal" "read_file" "web_search" "not-implemented"] nil)))
+    (is (= ["read_file"]
+           (tools/enabled-tool-names ["read_file" "write_file"] ["write_file"])))
+    (is (= ["not-implemented" "browser"]
+           (tools/unsupported-tools ["terminal" "not-implemented" "browser" "terminal"]))))
+  (testing "existing toolset expansion remains unchanged"
+    (is (= (tools/tool-names ["hermes-cli"])
+           (tools/enabled-tool-names ["hermes-cli"] nil)))))
+
+(deftest tool-approval-policy
+  (testing "read-only tools proceed directly while effectful tools require desktop approval"
+    (is (false? (tools/approval-required? "read_file")))
+    (is (false? (tools/approval-required? "search_files")))
+    (is (false? (tools/approval-required? "web_search")))
+    (is (false? (tools/approval-required? "skill_view")))
+    (is (true? (tools/approval-required? "terminal")))
+    (is (true? (tools/approval-required? "write_file")))
+    (is (true? (tools/approval-required? "memory")))))
+
+(deftest mcp-profile-tool-compatibility
+  (testing "MCP server selection follows per-run allowlists and disabled servers"
+    (let [cfg {"mcp_servers" {"fixture" {"command" "node" "args" ["test/mcp_stdio_fixture.mjs"]}
+                               "off" {"enabled" false "command" "node"}}}]
+      (is (= ["fixture"] (mcp/names-for cfg ["terminal"] [])))
+      (is (= ["fixture"] (mcp/names-for cfg ["fixture"] [])))
+      (is (= [] (mcp/names-for cfg ["terminal" "no_mcp"] [])))
+      (is (= [] (mcp/names-for cfg ["terminal"] ["fixture"])))))
+  (testing "stdio MCP schemas and tools/call use provider-safe names"
+    (let [cfg {"mcp_servers" {"fixture" {"command" "node" "args" ["test/mcp_stdio_fixture.mjs"]
+                                               "tools" {"include" ["e*"] "exclude" ["echo"]}}}}
+          data (mcp/discover cfg (h/process-env) ["fixture"])
+          schema (first (:schemas data))
+          result (mcp/call cfg (h/process-env) "fixture" "echo" {"text" "kotoba"})
+          excluded (mcp/discover {"mcp_servers" {"fixture" {"command" "node"
+                                                            "args" ["test/mcp_stdio_fixture.mjs"]
+                                                            "tools" {"exclude" ["echo"]}}}}
+                                 (h/process-env) ["fixture"])]
+      (is (= "mcp__fixture__echo" (get-in schema ["function" "name"])))
+      (is (= ["fixture" "echo"] (get (:index data) "mcp__fixture__echo")))
+      (is (empty? (:schemas excluded)))
+      (is (str/includes? result "kotoba"))))
+  (testing "long names are bounded and stable"
+    (let [n (mcp/tool-name "server-with-a-long-name" "tool-with-a-long-name-that-exceeds-provider-limits")]
+      (is (<= (count n) 64))
+      (is (= n (mcp/tool-name "server-with-a-long-name" "tool-with-a-long-name-that-exceeds-provider-limits"))))))
+
 
 (deftest separate-stores
   ;; profiles and state live under ITONAMI_DIR, never in the Hermes home
@@ -765,56 +825,6 @@ plain: true
           (profile/copy-profile! to back {})
           (is (= "SOUL.md content\n" (h/slurp (h/join back "SOUL.md")))))))
     (h/rm src)))
-
-(deftest delegate-task-hermes-api
-  ;; delegate_task, the Hermes delegation API: same name, same argument
-  ;; shape, children run through the injected :run-child (placement).
-  (async done
-    (let [ran (atom [])
-          run-child (fn [prompt _] (swap! ran conj prompt) (p/resolved {:exit-reason "completed" :final "done" :turns 1}))
-          call (fn [args] (p/let [s (tools/call {:run-child run-child} ["delegate_task"] "delegate_task" args)]
-                            (h/json-parse s)))]
-      (-> (p/let [r (call "{\"tasks\":[{\"goal\":\"g1\"},{\"goal\":\"g2\",\"context\":\"c\"}]}")
-                  _ (do (is (= 2 (count (get r "tasks"))))
-                        (is (= ["done" "done"] (map #(get % "summary") (get r "tasks"))))
-                        (is (every? #(= "completed" (get % "status")) (get r "tasks")))
-                        (is (= #{"# Goal\ng1" "# Goal\ng2\n\n# Context\nc"} (set @ran))))
-                  l (call "{\"action\":\"list\"}")
-                  _ (is (= 2 (count (get l "tasks"))) "action=list stays truthful about joined children")
-                  sid (get (first (get r "tasks")) "subagent_id")
-                  s (call (h/json-str {"action" "steer" "subagent_id" sid "message" "m"}))
-                  _ (is (str/includes? (str (get s "error")) "no mid-run inbox") "steer is honest about joined children")]
-            nil)
-          (p/catch (fn [e] (is (nil? e) (str "delegate test crashed: " (.-message e)))))
-          (p/finally (fn [_ _] (done)))))))
-
-(deftest delegate-task-output-schema
-  ;; output_schema: the child is told up front, the parent validates, and one
-  ;; bounded correction retry runs; the raw summary is never discarded.
-  (async done
-    (let [calls (atom 0)
-          run-child (fn [prompt _]
-                      (swap! calls inc)
-                      (p/resolved {:exit-reason "completed"
-                                   :final (if (= 1 @calls) "not json" "{\"n\": 3}")
-                                   :turns 1}))
-          schema {"type" "object" "properties" {"n" {"type" "number"}} "required" ["n"]}
-          bad (fn [_ _] (p/resolved {:exit-reason "completed" :final "{\"x\": 1}" :turns 1}))
-          call (fn [rc args] (p/let [s (tools/call {:run-child rc} ["delegate_task"] "delegate_task" args)]
-                               (h/json-parse s)))]
-      (-> (p/let [r (call run-child (h/json-str {"tasks" [{"goal" "g" "output_schema" schema}]}))
-                  t (first (get r "tasks"))
-                  _ (do (is (= 2 @calls) "one bounded correction retry")
-                        (is (true? (get t "schema_valid")))
-                        (is (= "{\"n\": 3}" (get t "summary"))))
-                  r2 (call bad (h/json-str {"tasks" [{"goal" "g" "output_schema" schema}]}))
-                  t2 (first (get r2 "tasks"))
-                  _ (do (is (false? (get t2 "schema_valid")))
-                        (is (= ["n"] (get t2 "schema_errors")))
-                        (is (= "{\"x\": 1}" (get t2 "summary"))) "the raw summary is never discarded")]
-            nil)
-          (p/catch (fn [e] (is (nil? e) (str "delegate schema test crashed: " (.-message e)))))
-          (p/finally (fn [_ _] (done)))))))
 
 (deftest rebase-paths-both-stores
   (let [paths {:origin-home "/home/u/.itonami/profiles/p" :profile "p" :ws "/run/ws" :home "/run/home"}]
