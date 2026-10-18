@@ -1078,3 +1078,19 @@ plain: true
           (is (not= (:incident-id r1) (:incident-id (execution-ledger/upsert-incident-for-failure! home job {} "different error" nil)))
               "the error text changed: a new incident, alerted again"))))
     (h/rm home)))
+
+(deftest handoff-adoption
+  ;; Hermes handoff: a claim can be fenced for an adopting worker, and the
+  ;; single claimed -> running adoption gate transfers ownership exactly once
+  (let [home (h/join (h/tmp-dir) (str "itonami-handoff-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    (let [id (execution-ledger/claim! home {"id" "jh"} "direct")]
+      (is (true? (execution-ledger/mark-handoff-pending! home id)))
+      (is (false? (execution-ledger/mark-handoff-pending! home "nope")) "owner/id fenced")
+      (is (true? (execution-ledger/adopt-claimed! home id)) "the adoption gate opens once")
+      (is (false? (execution-ledger/adopt-claimed! home id)) "claimed -> running happens exactly once")
+      (is (= "running" (get (first (execution-ledger/rows home "jh")) "status")))
+      (execution-ledger/finish! home id true "delivered"))
+    (testing "the adoption grace is 30s, as Hermes"
+      (is (= 30 execution-ledger/handoff-adoption-grace-seconds)))
+    (h/rm home)))

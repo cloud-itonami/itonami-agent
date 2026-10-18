@@ -79,8 +79,13 @@
 
 (defn- iso-now [] (h/iso-local (js/Date.) true))
 
+(def handoff-adoption-grace-seconds
+  "Hermes HANDOFF_ADOPTION_GRACE_SECONDS: restart recovery leaves a claimed
+  row alone while an external worker is inside the adoption window."
+  30)
+
 (defn- recover-interrupted! [db]
-  (let [rows (.all (.prepare db "SELECT id,process_id,pid,process_started_at FROM executions WHERE status IN ('claimed','running')"))
+  (let [rows (.all (.prepare db "SELECT id,process_id,pid,process_started_at,handoff_pending,handoff_started_at FROM executions WHERE status IN ('claimed','running')"))
         now (iso-now)]
     (doseq [i (range (.-length rows))
             :let [row (aget rows i)
@@ -90,7 +95,14 @@
                   owner-gone? (or (not (h/process-alive? owner-pid))
                                   (and (number? recorded-start) (number? current-start)
                                        (> (js/Math.abs (- current-start recorded-start)) 200)))]]
-      (when (and (not= process-id (aget row "process_id")) owner-gone?)
+      (when (and (not= process-id (aget row "process_id"))
+                 owner-gone?
+                 ;; an external worker inside the adoption window must never
+                 ;; be terminalized out from under itself
+                 (not (and (pos? (or (aget row "handoff_pending") 0))
+                           (number? (aget row "handoff_started_at"))
+                           (< (- (/ (h/now-ms) 1000) (aget row "handoff_started_at"))
+                              handoff-adoption-grace-seconds))))
         (.run (.prepare db "UPDATE executions SET status='unknown',finished_at=?,error=?,
           handoff_pending=0,handoff_started_at=NULL WHERE id=? AND status IN ('claimed','running')")
               now "scheduler restarted before a terminal result; execution outcome is unknown"
@@ -120,6 +132,36 @@
         (catch :default e
           (try (.exec db "ROLLBACK") (catch :default _ nil))
           (throw e)))
+      (finally (.close db)))))
+
+(defn mark-handoff-pending!
+  "Hermes mark_execution_handoff_pending: fence restart recovery while an
+  external worker is adopting this claim. Owner-fenced: only the process
+  that claimed the attempt may hand it off."
+  [home id]
+  (let [db (open-db home)]
+    (try
+      (let [r (.run (.prepare db "UPDATE executions
+        SET handoff_pending=1, handoff_started_at=?
+        WHERE id=? AND status='claimed' AND process_id=? AND pid=?")
+                    (/ (h/now-ms) 1000) (str id) process-id (.-pid js/process))]
+        (= 1 (.-changes r)))
+      (finally (.close db)))))
+
+(defn adopt-claimed!
+  "Hermes adopt_claimed_execution: atomically transfer and start an attempt
+  in this worker process. This is the single claimed -> running adoption
+  gate — only the winner acknowledges ownership and runs side effects."
+  [home id]
+  (let [db (open-db home)
+        pid (.-pid js/process)]
+    (try
+      (let [r (.run (.prepare db "UPDATE executions
+        SET process_id=?, pid=?, process_started_at=?, status='running', started_at=?,
+            handoff_pending=0, handoff_started_at=NULL
+        WHERE id=? AND status='claimed' AND handoff_pending=1")
+                    process-id pid (h/process-start-time pid) (iso-now) (str id))]
+        (= 1 (.-changes r)))
       (finally (.close db)))))
 
 (defn mark-running!
