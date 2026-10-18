@@ -947,6 +947,152 @@
       (seq assets) (assoc "assets" (vec assets))
       (seq scripts) (assoc "scripts" (vec scripts)))))
 
+
+;; ---------------------------------------------------------------- skill guards
+;; Hermes tools/skill_manager_guards.py + tools/skill_usage.py, same verdicts.
+
+(def essential-skills
+  "Hermes ESSENTIAL_SKILLS: the agent's own operating manual referenced by
+  the system prompt. Permanently pinned - never deletable."
+  #{"hermes-agent"})
+
+(defn- usage-file [home] (h/join home "skills" ".usage.json"))
+
+(defn load-skill-usage
+  "The whole .usage.json map (skills/.usage.json, the Hermes skill_usage
+  store); {} on missing/corrupt."
+  [home]
+  (try (let [m (h/json-parse (h/slurp (usage-file home)))] (if (map? m) m {}))
+       (catch :default _ {})))
+
+(defn skill-usage-record [home name] (get (load-skill-usage home) (str name)))
+
+(defn- curator-managed?
+  "created_by is a curator-management OPT-IN flag, not proof of authorship
+  (curator adopt flips it). A missing record and created_by null resolve
+  identically."
+  [rec] (= "agent" (get rec "created_by")))
+
+(defn- safe-resolve [p] (try (h/realpath p) (catch :default _ (str p))))
+
+(defn- review-read? [ctx target]
+  (contains? (some-> (:review-read ctx) deref) (safe-resolve target)))
+
+(defn- review-mark-read! [ctx target]
+  (when-let [a (:review-read ctx)]
+    (swap! a conj (safe-resolve target))))
+
+(defn- review-read-before-write
+  "Hermes _background_review_read_before_write_guard: review forks must load
+  the exact target before mutating it - the fork must not patch content it
+  only inferred from the transcript. Only existing targets are gated."
+  [ctx name target action file-label]
+  (when (and (:review? ctx) (h/file? target) (not (review-read? ctx target)))
+    (str "Refusing background curator " action " for skill '" name "': the current " file-label
+         " content has not been loaded in this review turn. Call skill_view(name) for SKILL.md, or "
+         "skill_view(name, file_path=...) for a supporting file, then retry the write using the "
+         "content just returned.")))
+
+(defn- pinned-delete-guard
+  "Hermes _pinned_guard: pin only guards DELETION; patches/edits stay
+  allowed. Best-effort on an unreadable sidecar (the delete goes through)."
+  [home name]
+  (cond
+    (contains? essential-skills name)
+    (str "Skill '" name "' is essential (the agent's own operating manual referenced by the "
+         "system prompt) and cannot be deleted. Patches and edits are still allowed.")
+    (true? (get (skill-usage-record home name) "pinned"))
+    (str "Skill '" name "' is pinned and cannot be deleted by skill_manage. Ask the user to "
+         "run `hermes curator unpin " name "` if they want to delete it. Patches and edits "
+         "are allowed on pinned skills; only deletion is blocked.")
+    :else nil))
+
+(defn- review-delete-guard
+  "Hermes _background_review_delete_guard: autonomous review forks may only
+  archive curator-managed skills. Content writes are not gated by ownership -
+  an archive removes a skill the user relies on. Provenance that cannot be
+  verified fails closed."
+  [home name]
+  (let [rec (skill-usage-record home name)]
+    (cond
+      (contains? essential-skills name)
+      (str "Refusing background curator delete of pinned skill '" name "': pinned skills are "
+           "off-limits to autonomous maintenance. Ask the user to run `hermes curator unpin "
+           name "` if they want it changed.")
+      (true? (get rec "pinned"))
+      (str "Refusing background curator delete of pinned skill '" name "': pinned skills are "
+           "off-limits to autonomous maintenance. Ask the user to run `hermes curator unpin "
+           name "` if they want it changed.")
+      (not (map? rec))
+      (str "Refusing background curator delete of skill '" name "': skill ownership could not "
+           "be verified because the provenance record is unavailable or unreadable.")
+      (not (curator-managed? rec))
+      (str "Refusing background curator delete of skill '" name "': the skill is not "
+           "curator-managed (created_by=" (pr-str (get rec "created_by")) "). Only "
+           "curator-managed skills may be archived autonomously. Run `hermes curator adopt "
+           name "` to opt it in.")
+      :else nil)))
+
+(defn- consolidation-delete-guard
+  "Hermes _curator_consolidation_delete_guard: the review fork's only
+  legitimate delete is a consolidation declared via absorbed_into=<umbrella>.
+  A bare delete can only be the LLM pass pruning without evidence (#29912).
+  Fail closed; keep the skill active."
+  [name absorbed-into]
+  (when-not (and (string? absorbed-into) (not (str/blank? (str/trim absorbed-into))))
+    (str "Refusing background curator delete of skill '" name "': the consolidation pass may only "
+         "archive a skill it has absorbed into an umbrella. Pass absorbed_into=<umbrella> (the "
+         "umbrella must already exist) to record a verified consolidation. Pruning a skill with no "
+         "forwarding target is not permitted here. Keeping '" name "' active.")))
+
+(defn- validate-delete-target
+  "Hermes _validate_delete_target: the last-line guard before rmtree - even a
+  poisoned tree must never delete a symlink/junction (rmtree follows it), the
+  skills root itself, or a path outside the skills root (#11227)."
+  [skills-root dir]
+  (let [resolved (safe-resolve dir)
+        root (safe-resolve skills-root)]
+    (cond
+      (h/symlink? dir)
+      (str "Refusing to delete '" dir "': the skill directory is a symlink/junction. "
+           "Remove the link target manually if intended.")
+      (= resolved root)
+      (str "Refusing to delete '" dir "': resolves to the skills root itself, "
+           "which would remove every installed skill.")
+      (not (str/starts-with? resolved (str root "/")))
+      (str "Refusing to delete '" dir "': path does not resolve inside the skills root.")
+      :else nil)))
+
+(defn- find-skill-dir
+  "The directory of a skill name or category/name under the profile's skills
+  root (the umbrella existence check for absorbed_into)."
+  [ctx name]
+  (let [skills (h/join (:home ctx) "skills")
+        parts (when (safe-skill-relative? name) (str/split (str name) #"/"))]
+    (when (and (#{1 2} (count parts)) (every? skill-name? parts))
+      (first (for [rel (if (h/dir? skills) (h/walk-files skills (fn [_] false)) [])
+                   :when (and (str/ends-with? rel "/SKILL.md")
+                              (let [segments (str/split rel #"/")
+                                    skill-path (vec (butlast segments))]
+                                (and (= (count skill-path) (count parts))
+                                     (if (= 1 (count parts))
+                                       (= (first parts) (first skill-path))
+                                       (= parts skill-path)))))]
+               (h/join skills (subs rel 0 (- (count rel) (count "/SKILL.md")))))))))
+
+(defn- absorbed-into-error
+  "Hermes _delete_skill's absorbed_into validation: the forwarding target
+  must already exist and must differ from the skill being deleted. Empty
+  means an explicit prune; absent means undeclared (legacy, accepted)."
+  [ctx name absorbed]
+  (when (some? absorbed)
+    (let [t (str/trim (str absorbed))]
+      (cond
+        (str/blank? t) nil
+        (= t name) (str "absorbed_into='" t "' cannot equal the skill being deleted.")
+        (not (find-skill-dir ctx t)) (str "absorbed_into='" t "' does not exist.")
+        :else nil))))
+
 (defn skill-view [ctx {:strs [name file_path]}]
   (let [skills (h/join (:home ctx) "skills")
         parts (when (safe-skill-relative? name) (str/split name #"/"))
@@ -976,6 +1122,7 @@
           (not (readable? ctx "skill_view" f)) (err "skill file is outside this run's readable roots")
           :else
           (let [content (h/slurp f)
+                _ (review-mark-read! ctx f)
                 fm (when (= relative "SKILL.md")
                      (second (re-find #"(?s)^---\s*\n(.*?)\n---(?:\n|$)" content)))
                 meta (when fm (try (yaml/parse fm) (catch :default _ {})))
@@ -1041,12 +1188,23 @@
         skill-file (when dir (h/join dir "SKILL.md"))
         skills-root (h/join (:home ctx) "skills")
         support (when dir (skill-support-path dir (get op "file_path")))
+        target (when (contains? #{"patch" "write_file" "remove_file"} action)
+                 (if (= action "patch") (or support skill-file) support))
+        review-why (when target
+                     (review-read-before-write
+                      ctx name target action
+                      (if (= action "patch") (or (get op "file_path") "SKILL.md") (get op "file_path"))))
         fail (fn [s] (err s))]
     (cond
-      (not dir) (fail "name/category must use lowercase letters, digits, hyphens, or underscores; name is limited to 64 characters")
-      (not (writable? ctx dir)) (fail "skill path is outside this run's writable roots")
+      (not dir)
+      (fail "name/category must use lowercase letters, digits, hyphens, or underscores; name is limited to 64 characters")
+
+      (not (writable? ctx dir))
+      (fail "skill path is outside this run's writable roots")
+
       (or (symlink-under? skills-root dir) (and support (symlink-under? skills-root support)))
       (fail "skill_manage refuses paths that traverse a symbolic link")
+
       (= action "create")
       (cond
         (not (string? (get op "content"))) (fail "create requires full SKILL.md content")
@@ -1059,57 +1217,77 @@
       (= action "delete")
       (if-not (and (h/dir? dir) (h/file? skill-file))
         (fail (str "skill not found: " name))
-        (do (h/rm dir) (record-write! ctx dir)
-            (ok {"success" true "action" action "name" name})))
+        (if-let [why (or (pinned-delete-guard (:home ctx) name)
+                         (when (:review? ctx)
+                           (or (review-delete-guard (:home ctx) name)
+                               (consolidation-delete-guard name (get op "absorbed_into"))))
+                         (absorbed-into-error ctx name (get op "absorbed_into"))
+                         ;; last line before rmtree, even against a poisoned tree
+                         (validate-delete-target skills-root dir))]
+          (fail why)
+          (do (h/rm dir) (record-write! ctx dir)
+              (ok {"success" true "action" action "name" name}))))
 
-      (contains? #{"patch" "write_file" "remove_file"} action)
-      (let [target (if (= action "patch") (or support skill-file) support)]
+      review-why (fail review-why)
+
+      (and (not= action "patch") (nil? support))
+      (fail "file_path must be a relative path under references/, templates/, scripts/, or assets/")
+
+      (and (= action "patch") (get op "file_path") (nil? support))
+      (fail "file_path must be a relative path under references/, templates/, scripts/, or assets/")
+
+      (not (h/file? skill-file))
+      (fail (str "skill not found: " name))
+
+      (= action "write_file")
+      (if-not (string? (get op "file_content"))
+        (fail "write_file requires file_content")
+        (if (> (h/utf8-byte-length (get op "file_content")) 1048576)
+          (fail "supporting file content exceeds 1048576 bytes")
+          (do (h/spit target (get op "file_content")) (record-write! ctx target)
+              (ok {"success" true "action" action "name" name "file_path" (get op "file_path")}))))
+
+      (= action "remove_file")
+      (if-not (h/file? target)
+        (fail (str "file not found: " (get op "file_path")))
+        (do (h/rm target) (record-write! ctx target)
+            (ok {"success" true "action" action "name" name "file_path" (get op "file_path")})))
+
+      (= action "patch")
+      (let [old (get op "old_string") new (get op "new_string")]
         (cond
-          (and (not= action "patch") (nil? support)) (fail "file_path must be a relative path under references/, templates/, scripts/, or assets/")
-          (and (= action "patch") (get op "file_path") (nil? support)) (fail "file_path must be a relative path under references/, templates/, scripts/, or assets/")
-          (not (h/file? skill-file)) (fail (str "skill not found: " name))
-          (= action "write_file")
-          (if-not (string? (get op "file_content"))
-            (fail "write_file requires file_content")
-            (if (> (h/utf8-byte-length (get op "file_content")) 1048576)
-              (fail "supporting file content exceeds 1048576 bytes")
-              (do (h/spit target (get op "file_content")) (record-write! ctx target)
-                  (ok {"success" true "action" action "name" name "file_path" (get op "file_path")}))))
-          (= action "remove_file")
-          (if-not (h/file? target) (fail (str "file not found: " (get op "file_path")))
-            (do (h/rm target) (record-write! ctx target)
-                (ok {"success" true "action" action "name" name "file_path" (get op "file_path")})))
-          :else
-          (let [old (get op "old_string") new (get op "new_string")]
+          (and (string? (get op "content")) (not (contains? op "old_string")))
+          (let [content (get op "content")
+                validation (when (= target skill-file) (skill-content-error content false))]
             (cond
-              (and (string? (get op "content")) (not (contains? op "old_string")))
-              (let [content (get op "content")
-                    validation (when (= target skill-file) (skill-content-error content false))]
+              validation (fail validation)
+              (> (if (= target skill-file) (count content) (h/utf8-byte-length content))
+                 (if (= target skill-file) 100000 1048576)) (fail "skill file content exceeds the allowed size")
+              :else (do (h/spit target content) (record-write! ctx target)
+                        (ok {"success" true "action" action "name" name "path" target}))))
+          (or (not (string? old)) (str/blank? old) (not (string? new)))
+          (fail "patch requires non-empty old_string and new_string")
+          (not (h/file? target))
+          (fail (str "skill file not found: " (get op "file_path" "SKILL.md")))
+          :else
+          (let [text (h/slurp target) matches (substring-count text old)
+                replace-all (true? (get op "replace_all"))]
+            (cond
+              (zero? matches) (fail "old_string not found")
+              (and (> matches 1) (not replace-all))
+              (fail (str "old_string matched " matches " times; set replace_all=true or make it unique"))
+              :else
+              (let [updated (if replace-all (str/replace text old new) (str/replace-first text old new))
+                    validation (when (= target skill-file) (skill-content-error updated false))]
                 (cond
                   validation (fail validation)
-                  (> (if (= target skill-file) (count content) (h/utf8-byte-length content))
+                  (> (if (= target skill-file) (count updated) (h/utf8-byte-length updated))
                      (if (= target skill-file) 100000 1048576)) (fail "skill file content exceeds the allowed size")
-                  :else (do (h/spit target content) (record-write! ctx target)
-                            (ok {"success" true "action" action "name" name "path" target}))))
-              (or (not (string? old)) (str/blank? old) (not (string? new))) (fail "patch requires non-empty old_string and new_string")
-              (not (h/file? target)) (fail (str "skill file not found: " (get op "file_path" "SKILL.md")))
-              :else
-              (let [text (h/slurp target) matches (substring-count text old)
-                    replace-all (true? (get op "replace_all"))]
-                (cond
-                  (zero? matches) (fail "old_string not found")
-                  (and (> matches 1) (not replace-all)) (fail (str "old_string matched " matches " times; set replace_all=true or make it unique"))
-                  :else (let [updated (if replace-all (str/replace text old new) (str/replace-first text old new))
-                              validation (when (= target skill-file) (skill-content-error updated false))]
-                          (cond
-                            validation (fail validation)
-                            (> (if (= target skill-file) (count updated) (h/utf8-byte-length updated))
-                               (if (= target skill-file) 100000 1048576)) (fail "skill file content exceeds the allowed size")
-                            :else (do (h/spit target updated)
-                                      (record-write! ctx target)
-                                      (ok {"success" true "action" action "name" name "path" target})))))))))
+                  :else (do (h/spit target updated)
+                            (record-write! ctx target)
+                            (ok {"success" true "action" action "name" name "path" target}))))))))
 
-      :else (fail "unsupported skill_manage action")))))
+      :else (fail "unsupported skill_manage action"))))
 
 (defn skill-manage [ctx {:strs [operations]}]
   (cond
