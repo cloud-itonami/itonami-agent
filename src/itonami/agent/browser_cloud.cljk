@@ -1,0 +1,175 @@
+(ns itonami.agent.browser-cloud
+  "Concrete cloud browser providers — the bundled Hermes plugins
+  (plugins/browser/_common.py + browserbase + browser_use) ported to the
+  itonami plane. Every vendor speaks the same REST shape (POST to create a
+  session, one request to release it); the shared lifecycle lives here and
+  the providers are attributes + hooks.
+
+  Session metadata contract (verbatim keys — bb_session_id is a legacy key
+  name that holds the PROVIDER's session id regardless of provider):
+    {:session_name  unique name for agent-browser --session
+     :bb_session_id provider session id (for close/cleanup)
+     :cdp_url       CDP websocket URL
+     :expires_at    optional provider-authoritative ISO timestamp
+     :features      feature flags that were enabled
+     :external_call_id optional managed-gateway billing key}"
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.browser-provider :as browser-provider]))
+
+(defn session-name
+  "Hermes CloudBrowserProvider._session_name: the unique name handed to
+  agent-browser --session."
+  [task-id]
+  (str "itonami_" task-id "_" (h/random-hex 4)))
+
+;; ---------------------------------------------------------------- shared lifecycle
+
+(defn- post-create! [url headers payload label]
+  (-> (js/fetch url #js {:method "POST"
+                         :headers (clj->js headers)
+                         :body (h/json-str payload)
+                         :signal (js/AbortSignal.timeout 30000)})
+      (.catch (fn [e] (throw (js/Error. (str label " API connection failed: " (.-message e))))))))
+
+(defn- check-created [res label suffix]
+  (when-not (.-ok res)
+    (throw (js/Error. (str "Failed to create " label suffix " session: HTTP " (.-status res))))))
+
+(defn- close-request! [config {:keys [method path body headers label]} session-id]
+  (-> (js/fetch (str (:base-url config) (str/replace path "{session_id}" (str session-id)))
+                #js {:method (str/upper-case (str method))
+                     :headers (clj->js (or (headers config) {"Content-Type" "application/json"}))
+                     :body (when-let [b (body config)] (h/json-str b))
+                     :signal (js/AbortSignal.timeout 10000)})
+      (.then (fn [res] (contains? #{200 201 204} (.-status res))))
+      (.catch (fn [_] false))))
+
+;; ---------------------------------------------------------------- browserbase
+
+(defn browserbase-config
+  "BROWSERBASE_API_KEY + BROWSERBASE_PROJECT_ID are both required (cheap
+  check, no network); the endpoint is per-profile BROWSERBASE_BASE_URL."
+  []
+  (let [api-key (h/env "BROWSERBASE_API_KEY")
+        project-id (h/env "BROWSERBASE_PROJECT_ID")]
+    (when (and api-key project-id)
+      {"api_key" api-key "project_id" project-id
+       "base_url" (str/replace (or (h/env "BROWSERBASE_BASE_URL") "https://api.browserbase.com") #"/$" "")})))
+
+(defn- browserbase-create! [config task-id]
+  (let [session-name (session-name task-id)
+        enable-proxies (not= "false" (str/lower-case (or (h/env "BROWSERBASE_PROXIES") "true")))
+        enable-stealth (= "true" (str/lower-case (or (h/env "BROWSERBASE_ADVANCED_STEALTH") "false")))
+        enable-keep-alive (not= "false" (str/lower-case (or (h/env "BROWSERBASE_KEEP_ALIVE") "true")))
+        custom-timeout (h/env "BROWSERBASE_SESSION_TIMEOUT")
+        timeout (when custom-timeout (js/parseInt custom-timeout 10))
+        base {"projectId" (get config "project_id")}
+        base (cond-> base enable-keep-alive (assoc "keepAlive" true)
+                     (and timeout (pos? timeout)) (assoc "timeout" timeout)
+                     enable-proxies (assoc "proxies" true)
+                     enable-stealth (assoc "browserSettings" {"advancedStealth" true}))
+        headers {"Content-Type" "application/json" "X-BB-API-Key" (get config "api_key")}
+        url (str (get config "base_url") "/v1/sessions")]
+    (p/let [res (post-create! url headers base "Browserbase")
+            ;; 402 — paid features unavailable: drop keepAlive, then proxies, and retry
+            [res payload dropped] (cond
+                                   (not= 402 (.-status res)) (p/resolved [res nil #{}])
+                                   :else
+                                   (p/let [b1 (cond-> base (contains? base "keepAlive") (dissoc "keepAlive"))
+                                           r1 (if (= b1 base) res (post-create! url headers b1 "Browserbase"))
+                                           b2 (cond-> b1 (contains? b1 "proxies") (dissoc "proxies"))
+                                           r2 (if (= b2 b1) r1 (post-create! url headers b2 "Browserbase"))]
+                                     [r2 nil (set (remove nil? [(when (not= b1 base) "keepAlive")
+                                                                (when (not= b2 b1) "proxies")]))]))
+            _ (check-created res "Browserbase" "")
+            data (if payload payload (p/let [j (.json res)] (js->clj j)))
+            features {"basic_stealth" true
+                      "proxies" (and enable-proxies (not (contains? dropped "proxies")))
+                      "advanced_stealth" enable-stealth
+                      "keep_alive" (and enable-keep-alive (not (contains? dropped "keepAlive")))
+                      "custom_timeout" (boolean (and timeout (pos? timeout) (contains? (set (keys base)) "timeout")))}]
+      {"session_name" session-name
+       "bb_session_id" (get data "id")
+       "cdp_url" (get data "connectUrl")
+       "features" features})))
+
+(defn browserbase-provider []
+  {"name" "browserbase"
+   :is-available (fn [] (some? (browserbase-config)))
+   :create-session (fn [task-id]
+                     (if-let [config (browserbase-config)]
+                       (browserbase-create! config task-id)
+                       (p/rejected (js/Error. (str "Browserbase requires BROWSERBASE_API_KEY and "
+                                                   "BROWSERBASE_PROJECT_ID environment variables.")))))
+   :close-session (fn [session-id]
+                    (if-let [config (browserbase-config)]
+                      (close-request! config {:method "post" :path "/v1/sessions/{session_id}"
+                                              :headers (fn [c] {"X-BB-API-Key" (get c "api_key")
+                                                                "Content-Type" "application/json"})
+                                              :body (fn [c] {"projectId" (get c "project_id")
+                                                             "status" "REQUEST_RELEASE"})}
+                                      session-id)
+                      (p/resolved false)))
+   :emergency-cleanup (fn [session-id]
+                        (when-let [config (browserbase-config)]
+                          (p/let [ok (close-request! config {:method "post" :path "/v1/sessions/{session_id}"
+                                                             :headers (fn [c] {"X-BB-API-Key" (get c "api_key")
+                                                                               "Content-Type" "application/json"})
+                                                             :body (fn [c] {"projectId" (get c "project_id")
+                                                                            "status" "REQUEST_RELEASE"})}
+                                                     session-id)]
+                            ok)))})
+
+;; ---------------------------------------------------------------- browser-use
+
+(def browser-use-base-url "https://api.browser-use.com/api/v3")
+
+(defn browser-use-config []
+  (when-let [api-key (h/env "BROWSER_USE_API_KEY")]
+    {"api_key" api-key "base_url" browser-use-base-url}))
+
+(defn- browser-use-create! [config task-id]
+  (p/let [res (post-create! (str (get config "base_url") "/browsers")
+                            {"Content-Type" "application/json"
+                             "X-Browser-Use-API-Key" (get config "api_key")}
+                            {} "Browser Use")
+          _ (check-created res "Browser Use" "")
+          data (p/let [j (.json res)] (js->clj j))]
+    {"session_name" (session-name task-id)
+     "bb_session_id" (get data "id")
+     "cdp_url" (or (get data "cdpUrl") (get data "connectUrl") "")
+     ;; fixed server-side lifetime: keep the API's authority so an expired
+     ;; CDP endpoint is retired
+     "expires_at" (get data "timeoutAt")
+     "features" {"browser_use" true}}))
+
+(defn browser-use-provider []
+  {"name" "browser-use"
+   :is-available (fn [] (some? (browser-use-config)))
+   :create-session (fn [task-id]
+                     (if-let [config (browser-use-config)]
+                       (browser-use-create! config task-id)
+                       (p/rejected (js/Error. "Browser Use requires BROWSER_USE_API_KEY."))))
+   :close-session (fn [session-id]
+                    (if-let [config (browser-use-config)]
+                      (close-request! config {:method "patch" :path "/browsers/{session_id}"
+                                              :headers (fn [c] {"Content-Type" "application/json"
+                                                                "X-Browser-Use-API-Key" (get c "api_key")})
+                                              :body (fn [_] {"action" "stop"})}
+                                      session-id)
+                      (p/resolved false)))
+   :emergency-cleanup (fn [session-id]
+                        (when-let [config (browser-use-config)]
+                          (close-request! config {:method "patch" :path "/browsers/{session_id}"
+                                                  :headers (fn [c] {"Content-Type" "application/json"
+                                                                    "X-Browser-Use-API-Key" (get c "api_key")})
+                                                  :body (fn [_] {"action" "stop"})}
+                                          session-id)))})
+
+(defn register-builtin-providers!
+  "Register the bundled cloud providers (the plugins/browser/ pair)."
+  []
+  (browser-provider/register-provider! (browser-use-provider))
+  (browser-provider/register-provider! (browserbase-provider)))

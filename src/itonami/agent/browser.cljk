@@ -318,11 +318,13 @@
 ;; CDP endpoint only (the same sources the run gate checks).
 
 (defn cdp-endpoint
-  "The configured CDP endpoint: browser.cdp_url / browser.cdp_endpoint in
-  config.yaml, or the BROWSER_CDP_URL env. nil when none is configured."
+  "The CDP endpoint this run drives: a resolved cloud session's cdp_url
+  first (cloud mode), else browser.cdp_url / browser.cdp_endpoint in
+  config.yaml or the BROWSER_CDP_URL env. nil when none is configured."
   [ctx]
   (let [c (:browser-config ctx)]
-    (or (get c "cdp_url") (get c "cdp_endpoint") (h/env "BROWSER_CDP_URL"))))
+    (or (get (:cloud-session ctx) "cdp_url")
+        (get c "cdp_url") (get c "cdp_endpoint") (h/env "BROWSER_CDP_URL"))))
 
 (defn- ws-url
   "ws(s):// is used as-is; http(s):// resolves webSocketDebuggerUrl from
