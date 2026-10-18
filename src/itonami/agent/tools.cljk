@@ -380,11 +380,16 @@
      (zipmap channel-bundles (repeat hermes-core-tools)))))
 
 (defn tool-names
-  "Resolve toolsets or direct tool names; run preflight rejects unknown toolsets."
+  "Resolve toolsets or direct tool names; run preflight rejects unknown
+  toolsets. A name that is itself a tool is the tool: API-server `tool_names`
+  pass explicit names and are never broadened into a toolset that happens to
+  share the name (`terminal`)."
   [sets]
-  (vec (distinct (mapcat #(or (get toolsets %)
-                               (when (contains? schemas %) [%])
-                               []) sets))))
+  (vec (distinct (mapcat #(cond
+                            (contains? schemas %) [%]
+                            (contains? toolsets %) (get toolsets %)
+                            :else [])
+                         sets))))
 
 (defn unsupported-tools
   "Tool names this Kotoba agent cannot execute. Callers at compatibility
