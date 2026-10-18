@@ -63,10 +63,14 @@ call (as Hermes does without a later-result consumer); `output_schema` is
 told to the child up front and validated with one bounded correction retry
 (`schema_valid` / `schema_errors` beside the raw summary, which is never
 discarded). Children cannot call `delegate_task`, `clarify`, `memory` or
-cron tools. What remains of Hermes' delegation surface: background children
-(results re-entering between turns), steer as a mid-run tool-result append,
-and live cancel — joined foreground children answer those actions honestly
-instead of pretending.
+cron tools. Live controls work like Hermes': `steer` queues the correction into the
+child's next tool result mid-run, and `stop` ends the child early with an
+`interrupted` completion carrying its partial output. Sessions without a
+later-result consumer (CLI `-z`, cron) still join their children; a caller
+that passes `:join-children? false` gets background children back as live
+handles (`{"background": true, results: [...status "running"]}`) whose
+finished summaries re-enter as a message between model turns. What remains
+of Hermes' delegation surface: cross-run re-entry in chat sessions.
 
 Home Assistant uses the profile's `HASS_URL` / `HASS_TOKEN` (default URL:
 `http://homeassistant.local:8123`); redirects are refused and the service-call

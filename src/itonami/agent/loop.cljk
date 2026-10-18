@@ -111,7 +111,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
    {:final str :exit-reason str :turns n :messages [...] :usage {...}
     :provider str :model str :attempts [...] :writes [abs-paths]}"
   [{:keys [config env] :as prof} prompt {:keys [model provider pinned? toolsets tool-names cwd roots platform
-                                                load-context? max-turns budget-s on-event peer?
+                                                load-context? max-turns budget-s on-event peer? steer-queue cancelled?
                                                 reasoning-effort max-tokens
                                                 history instructions before-tool tool-overrides]
                                          :as options}]
@@ -192,6 +192,10 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
              attempts []
              last-hop nil]
       (cond
+        (and cancelled? @cancelled?)
+        {:final nil :exit-reason "interrupted" :turns n :messages messages :usage @usage
+         :attempts attempts :writes @writes :provider (:provider last-hop) :model (:model last-hop)}
+
         (>= n max-turns)
         {:final nil :exit-reason (str "max_iterations_reached(" n "/" max-turns ")") :turns n
          :messages messages :usage @usage :attempts attempts :writes @writes
@@ -253,6 +257,11 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                       (tools/call (assoc ctx :tool-approved? approved?) names nm args))
                                                     (h/json-str {"error" "Tool call denied by user."}))
                                               out (tools/tool-result-text out-result)
+                                              out (let [steered (when steer-queue (not-empty @steer-queue))]
+                                                    (if steered
+                                                      (do (reset! steer-queue [])
+                                                          (str out "\n\n[STEER from the parent turn]\n" (str/join "\n" steered)))
+                                                      out))
                                               _ (swap! images into (tools/tool-result-images out-result))]
                                         (emit {:event :tool :name nm :bytes (count out)
                                                :ms (- (h/now-ms) t1) :denied (not approved?)})
@@ -270,8 +279,14 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
        (fn [] (browser-runtime/close-session ctx)))))
 
 (def delegate-children
-  "subagent_id -> {goal status}. Foreground children are registered while
-  they run and kept afterwards, so action=list stays truthful."
+  "subagent_id -> {goal status summary}. Children are registered while they
+  run and kept afterwards, so action=list stays truthful."
+  (atom {}))
+
+(def delegate-ctl
+  "subagent_id -> {:steer (atom [message]) :cancel (atom bool)}. steer queues
+  the correction into the child's next tool result; cancel ends the child
+  early with an 'interrupted' completion carrying its partial output."
   (atom {}))
 
 (defn- delegate-validate-schema
@@ -322,15 +337,23 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
 
     "stop" (if-let [c (get @delegate-children subagent_id)]
              (if (= "running" (get c "status"))
-               (h/json-str {"error" (str "stop: " subagent_id " runs joined in this call and cannot be "
-                                         "cancelled mid-turn; its partial summary arrives when the turn ends")})
+               (if-let [ctl (get @delegate-ctl subagent_id)]
+                 (do (reset! (:cancel ctl) true)
+                     (h/json-str {"subagent_id" subagent_id "status" "stopping"
+                                  "note" "the child ends early with an interrupted completion carrying its partial output"}))
+                 (h/json-str {"error" (str "stop: " subagent_id " has no live control channel")}))
                (h/json-str {"subagent_id" subagent_id "status" (get c "status")}))
              (h/json-str {"error" (str "no such subagent: " subagent_id)}))
 
-    "steer" (if (contains? @delegate-children subagent_id)
-              (h/json-str {"error" (str "steer: a joined child has no mid-run inbox (message: "
-                                        (pr-str message) ") — re-delegate with the correction in the goal")})
-              (h/json-str {"error" (str "no such subagent: " subagent_id)}))
+    "steer" (if-let [ctl (get @delegate-ctl subagent_id)]
+              (do (swap! (:steer ctl) conj (str message))
+                  (h/json-str {"subagent_id" subagent_id
+                               "status" (get-in @delegate-children [subagent_id "status"])
+                               "steered" true}))
+              (if (contains? @delegate-children subagent_id)
+                (h/json-str {"error" (str "steer: this child has no live mid-run inbox (message: "
+                                          (pr-str message) ") — re-delegate with the correction in the goal")})
+                (h/json-str {"error" (str "no such subagent: " subagent_id)})))
 
     ;; spawn (default)
     (let [tasks (if (vector? tasks) tasks [])
@@ -352,15 +375,18 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                          (min 300 configured-budget)
                          300)
               t0 (h/now-ms)
-              child-run (fn [task]
-                          (let [id (str "sub-" (h/random-hex 6))
-                                goal (get task "goal")
+              ids (mapv (fn [_] (str "sub-" (h/random-hex 6))) tasks)
+              child-run (fn [id task]
+                          (let [goal (get task "goal")
                                 schema (get task "output_schema")
                                 prompt (delegate-child-prompt task)
+                                ctl {:steer (atom []) :cancel (atom false)}
                                 child-options (assoc parent-options
                                                      :tool-names child-names
                                                      :toolsets nil
                                                      :history []
+                                                     :steer-queue (:steer ctl)
+                                                     :cancelled? (:cancel ctl)
                                                      :instructions "You are a Kotoba child agent. Return a concise result for the parent task.")
                                 done (fn [result extra]
                                        (let [base (merge {"subagent_id" id
@@ -369,9 +395,13 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                           "summary" (when-let [summary (:final result)]
                                                                       (subs summary 0 (min 8000 (count summary))))
                                                           "error" (get-in result [:error :error])} extra)]
-                                         (swap! delegate-children assoc id {"goal" goal "status" (get base "status")})
+                                         (swap! delegate-children assoc id {"goal" goal
+                                                                            "status" (get base "status")
+                                                                            "summary" (get base "summary")})
+                                         (swap! delegate-ctl dissoc id)
                                          base))]
                             (swap! delegate-children assoc id {"goal" goal "status" "running"})
+                            (swap! delegate-ctl assoc id ctl)
                             (-> (run prof prompt (assoc child-options :budget-s budget-s))
                                 (p/then (fn [result]
                                           (if-not schema
@@ -390,8 +420,15 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                 (p/catch (fn [e]
                                            (swap! delegate-children assoc id {"goal" goal "status" "failed"})
                                            {"subagent_id" id "goal" goal "status" "failed" "error" (.-message e)})))))
-              child-runs (mapv child-run tasks)]
-          (p/then (p/all child-runs)
-                  (fn [results]
-                    (h/json-str {"results" (vec results)
-                                 "total_duration_seconds" (/ (- (h/now-ms) t0) 1000)}))))))))
+              child-runs (mapv child-run ids tasks)]
+          (if (false? (:join-children? parent-options))
+            ;; background: dispatch returns live handles now; finished
+            ;; results re-enter as a new message between turns
+            (p/resolved (h/json-str {"background" true
+                                     "results" (vec (for [[id task] (map vector ids tasks)]
+                                                      {"subagent_id" id "goal" (get task "goal")
+                                                       "status" "running"}))}))
+            (p/then (p/all child-runs)
+                    (fn [results]
+                      (h/json-str {"results" (vec results)
+                                   "total_duration_seconds" (/ (- (h/now-ms) t0) 1000)})))))))))
