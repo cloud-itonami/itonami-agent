@@ -23,6 +23,7 @@
             [itonami.agent.loop :as agent-loop]
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.notepad :as notepad]
+            [itonami.agent.delivery :as delivery]
             [itonami.agent.webguard :as webguard]))
 
 (defn cron-hint [job]
@@ -703,25 +704,28 @@
 (defn- delivery-lane [job failed?]
   (let [failure (get job "failure_deliver")
         raw (if (and failed? (some? failure) (not (str/blank? (str failure))))
-              failure (get job "deliver" "local"))
-        targets (cond
-                  (sequential? raw) (str/join "," (map str raw))
-                  (nil? raw) "local"
-                  :else (str raw))]
-    (if (str/blank? targets) "local" targets)))
+              failure (get job "deliver"))]
+    (delivery/normalize-deliver-value raw)))
 
 (defn- deliver-output [job content failed? delivery-fn]
-  (let [lane (delivery-lane job failed?)]
-    (if (= "local" (str/lower-case lane))
+  (let [lane (delivery-lane job failed?)
+        names (delivery/lanes lane)
+        targets (remove #(= "local" (str/lower-case %)) names)
+        send (fn [l]
+               (let [f (or (delivery/adapter-for l) delivery-fn)]
+                 (if-not (fn? f)
+                   (p/resolved (str "delivery requested for '" l "' but no Kotoba delivery adapter is configured"))
+                   (-> (p/let [result (f job l content {:for-failure failed?})]
+                         (cond
+                           (and (map? result) (:error result)) (str (:error result))
+                           (false? result) "delivery adapter returned false"
+                           :else nil))
+                       (p/catch (fn [e] (str "delivery adapter failed: " (.-message e))))))))]
+    (if (empty? targets)
       (p/resolved nil)
-      (if-not (fn? delivery-fn)
-        (p/resolved (str "delivery requested for '" lane "' but no Kotoba delivery adapter is configured"))
-        (-> (p/let [result (delivery-fn job lane content {:for-failure failed?})]
-              (cond
-                (and (map? result) (:error result)) (str (:error result))
-                (false? result) "delivery adapter returned false"
-                :else nil))
-            (p/catch (fn [e] (str "delivery adapter failed: " (.-message e)))))))))
+      (p/let [errs (p/all (map send targets))]
+        (let [joined (str/join "; " (remove str/blank? errs))]
+          (when-not (str/blank? joined) joined))))))
 
 (declare run-job-core)
 
@@ -744,11 +748,19 @@
                   error (or (get-in result [:result :error :error])
                             (get-in result [:result :exit-reason])
                             "execution failed")
-                  outcome (cond
-                            (= "silent" (:status result)) "suppressed"
-                            (:delivery-error result) "failed"
-                            (= "local" (str/lower-case (delivery-lane job (= "error" (:status result))))) "not_configured"
-                            :else "delivered")]
+                  lane (delivery-lane job (= "error" (:status result)))
+                  lane-names (delivery/lanes lane)
+                  should-deliver (not (every? #(= "local" (str/lower-case %)) lane-names))
+                  has-adapter? (or (fn? (:delivery-fn opts))
+                                   (some delivery/adapter-for
+                                         (remove #(= "local" (str/lower-case %)) lane-names)))
+                  outcome (delivery/classify-outcome
+                           {:delivery-error (:delivery-error result)
+                            :should-deliver should-deliver
+                            :unresolved-origin (and should-deliver (not has-adapter?))
+                            :normalized-deliver (delivery/normalize-deliver-value lane)
+                            :notification-suppressed (= "silent" (:status result))
+                            :success success?})]
               (if success?
                 (execution-ledger/resolve-incidents! home (get job "id"))
                 (let [incident (execution-ledger/upsert-incident! home (get job "id") error (:output-file result))]
