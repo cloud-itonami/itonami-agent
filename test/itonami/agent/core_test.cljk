@@ -8,6 +8,7 @@
             [itonami.agent.manifest :as manifest]
             [itonami.agent.provider :as provider]
             [itonami.agent.cron :as cron]
+            [itonami.agent.notepad :as notepad]
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.tools :as tools]
@@ -861,3 +862,43 @@ plain: true
     (testing "steer/stop on an unknown child answer honestly"
       (is (str/includes? (str (get (call {"action" "steer" "subagent_id" "sub-none" "message" "m"}) "error")) "no such subagent"))
       (is (str/includes? (str (get (call {"action" "stop" "subagent_id" "sub-none"}) "error")) "no such subagent")))))
+
+(deftest notepad-hermes-contract
+  (let [home (h/join (h/tmp-dir) (str "itonami-notepad-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    (testing "set/get/list/delete round trip"
+      (let [r (notepad/set-note home "job1" "cursor" "42")]
+        (is (= "42" (get r "value")))
+        (is (= "42" (notepad/get-note home "job1" "cursor")))
+        (is (= ["cursor"] (map #(get % "key") (notepad/list-notes home "job1"))))
+        (is (true? (notepad/delete-note home "job1" "cursor")))
+        (is (false? (notepad/delete-note home "job1" "cursor")))
+        (is (nil? (notepad/get-note home "job1" "cursor")))))
+    (testing "documented caps refuse and leave the store untouched"
+      (is (thrown? js/Error (notepad/set-note home "job1" (apply str (repeat 129 "k")) "v")))
+      (is (thrown? js/Error (notepad/set-note home "job1" "big" (apply str (repeat (inc notepad/max-value-bytes) "a")))))
+      (notepad/clear-notepad home "job1")
+      (doseq [k ["a" "b" "c"]]
+        (notepad/set-note home "job1" k (apply str (repeat notepad/max-value-bytes "x"))))
+      (is (thrown? js/Error (notepad/set-note home "job1" "d" (apply str (repeat notepad/max-value-bytes "x"))))
+          "the 4th 16KB entry would exceed the 64KB per-job total")
+      (is (= ["a" "b" "c"] (map #(get % "key") (notepad/list-notes home "job1")))
+          "the refused write left the store untouched"))
+    (testing "render: an empty notepad is byte-identical (''), notes render as a prompt section"
+      (is (= "" (notepad/render-notepad-section home "job2")))
+      (notepad/set-note home "job1" "cursor" "42")
+      (let [s (notepad/render-notepad-section home "job1")]
+        (is (str/starts-with? s "## Job notepad (persistent across runs)"))
+        (is (str/includes? s "- cursor: 42"))
+        (is (str/includes? s "itonami-agent cron notepad job1 set"))))
+    (testing "build-prompt injects the section ahead of the job prompt"
+      (let [[prompt _] (cron/build-prompt {:home home} {"id" "job1" "prompt" "do the thing"})]
+        (is (str/includes? prompt "## Job notepad (persistent across runs)"))
+        (is (< (str/index-of prompt "## Job notepad") (str/index-of prompt "do the thing")))))
+    (testing "clear-notepad deletes a job's keys and no-ops without creating the DB"
+      (is (pos? (notepad/clear-notepad home "job1")))
+      (is (= [] (notepad/list-notes home "job1")))
+      (h/rm (notepad/db-path home))
+      (is (zero? (notepad/clear-notepad home "job1")))
+      (is (not (h/exists? (notepad/db-path home))) "no notepad file -> no DB is created"))
+    (h/rm home)))

@@ -1,0 +1,133 @@
+(ns itonami.agent.notepad
+  "Per-job durable KV notepad (cursors, watermarks) carried across cron
+  wake-ups — Hermes cron/notepad.py with the same store shape (profile-local
+  SQLite next to the executions ledger) and the same documented caps:
+  16 KB per value, 128 characters per key, 64 KB per job in total. Oversized
+  writes fail and leave the store untouched.
+
+  The write path is the CLI (`itonami-agent cron notepad <job_id> set ...`)
+  via the terminal tool; no model tool is added, matching Hermes. The
+  section is prompt-injected each run and renders '' when unused, so jobs
+  that never touch the notepad keep a byte-identical prompt."
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]
+            ["node:sqlite" :as sqlite]))
+
+(def max-value-bytes (* 16 1024))
+(def max-key-chars 128)
+(def max-job-total-bytes (* 64 1024))
+
+(defn db-path [home] (h/join home "cron" "notepad.db"))
+
+(defn- open-db [home]
+  (let [f (db-path home)]
+    (h/mkdirs (h/dirname f))
+    (let [db (sqlite/DatabaseSync. f)]
+      (.exec db "PRAGMA journal_mode=WAL")
+      (.exec db "CREATE TABLE IF NOT EXISTS cron_notepad (
+        job_id TEXT NOT NULL,
+        key TEXT NOT NULL,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (job_id, key))")
+      db)))
+
+(defn- utf8-bytes [s] (.-length (js/Buffer.from (str s) "utf8")))
+
+(defn- validate! [job-id key value]
+  (when (str/blank? (str job-id))
+    (throw (ex-info "job_id must be non-empty" {})))
+  (when (str/blank? (str key))
+    (throw (ex-info "key must be non-empty" {})))
+  (when (> (count (str key)) max-key-chars)
+    (throw (ex-info (str "key too long (max " max-key-chars " characters)") {})))
+  (when (> (utf8-bytes value) max-value-bytes)
+    (throw (ex-info (str "value too large (max " max-value-bytes " bytes per key)") {}))))
+
+(defn set-note
+  "Upsert one key. Throws when a size cap would be exceeded; the store is
+  left untouched in that case."
+  [home job-id key value]
+  (let [job-id (str job-id) key (str key) value (str value)]
+    (validate! job-id key value)
+    (let [db (open-db home)
+          now (h/iso-local)]
+      (try
+        (let [row (.get (.prepare db (str "SELECT COALESCE(SUM(LENGTH(CAST(key AS BLOB))"
+                                          " + LENGTH(CAST(value AS BLOB))), 0) AS n"
+                                          " FROM cron_notepad WHERE job_id=? AND key<>?"))
+                        job-id key)
+              other-bytes (js/parseInt (str (aget row "n")) 10)
+              entry-bytes (+ (utf8-bytes key) (utf8-bytes value))]
+          (when (> (+ other-bytes entry-bytes) max-job-total-bytes)
+            (throw (ex-info (str "notepad full: job '" job-id "' would exceed "
+                                 max-job-total-bytes " bytes total; delete unused keys first")
+                            {})))
+          (.run (.prepare db (str "INSERT INTO cron_notepad (job_id, key, value, updated_at)"
+                                  " VALUES (?, ?, ?, ?)"
+                                  " ON CONFLICT(job_id, key)"
+                                  " DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at"))
+                job-id key value now)
+          {"job_id" job-id "key" key "value" value "updated_at" now})
+        (finally (.close db))))))
+
+(defn get-note [home job-id key]
+  (let [db (open-db home)]
+    (try
+      (let [row (.get (.prepare db "SELECT value FROM cron_notepad WHERE job_id=? AND key=?")
+                      (str job-id) (str key))]
+        (when row (aget row "value")))
+      (finally (.close db)))))
+
+(defn delete-note [home job-id key]
+  (let [db (open-db home)]
+    (try
+      (let [r (.run (.prepare db "DELETE FROM cron_notepad WHERE job_id=? AND key=?")
+                    (str job-id) (str key))]
+        (pos? (or (.-changes r) 0)))
+      (finally (.close db)))))
+
+(defn list-notes
+  "All entries for one job, sorted by key."
+  [home job-id]
+  (let [db (open-db home)]
+    (try
+      (let [rows (.all (.prepare db (str "SELECT job_id, key, value, updated_at FROM cron_notepad"
+                                         " WHERE job_id=? ORDER BY key"))
+                       (str job-id))]
+        (vec (for [i (range (.-length rows))]
+               (let [r (aget rows i)]
+                 {"job_id" (aget r "job_id") "key" (aget r "key")
+                  "value" (aget r "value") "updated_at" (aget r "updated_at")}))))
+      (finally (.close db)))))
+
+(defn clear-notepad
+  "Delete every key for one job (called when a job is removed). Returns the
+  row count; no-ops without creating the DB when no notepad file exists."
+  [home job-id]
+  (if-not (h/file? (db-path home))
+    0
+    (let [db (open-db home)]
+      (try
+        (let [r (.run (.prepare db "DELETE FROM cron_notepad WHERE job_id=?") (str job-id))]
+          (or (.-changes r) 0))
+        (finally (.close db))))))
+
+(defn render-notepad-section
+  "The job's notepad as a prompt section. An empty notepad returns '' so jobs
+  that never use the feature get a byte-identical prompt (prompt-cache and
+  drift safety)."
+  [home job-id]
+  (try
+    (let [notes (list-notes home job-id)]
+      (if (empty? notes)
+        ""
+        (str "## Job notepad (persistent across runs)\n"
+             "This durable scratchpad survives between scheduled runs of this "
+             "job. Update it via the CLI, e.g.:\n"
+             "`itonami-agent cron notepad " job-id " set <key> <value>` "
+             "(also: get/delete/list; `itonami-agent cron notepad " job-id " delete "
+             "<key>` removes an entry).\n\n"
+             (str/join "\n" (for [n notes] (str "- " (get n "key") ": " (get n "value"))))
+             "\n\n")))
+    (catch :default _ "")))

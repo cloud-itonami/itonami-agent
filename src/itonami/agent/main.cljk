@@ -46,6 +46,7 @@
             [itonami.agent.browser :as browser]
             [itonami.agent.computer-use :as computer-use]
             [itonami.agent.cron :as cron]
+            [itonami.agent.notepad :as notepad]
             [itonami.agent.mcp :as mcp]
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
@@ -301,6 +302,25 @@
                           " type=" (get r "failure_type")
                           " id=" (get r "id")
                           " last=" (get r "last_seen_at"))))))
+
+      "notepad"
+      (let [[job-id verb key value] args]
+        (when-not (and job-id (#{"set" "get" "delete" "list"} verb))
+          (die 2 (str "usage: itonami-agent cron notepad <job-id> set <key> <value>"
+                      " | get <key> | delete <key> | list")))
+        (case verb
+          "set" (do (when (nil? value)
+                      (die 2 "usage: itonami-agent cron notepad <job-id> set <key> <value>"))
+                    (let [r (notepad/set-note home job-id key value)]
+                      (println (str (get r "key") " = " (get r "value")))))
+          "get" (if-let [v (notepad/get-note home job-id key)]
+                  (println v)
+                  (println (str key " is not set")))
+          "delete" (println (if (notepad/delete-note home job-id key)
+                              "deleted"
+                              (str "no such key: " key)))
+          "list" (doseq [n (notepad/list-notes home job-id)]
+                   (println (str (get n "key") " = " (get n "value"))))))
 
       "status"
       (let [hb (h/join home "cron" "ticker_heartbeat")]
