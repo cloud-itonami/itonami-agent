@@ -53,10 +53,18 @@ Definition = `SOUL.md`, `profile.yaml`, `config.yaml`, `.env`,
 | browser navigation, snapshot, click, type, scroll, back, key press, image listing, screenshot vision, console | local Chrome through `agent-browser`; a Kotoba loopback proxy checks the allowlist and every DNS result for HTTP, HTTPS CONNECT, redirects, and subresources, pins the selected public IP, disables Chromium's implicit loopback proxy bypass, and closes the per-run session at loop end. Browser output is scrubbed for common credential forms. Cloud/CDP backends, raw CDP, dialog control, vault tools, and `browser_exec` remain unsupported and readiness-blocked |
 | notepad, messaging gateway adapters | **not implemented**; Kotoba also keeps its detailed local run log in `cron/itonami-runs.jsonl` |
 
-`delegate_task` is currently limited to up to three parallel foreground turns.
-Hermes background/list/steer/stop controls for agent turns, image inputs, and
-output-schema validation are not implemented. This is partial tool-contract
-coverage, not full Hermes agent parity.
+`delegate_task` carries Hermes' argument contract: `tasks` up to 10
+(`delegation.max_concurrent_children`), `tasks[].goal/context/output_schema/
+images`, and `action` spawn·list·steer·stop with `subagent_id`/`message`.
+One-shot sessions join their foreground children and return `results` in the
+call (as Hermes does without a later-result consumer); `output_schema` is
+told to the child up front and validated with one bounded correction retry
+(`schema_valid` / `schema_errors` beside the raw summary, which is never
+discarded). Children cannot call `delegate_task`, `clarify`, `memory` or
+cron tools. What remains of Hermes' delegation surface: background children
+(results re-entering between turns), steer as a mid-run tool-result append,
+and live cancel — joined foreground children answer those actions honestly
+instead of pretending.
 
 Home Assistant uses the profile's `HASS_URL` / `HASS_TOKEN` (default URL:
 `http://homeassistant.local:8123`); redirects are refused and the service-call
