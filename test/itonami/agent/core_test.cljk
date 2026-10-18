@@ -13,6 +13,7 @@
             [itonami.agent.delivery-queue :as delivery-queue]
             [itonami.agent.vault :as vault]
             [itonami.agent.oauth :as oauth]
+            [itonami.agent.browser-provider :as browser-provider]
             ["node:http" :as http]
             [itonami.agent.platform-adapters :as platform-adapters]
             [itonami.agent.execution-ledger :as execution-ledger]
@@ -1281,3 +1282,33 @@ plain: true
                            nil)
                          (p/catch (fn [e] (is (nil? e) (str "oauth flow crashed: " (.-message e)))))
                          (p/finally (fn [_ _] (.close srv) (h/rm home) (done)))))))))))
+
+(deftest cloud-provider-resolution
+  ;; Hermes agent/browser_registry._resolve: explicit wins regardless of
+  ;; availability; unregistered falls back; only the legacy list auto-detects
+  (let [mk (fn [name avail] {:name name :is-available (fn [] avail)
+                             :create-session (fn [task] {"session_id" (str name "-" task)})
+                             :close-session (fn [_] true) :emergency-cleanup (fn [_])})
+        cleanup (fn [] (reset! browser-provider/registry {}))]
+    (cleanup)
+    (browser-provider/register-provider! (mk "browser-use" false))
+    (browser-provider/register-provider! (mk "browserbase" true))
+    (browser-provider/register-provider! (mk "firecrawl" true))
+    (testing "explicit browser.cloud_provider wins regardless of is_available"
+      (is (= "browser-use" (:name (browser-provider/resolve-provider "browser-use")))
+          "a typed X_API_KEY error is better than silently switching backends"))
+    (testing "configured but unregistered falls back to auto-detect"
+      (is (= "browserbase" (:name (browser-provider/resolve-provider "nope")))))
+    (testing "auto-detect walks the legacy list only"
+      (is (= "browserbase" (:name (browser-provider/resolve-provider nil)))
+          "browser-use is unavailable, so its order partner wins")
+      (is (nil? (do (browser-provider/unregister-provider! "browserbase")
+                    (browser-provider/resolve-provider "local")))
+          "explicit local = no cloud provider")
+      (is (nil? (browser-provider/resolve-provider nil))
+          "a Firecrawl key shared with web extract never routes to a paid cloud browser"))
+    (testing "a provider whose is_available throws is treated as unavailable"
+      (browser-provider/register-provider! {:name "browserbase" :is-available (fn [] (throw (js/Error. "boom")))})
+      (is (nil? (browser-provider/resolve-provider nil))))
+    (cleanup)))
+
