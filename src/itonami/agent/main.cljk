@@ -86,6 +86,7 @@
 (defn- run-opts [opts prof]
   (cond-> {:model (:model opts) :provider (:provider opts) :pinned? (boolean (:model opts))
            :toolsets (:toolsets opts) :platform "cli" :load-context? true :cwd (js/process.cwd)
+           :join-children? (:join-children? opts)
            :tool-overrides {"cronjob_manage" (fn [_ args] (cron/manage prof args))}}
     (:verbose opts) (assoc :on-event log-event)))
 
@@ -208,7 +209,21 @@
                             true)))]
     (println (str "itonami-agent · profile " (:name prof) " · /exit to quit"))
     (letfn [(ask []
-              (.question rl "> "
+              (let [pending (agent-loop/delegate-pending-results!)]
+                (if (seq pending)
+                  ;; background results re-enter as a message between turns
+                  ;; (one message per call): acknowledge, then end the turn
+                  (-> ((executor opts) prof
+                       (str "## Delegated task results (arrived between your turns)\n"
+                            (str/join "\n" (for [r pending]
+                                              (str "- " (get r "goal") " [" (get r "status") "]: "
+                                                   (or (get r "summary") (get r "error")))))
+                            "\n\nAcknowledge these results in one line, then end your turn.")
+                       (run-opts (assoc opts :join-children? false) prof))
+                      (p/then (fn [r]
+                                (when (:final r) (println (:final r)))
+                                (ask))))
+                  (.question rl "> "
                          (fn [line]
                            (if (or (nil? line) (#{"/exit" "/quit"} (str/trim line)))
                              (.close rl)
@@ -220,7 +235,7 @@
                                    (p/then (fn [r]
                                              (println (or (:final r) (str "[" (:exit-reason r) "] " (get-in r [:error :error]))))
                                              (swap! history #(str % "\nUser: " line "\nAssistant: " (:final r)))
-                                             (ask)))))))))]
+                                             (ask)))))))))))]
       (ask))))
 
 ;; ---------------------------------------------------------------- cron
