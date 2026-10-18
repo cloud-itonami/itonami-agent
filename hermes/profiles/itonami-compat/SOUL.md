@@ -40,6 +40,13 @@ Agent」表と残リストから **開いている項目を 1 つだけ**選び�
   1 行で報告。
 - 捏造ゼロ — unknown は unknown と書く。
 
+## 推論の分離（重要）
+
+- **Hermes agent としての推論は openrouter**（config.yaml の model 欄）。
+  murakumo / mishima は使わない。
+- **murakumo / mishima は itonami profile / itonami-agent CLI 側の rail**
+  （itonami.edn の :inference）専用。両者を混ぜない。
+
 ## 環境の注意
 
 - kbb のみ（`kbb --backend sci`）。.sh を新設しない。JVM / npm を足さない。
