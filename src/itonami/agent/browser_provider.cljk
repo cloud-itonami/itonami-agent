@@ -1,0 +1,86 @@
+(ns itonami.agent.browser-provider
+  "Cloud browser provider registry and resolution — Hermes
+  agent/browser_provider.py + agent/browser_registry.py + the
+  tools/browser_tool_cloud.py resolution layer.
+
+  Providers are the full lifecycle (name / is-available / create-session /
+  close-session / emergency-cleanup) — there is no capability split. Plugins
+  register providers; `resolve-provider` picks the active one:
+
+    - explicit browser.cloud_provider wins regardless of is-available, so a
+      caller can surface a typed \"X_API_KEY is not set\" error instead of
+      silently switching backends
+    - a configured but unregistered name falls back to auto-detect
+    - auto-detect walks ONLY the legacy preference list (browser-use ->
+      browserbase) filtered by availability — deliberately no
+      single-eligible shortcut, so a Firecrawl key shared with the web
+      extract plugin must never silently route to a paid cloud browser
+    - otherwise nil: local browser mode"
+  (:require [clojure.string :as str]))
+
+(def default-provider "local")
+
+(def legacy-preference
+  "The only auto-eligible provider names (Hermes _LEGACY_PREFERENCE)."
+  ["browser-use" "browserbase"])
+
+(defonce registry (atom {}))
+
+(defn register-provider!
+  "Register a cloud browser provider: a map of
+  {:name :is-available :create-session :close-session :emergency-cleanup}.
+  Plugins register; the local browser never does."
+  [provider]
+  (swap! registry assoc (str (:name provider)) provider)
+  provider)
+
+(defn unregister-provider! [name]
+  (swap! registry dissoc (str name)))
+
+(defn normalize-provider
+  "Hermes normalize_browser_cloud_provider: trimmed, lower-cased;
+  \"local\" when unset or blank."
+  [v]
+  (let [s (str/trim (str/lower-case (str v)))]
+    (if (str/blank? s) default-provider s)))
+
+(defn- available-safe?
+  "is_available with exceptions treated as unavailable (Hermes
+  is_available_safe): a broken provider must not take the resolution down."
+  [provider]
+  (try (boolean ((:is-available provider))) (catch :default _ false)))
+
+(defn- auto-detect []
+  (some (fn [name]
+          (when-let [p (get @registry name)]
+            (when (available-safe? p) p)))
+        legacy-preference))
+
+(defn resolve-provider
+  "The active cloud browser provider for a config value (browser.cloud_provider),
+  or nil for local browser mode. Unset auto-detects; an explicit local is
+  never a provider."
+  [configured]
+  (let [raw (str/trim (str configured))
+        nm (normalize-provider configured)]
+    (cond
+      (= raw "local") nil
+      (not (str/blank? raw)) (or (get @registry nm) (auto-detect))
+      :else (auto-detect))))
+
+;; ---------------------------------------------------------------- lifecycle
+
+(defn create-session!
+  "Open a cloud browser session for a task; the provider's session record
+  (its CDP endpoint etc.) comes back as a map."
+  [provider task-id]
+  ((:create-session provider) (str task-id)))
+
+(defn close-session! [provider session-id]
+  (if-let [f (:close-session provider)]
+    (boolean (f session-id))
+    false))
+
+(defn emergency-cleanup! [provider session-id]
+  (when-let [f (:emergency-cleanup provider)]
+    (f session-id)))
