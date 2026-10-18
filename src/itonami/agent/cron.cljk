@@ -22,6 +22,7 @@
             [itonami.agent.profile :as profile]
             [itonami.agent.loop :as agent-loop]
             [itonami.agent.execution-ledger :as execution-ledger]
+            [itonami.agent.notepad :as notepad]
             [itonami.agent.webguard :as webguard]))
 
 (defn cron-hint [job]
@@ -288,6 +289,7 @@
 
           "remove"
           (do (remove-job! home (get job "id"))
+              (notepad/clear-notepad home (get job "id"))
               (respond {"removed" true "job_id" (get job "id")}))
 
           "pause"
@@ -613,7 +615,8 @@
                       (str "\n\n## Required skills\nLoad and follow these skills before working: "
                            (str/join ", " skills) ". Use skill_view for each skill."))
         context (related-output-block (:home prof) job)
-        base (str (get job "prompt") (or skills-hint "")
+        base (str (notepad/render-notepad-section (:home prof) (get job "id"))
+                  (get job "prompt") (or skills-hint "")
                   (when context (str "\n\n" context))
                   (when monitor-context (str "\n\n" monitor-context)))]
     (if-let [_ (and (not (true? (get job "no_agent"))) (get job "script"))]
