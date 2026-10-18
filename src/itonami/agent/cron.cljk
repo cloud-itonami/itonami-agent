@@ -816,6 +816,9 @@
                   error (or (get-in result [:result :error :error])
                             (get-in result [:result :exit-reason])
                             "execution failed")
+                  incident (when-not success?
+                             (execution-ledger/upsert-incident-for-failure!
+                              home job (:config prof) error (:output-file result)))
                   lane (delivery-lane job (= "error" (:status result)))
                   lane-names (delivery/lanes lane)
                   should-deliver (not (every? #(= "local" (str/lower-case %)) lane-names))
@@ -829,12 +832,14 @@
                             :unresolved-origin (and should-deliver (not has-adapter?))
                             :normalized-deliver (delivery/normalize-deliver-value lane)
                             :notification-suppressed (= "silent" (:status result))
+                            :incident-acked (boolean (:withheld incident))
                             :success success?})]
               (if success?
                 (execution-ledger/resolve-incidents! home (get job "id"))
-                (let [incident (execution-ledger/upsert-incident! home (get job "id") error (:output-file result))]
-                  (when (and incident (contains? #{"delivered" "not_configured"} outcome))
-                    (execution-ledger/mark-incident-alerted! home (:id incident)))))
+                (when (and (not (:withheld incident))
+                           (:incident-id incident)
+                           (contains? #{"delivered" "not_configured"} outcome))
+                  (execution-ledger/mark-incident-alerted! home (:incident-id incident))))
               (execution-ledger/finish! home execution-id success? outcome)
               (assoc result :execution-id execution-id)))
           (p/catch (fn [e]

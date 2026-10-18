@@ -1054,3 +1054,27 @@ plain: true
   (is (empty? (agent-loop/delegate-pending-results!)) "delivered once")
   (reset! agent-loop/delegate-children {})
   (reset! agent-loop/delegate-delivered #{}))
+
+(deftest repeat-alert-gate
+  ;; Hermes cron.failure_repeat_alert_hours: an alerted incident withholds
+  ;; the per-run ping until the cooldown elapses; an acked signature is
+  ;; silent until the error text changes
+  (let [home (h/join (h/tmp-dir) (str "itonami-gate-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    (let [job {"id" "jg"}
+          r1 (execution-ledger/upsert-incident-for-failure! home job {} "boom" nil)]
+      (is (false? (:withheld r1)) "the first failure is alerted, not withheld")
+      (is (true? (execution-ledger/mark-incident-alerted! home (:incident-id r1))))
+      (let [r2 (execution-ledger/upsert-incident-for-failure! home job {} "boom" nil)]
+        (is (= (:incident-id r1) (:incident-id r2)) "same job + signature -> the same incident")
+        (is (true? (:withheld r2)) "a ping inside the 6h cooldown is withheld")
+        (testing "0 re-alerts on every failing run (the pre-gate behaviour)"
+          (is (false? (:withheld (execution-ledger/upsert-incident-for-failure!
+                                  home job {"cron" {"failure_repeat_alert_hours" 0}} "boom" nil)))))
+        (testing "an acked signature is silent until the error changes"
+          (is (true? (execution-ledger/ack-incident! home (:incident-id r1))))
+          (is (true? (:withheld (execution-ledger/upsert-incident-for-failure! home job {} "boom" nil))))
+          (is (false? (:withheld (execution-ledger/upsert-incident-for-failure! home job {} "different error" nil))))
+          (is (not= (:incident-id r1) (:incident-id (execution-ledger/upsert-incident-for-failure! home job {} "different error" nil)))
+              "the error text changed: a new incident, alerted again"))))
+    (h/rm home)))
