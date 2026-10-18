@@ -1,0 +1,48 @@
+(ns itonami.agent.platform-adapters
+  "Delivery adapters for messaging platforms — the sends the cron delivery
+  queue hands to `delivery/register-adapter!`. One adapter per `deliver`
+  lane (the platform name). The token comes from the environment (never from
+  config or the job), the target chat from profile config; an unconfigured
+  lane resolves to nil so the run reports `not_configured` instead of
+  pretending."
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]))
+
+;; ---------------------------------------------------------------- telegram
+
+(defn telegram-request
+  "The Telegram Bot API sendMessage request this adapter makes. Pure: the
+  caller owns transport and secrets."
+  [token chat-id text]
+  {:url (str "https://api.telegram.org/bot" token "/sendMessage")
+   :body (h/json-str {"chat_id" chat-id "text" (str text)})})
+
+(defn- telegram-adapter [token chat-id]
+  (fn [_job _lane content _opts]
+    (-> (js/fetch (:url (telegram-request token chat-id content))
+                  #js {:method "POST"
+                       :headers #js {"Content-Type" "application/json"}
+                       :body (:body (telegram-request token chat-id content))})
+        (.then (fn [res]
+                 (if (.-ok res)
+                   nil
+                   (str "telegram sendMessage failed: HTTP " (.-status res)))))
+        (.catch (fn [e] (str "telegram sendMessage failed: " (.-message e)))))))
+
+;; ---------------------------------------------------------------- registry
+
+(defn for-lane
+  "The built-in adapter for a deliver lane, or nil when this lane has no
+  configured platform. `config` is the profile's config.yaml map.
+  telegram: token from the env named by delivery.telegram.token_env
+  (default TELEGRAM_BOT_TOKEN), target chat from delivery.telegram.chat_id."
+  [lane config]
+  (case (str/lower-case (str lane))
+    "telegram"
+    (let [c (get-in config ["delivery" "telegram"])
+          token-env (or (get c "token_env") "TELEGRAM_BOT_TOKEN")
+          token (h/env token-env)
+          chat-id (get c "chat_id")]
+      (when (and (not (str/blank? (str token))) (not (str/blank? (str chat-id))))
+        (telegram-adapter token chat-id)))
+    nil))

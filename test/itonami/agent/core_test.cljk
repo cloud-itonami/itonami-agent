@@ -11,6 +11,7 @@
             [itonami.agent.notepad :as notepad]
             [itonami.agent.delivery :as delivery]
             [itonami.agent.delivery-queue :as delivery-queue]
+            [itonami.agent.platform-adapters :as platform-adapters]
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.tools :as tools]
@@ -975,3 +976,17 @@ plain: true
       (is (= "exec3" (get (delivery-queue/claim-next! home) "execution_id")))
       (is (nil? (delivery-queue/claim-next! home))))
     (h/rm home)))
+
+(deftest platform-adapters-telegram
+  (testing "the sendMessage request is built exactly (pure; transport and secrets stay with the caller)"
+    (let [r (platform-adapters/telegram-request "TOKEN" "42" "hello")]
+      (is (= "https://api.telegram.org/botTOKEN/sendMessage" (:url r)))
+      (is (= {"chat_id" "42" "text" "hello"} (h/json-parse (:body r))))))
+  (testing "a lane resolves to an adapter only when its platform is configured"
+    (is (nil? (platform-adapters/for-lane "telegram" {})) "no token env, no chat -> not_configured, never a fake send")
+    (is (nil? (platform-adapters/for-lane "telegram" {"delivery" {"telegram" {"chat_id" "42"}}}))
+        "token env is empty in tests")
+    (is (nil? (platform-adapters/for-lane "slack" {"delivery" {"telegram" {}}})) "no built-in slack adapter")
+    (do (aset (.-env js/process) "ITONAMI_TEST_TG_TOKEN" "x")
+        (is (fn? (platform-adapters/for-lane "Telegram" {"delivery" {"telegram" {"token_env" "ITONAMI_TEST_TG_TOKEN" "chat_id" "42"}}}))
+            "lane names are case-insensitive"))))

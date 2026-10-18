@@ -25,6 +25,7 @@
             [itonami.agent.notepad :as notepad]
             [itonami.agent.delivery :as delivery]
             [itonami.agent.delivery-queue :as delivery-queue]
+            [itonami.agent.platform-adapters :as platform-adapters]
             [itonami.agent.webguard :as webguard]))
 
 (defn cron-hint [job]
@@ -708,12 +709,12 @@
               failure (get job "deliver"))]
     (delivery/normalize-deliver-value raw)))
 
-(defn- deliver-output [home execution-id job content failed? delivery-fn]
+(defn- deliver-output [home execution-id job content failed? delivery-fn config]
   (let [lane (delivery-lane job failed?)
         names (delivery/lanes lane)
         targets (remove #(= "local" (str/lower-case %)) names)
         send (fn [l]
-               (let [f (or (delivery/adapter-for l) delivery-fn)]
+               (let [f (or (delivery/adapter-for l) (platform-adapters/for-lane l config) delivery-fn)]
                  (if-not (fn? f)
                    (p/resolved (str "delivery requested for '" l "' but no Kotoba delivery adapter is configured"))
                    (-> (p/let [result (f job l content {:for-failure failed?})]
@@ -761,7 +762,8 @@
                   lane-names (delivery/lanes lane)
                   should-deliver (not (every? #(= "local" (str/lower-case %)) lane-names))
                   has-adapter? (or (fn? (:delivery-fn opts))
-                                   (some delivery/adapter-for
+                                   (some #(or (delivery/adapter-for %)
+                                              (platform-adapters/for-lane % (:config prof)))
                                          (remove #(= "local" (str/lower-case %)) lane-names)))
                   outcome (delivery/classify-outcome
                            {:delivery-error (:delivery-error result)
@@ -830,7 +832,7 @@
               f (save-output! home job doc started)
               delivery-content (or final err "")
               finished (js/Date.)]
-          (p/let [delivery-error (if silent? nil (deliver-output home execution-id job delivery-content failed? delivery-fn))]
+          (p/let [delivery-error (if silent? nil (deliver-output home execution-id job delivery-content failed? delivery-fn (:config prof)))]
           (record-run-state! home job started failed? err delivery-error)
           (h/spit (h/join home "cron" "usage_audit.jsonl")
                   (str (h/json-str {"ts" (h/iso-local finished true) "job_id" (get job "id") "fire_id" (h/random-hex 8)
