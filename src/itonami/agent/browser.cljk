@@ -310,3 +310,106 @@
                        (.close server (fn [] nil))
                        (swap! proxies dissoc key))
                      nil))))))
+
+
+;; ---------------------------------------------------------------- raw CDP
+;; browser_cdp / browser_dialog (Hermes tools/browser_cdp_tool.py +
+;; tools/browser_dialog_tool.py): the CDP escape hatch, over a configured
+;; CDP endpoint only (the same sources the run gate checks).
+
+(defn cdp-endpoint
+  "The configured CDP endpoint: browser.cdp_url / browser.cdp_endpoint in
+  config.yaml, or the BROWSER_CDP_URL env. nil when none is configured."
+  [ctx]
+  (let [c (:browser-config ctx)]
+    (or (get c "cdp_url") (get c "cdp_endpoint") (h/env "BROWSER_CDP_URL"))))
+
+(defn- ws-url
+  "ws(s):// is used as-is; http(s):// resolves webSocketDebuggerUrl from
+  /json/version; host:port becomes ws://host:port."
+  [endpoint]
+  (let [e (str/trim (str endpoint))]
+    (cond
+      (re-matches #"(?i)^wss?://.*" e) (p/resolved e)
+      (re-matches #"(?i)^https?://.*" e)
+      (-> (js/fetch (str (str/replace e #"/$" "") "/json/version"))
+          (.then (fn [res] (if (.-ok res) (.json res) (throw (js/Error. (str "CDP endpoint /json/version: HTTP " (.-status res)))))))
+          (.then (fn [j] (or (aget j "webSocketDebuggerUrl")
+                             (throw (js/Error. "CDP endpoint /json/version has no webSocketDebuggerUrl"))))))
+      :else (p/resolved (str "ws://" e)))))
+
+(defn- redact-cdp-output
+  "Credential-shaped strings never leave the host, matching the browser
+  output scrubbing of the local proxy."
+  [x]
+  (cond
+    (string? x) (str/replace x secret-url-pattern "[redacted]")
+    (map? x) (into {} (map (fn [[k v]] [k (redact-cdp-output v)]) x))
+    (vector? x) (mapv redact-cdp-output x)
+    (array? x) (mapv redact-cdp-output (js->clj x))
+    :else x))
+
+(defn- connect! [url]
+  (p/create
+   (fn [resolve reject]
+     (let [ws (js/WebSocket. url)
+           timer (js/setTimeout #(do (.close ws) (reject (js/Error. "CDP connect timed out"))) 15000)]
+       (set! (.-onopen ws) (fn [_] (js/clearTimeout timer) (resolve ws)))
+       (set! (.-onerror ws) (fn [_] (js/clearTimeout timer) (reject (js/Error. "CDP connection failed"))))))))
+
+(defn- ws-call!
+  "One CDP request/response over the socket. Resolves the `result`, rejects
+  with the CDP error message."
+  [ws counter pending method params session-id]
+  (p/create
+   (fn [resolve reject]
+     (let [id (swap! counter inc)]
+       (swap! pending assoc id {:resolve resolve :reject reject :method method})
+       (set! (.-onmessage ws)
+             (fn [ev]
+               (let [msg (try (h/json-parse (.-data ev)) (catch :default _ nil))
+                     id (when msg (aget msg "id"))]
+                 (when-let [slot (and id (get @pending id))]
+                   (swap! pending dissoc id)
+                   (if-let [err (aget msg "error")]
+                     ((:reject slot) (js/Error. (str (:method slot) ": " (or (aget err "message") (h/json-str err)))))
+                     ((:resolve slot) (aget msg "result")))))))
+       (.send ws (h/json-str (cond-> {"id" id "method" method "params" (or params {})}
+                               (not (str/blank? (str session-id))) (assoc "sessionId" session-id))))))))
+
+(defn cdp-send
+  "browser_cdp: send one raw CDP command to the configured endpoint.
+  Resolves to {\"success\" true \"method\" ... \"result\" ...} or {\"error\" ...}."
+  [ctx {:strs [method params target_id]}]
+  (let [endpoint (cdp-endpoint ctx)]
+    (cond
+      (str/blank? (str method))
+      (p/resolved (h/json-str {"error" "method is required"}))
+      (or (nil? endpoint) (str/blank? (str endpoint)))
+      (p/resolved (h/json-str {"error" "no CDP endpoint is configured (browser.cdp_url / browser.cdp_endpoint / BROWSER_CDP_URL)"}))
+      :else
+      (-> (p/let [url (ws-url endpoint)
+                  ws (connect! url)
+                  counter (atom 0)
+                  pending (atom {})
+                  session (when-not (str/blank? (str target_id))
+                            (ws-call! ws counter pending "Target.attachToTarget"
+                                      {"targetId" target_id "flatten" true} nil))
+                  sid (when session (aget session "sessionId"))
+                  result (ws-call! ws counter pending (str method) params sid)
+                  _ (.close ws)]
+            (h/json-str {"success" true "method" (str method) "result" (redact-cdp-output (js->clj result))}))
+          (p/catch (fn [e] (h/json-str {"error" (str (.-message e))})))))))
+
+(defn dialog
+  "browser_dialog: answer the open JavaScript dialog (CDP
+  Page.handleJavaScriptDialog). accept clicks OK / returns the prompt text;
+  dismiss clicks Cancel / returns null. `dialog_id` names the CDP target of
+  the dialog when several are queued. Requires a CDP-capable backend."
+  [ctx {:strs [action prompt_text dialog_id]}]
+  (if-not (contains? #{"accept" "dismiss"} (str action))
+    (p/resolved (h/json-str {"error" "action must be accept or dismiss"}))
+    (cdp-send ctx {"method" "Page.handleJavaScriptDialog"
+                   "params" {"accept" (= "accept" (str action))
+                             "promptText" (or prompt_text "")}
+                   "target_id" dialog_id})))

@@ -112,6 +112,18 @@
    (fn-schema "skill_view" "Read a skill's SKILL.md (or a file inside the skill)."
               {"name" {"type" "string"} "file_path" {"type" "string"}}
               ["name"])
+   "browser_cdp"
+   (fn-schema "browser_cdp" "Send a raw Chrome DevTools Protocol (CDP) command. Escape hatch for browser operations not covered by the other browser tools. Requires a reachable CDP endpoint (browser.cdp_url / browser.cdp_endpoint / BROWSER_CDP_URL). Returns {success, method, result} or {error}."
+              {"method" {"type" "string" "description" "CDP method, e.g. Target.attachToTarget"}
+               "params" {"type" "object" "additionalProperties" true "description" "CDP parameters for the method"}
+               "target_id" {"type" "string" "description" "Attach to this target first (flattened session) and send the command inside it"}}
+              ["method"])
+   "browser_dialog"
+   (fn-schema "browser_dialog" "Answer the open JavaScript dialog. 'accept' clicks OK / returns the prompt text; 'dismiss' clicks Cancel / returns null from prompt(). For beforeunload dialogs: 'accept' allows the navigation, 'dismiss' keeps the page. Requires a CDP-capable backend."
+              {"action" {"type" "string" "enum" ["accept" "dismiss"]}
+               "prompt_text" {"type" "string" "description" "Response string for a prompt() dialog. Ignored for other dialog types. Defaults to empty string."}
+               "dialog_id" {"type" "string" "description" "Specific dialog to respond to (its CDP target id). Required only when multiple dialogs are queued."}}
+              ["action"])
    "skills_list"
    (fn-schema "skills_list" "List available profile skills with names, descriptions, and categories. Use skill_view(name) to load a skill."
               {"category" {"type" "string" "description" "Optional category filter"}}
@@ -2431,6 +2443,7 @@
    "browser_scroll" browser/scroll "browser_back" browser/back
    "browser_press" browser/press "browser_get_images" browser/get-images
    "browser_console" browser/console-output
+   "browser_cdp" browser/cdp-send "browser_dialog" browser/dialog
    "browser_vision" browser-vision
    "vision_analyze" vision-analyze
    "computer_use" computer-use/call

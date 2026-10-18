@@ -29,6 +29,96 @@
                    (str "telegram sendMessage failed: HTTP " (.-status res)))))
         (.catch (fn [e] (str "telegram sendMessage failed: " (.-message e)))))))
 
+
+;; ---------------------------------------------------------------- slack
+
+(defn slack-request
+  "The Slack chat.postMessage request (bot token). Pure."
+  [token channel text]
+  {:url "https://slack.com/api/chat.postMessage"
+   :headers {"Authorization" (str "Bearer " token) "Content-Type" "application/json; charset=utf-8"}
+   :body (h/json-str {"channel" channel "text" (str text)})})
+
+(defn- slack-adapter [token channel]
+  (fn [_job _lane content _opts]
+    (let [r (slack-request token channel content)]
+      (-> (js/fetch (:url r) #js {:method "POST"
+                                  :headers (clj->js (:headers r))
+                                  :body (:body r)})
+          (.then (fn [res]
+                   (if (.-ok res)
+                     (.then (.json res)
+                            (fn [j]
+                              (if (aget j "ok")
+                                nil
+                                (str "slack chat.postMessage failed: " (or (aget j "error") "unknown error")))))
+                     (str "slack chat.postMessage failed: HTTP " (.-status res)))))
+          (.catch (fn [e] (str "slack chat.postMessage failed: " (.-message e))))))))
+
+;; ---------------------------------------------------------------- discord
+
+(defn discord-request
+  "The Discord execute-webhook request. Pure. The webhook URL carries its own
+  secret; it comes from config because Discord has no separate token here."
+  [webhook-url text]
+  {:url (str webhook-url "?wait=true")
+   :body (h/json-str {"content" (str text)})})
+
+(defn discord-bot-request
+  "The Discord bot-channel message request. Pure."
+  [token channel-id text]
+  {:url (str "https://discord.com/api/channels/" channel-id "/messages")
+   :headers {"Authorization" (str "Bot " token) "Content-Type" "application/json"}
+   :body (h/json-str {"content" (str text)})})
+
+(defn- discord-adapter [webhook-url token channel-id]
+  (fn [_job _lane content _opts]
+    (let [r (if webhook-url (discord-request webhook-url content) (discord-bot-request token channel-id content))]
+      (-> (js/fetch (:url r) #js {:method "POST"
+                                  :headers (clj->js (or (:headers r) {"Content-Type" "application/json"}))
+                                  :body (:body r)})
+          (.then (fn [res]
+                   (if (.-ok res) nil (str "discord send failed: HTTP " (.-status res)))))
+          (.catch (fn [e] (str "discord send failed: " (.-message e))))))))
+
+;; ---------------------------------------------------------------- mattermost
+
+(defn mattermost-request
+  "The Mattermost incoming-webhook request. Pure."
+  [webhook-url text]
+  {:url webhook-url
+   :body (h/json-str {"text" (str text)})})
+
+(defn- mattermost-adapter [webhook-url]
+  (fn [_job _lane content _opts]
+    (let [r (mattermost-request webhook-url content)]
+      (-> (js/fetch (:url r) #js {:method "POST"
+                                  :headers #js {"Content-Type" "application/json"}
+                                  :body (:body r)})
+          (.then (fn [res]
+                   (if (.-ok res) nil (str "mattermost webhook failed: HTTP " (.-status res)))))
+          (.catch (fn [e] (str "mattermost webhook failed: " (.-message e))))))))
+
+;; ---------------------------------------------------------------- matrix
+
+(defn matrix-request
+  "The Matrix m.room.message send request. Pure. One txn id per send."
+  [homeserver token room-id text]
+  {:url (str (str/replace (str homeserver) #"/$" "") "/_matrix/client/v3/rooms/"
+             (js/encodeURIComponent room-id) "/send/m.room.message/" (h/random-hex 12))
+   :headers {"Authorization" (str "Bearer " token) "Content-Type" "application/json"}
+   :body (h/json-str {"msgtype" "m.text" "body" (str text)})})
+
+(defn- matrix-adapter [homeserver token room-id]
+  (fn [_job _lane content _opts]
+    (let [r (matrix-request homeserver token room-id content)]
+      (-> (js/fetch (:url r) #js {:method "PUT"
+                                  :headers (clj->js (:headers r))
+                                  :body (:body r)})
+          (.then (fn [res]
+                   (if (.-ok res) nil (str "matrix send failed: HTTP " (.-status res)))))
+          (.catch (fn [e] (str "matrix send failed: " (.-message e))))))))
+
 ;; ---------------------------------------------------------------- registry
 
 (defn for-lane
@@ -45,4 +135,33 @@
           chat-id (get c "chat_id")]
       (when (and (not (str/blank? (str token))) (not (str/blank? (str chat-id))))
         (telegram-adapter token chat-id)))
+    "slack"
+    (let [c (get-in config ["delivery" "slack"])
+          token (h/env (or (get c "token_env") "SLACK_BOT_TOKEN"))
+          channel (get c "channel")]
+      (when (and (not (str/blank? (str token))) (not (str/blank? (str channel))))
+        (slack-adapter token channel)))
+    "discord"
+    (let [c (get-in config ["delivery" "discord"])
+          webhook (get c "webhook_url")
+          token (h/env (or (get c "token_env") "DISCORD_BOT_TOKEN"))
+          channel-id (get c "channel_id")]
+      (cond
+        (not (str/blank? (str webhook))) (discord-adapter (str webhook) nil nil)
+        (and (not (str/blank? (str token))) (not (str/blank? (str channel-id))))
+        (discord-adapter nil token channel-id)))
+    "mattermost"
+    (let [c (get-in config ["delivery" "mattermost"])
+          webhook (get c "webhook_url")]
+      (when-not (str/blank? (str webhook))
+        (mattermost-adapter (str webhook))))
+    "matrix"
+    (let [c (get-in config ["delivery" "matrix"])
+          homeserver (get c "homeserver")
+          token (h/env (or (get c "token_env") "MATRIX_ACCESS_TOKEN"))
+          room-id (get c "room_id")]
+      (when (and (not (str/blank? (str homeserver)))
+                 (not (str/blank? (str token)))
+                 (not (str/blank? (str room-id))))
+        (matrix-adapter (str homeserver) token room-id)))
     nil))
