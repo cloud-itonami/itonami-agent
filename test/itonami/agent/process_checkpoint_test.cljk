@@ -1,0 +1,83 @@
+(ns itonami.agent.process-checkpoint-test
+  "Hermes processes.json crash-recovery contract for the background terminal
+  registry (`tools/process_registry_checkpoint.py` / `_detached_host_fate`)."
+  (:require [cljs.test :refer [deftest is testing]]
+            ["node:child_process" :as cp]
+            [clojure.string :as str]
+            [itonami.agent.host :as h]
+            [itonami.agent.process :as process]))
+
+(defn- parse-json [s] (js->clj (js/JSON.parse s)))
+
+(defn- fresh-home [tag]
+  (let [home (h/join (h/tmp-dir) (str "test-proc-" tag "-" (.-pid js/process) "-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    home))
+
+(deftest process-checkpoint-hermes-format
+  (let [home (fresh-home "checkpoint")
+        res (parse-json (process/spawn! {:home home} {:env (h/process-env) :cwd home
+                                                      :argv ["sleep" "30"]
+                                                      :command "sleep 30 --token=SUPERSECRET https://user:PASSW0RD@example.com/x"}))
+        id (get res "session_id")
+        path (h/join home "processes.json")]
+    (testing "spawn checkpoints a running session in Hermes' entry shape"
+      (is (h/exists? path))
+      (let [entries (parse-json (h/slurp path))
+            e (first (filter #(= id (get % "session_id")) entries))]
+        (is (vector? entries))
+        (is (some? e))
+        (is (= "host" (get e "pid_scope")))
+        (is (= (get res "pid") (get e "pid")))
+        (is (= home (get e "cwd")))
+        (is (number? (get e "started_at")))
+        (is (number? (get e "host_start_time")))
+        (doseq [k ["command" "systemd_unit" "wsl_chain" "task_id" "owner_task_id"
+                   "session_key" "watcher_platform" "watcher_chat_id" "watcher_user_id"
+                   "watcher_user_name" "watcher_thread_id" "watcher_message_id"
+                   "watcher_interval" "parent_session_id" "notify_on_complete"
+                   "completion_output_chars" "watch_patterns" "heartbeat_seconds"
+                   "persist_on_release" "output_log"]]
+          (is (contains? e k) k))))
+    (testing "inline credentials are redacted before persisting"
+      (let [text (h/slurp path)]
+        (is (not (str/includes? text "SUPERSECRET")))
+        (is (not (str/includes? text "PASSW0RD")))))
+    (try (js/process.kill (get res "pid")) (catch :default _ nil))
+    (h/rm home)))
+
+(deftest process-checkpoint-recovery-pid-safe
+  (let [home (fresh-home "recovery")
+        child (cp/spawn "sleep" #js ["30"] #js {:detached true :stdio "ignore"})
+        pid (.-pid child)
+        runner (.-pid js/process)
+        path (h/join home "processes.json")
+        entries [{"session_id" "proc_live000001" "command" "sleep 30" "pid" pid
+                  "pid_scope" "host" "host_start_time" nil "cwd" home
+                  "started_at" 1760000000.0}
+                 {"session_id" "proc_gone000002" "command" "gone" "pid" 999999
+                  "pid_scope" "host" "host_start_time" nil "started_at" 1760000000.0}
+                 {"session_id" "proc_reused0003" "command" "reused" "pid" runner
+                  "pid_scope" "host" "host_start_time" 1 "started_at" 1760000000.0}
+                 {"session_id" "proc_sandb00004" "command" "sandbox" "pid" pid
+                  "pid_scope" "sandbox" "host_start_time" nil "started_at" 1760000000.0}]]
+    (h/spit-atomic path (h/json-str entries))
+    (testing "recovery adopts only live host PIDs still ours"
+      (let [res (parse-json (process/manage {:home home} {"action" "list"}))
+            procs (get res "processes")]
+        (is (= ["proc_live000001"] (mapv #(get % "session_id") procs)))
+        (is (= "running" (get (first procs) "status")))
+        (is (= pid (get (first procs) "pid")))))
+    (testing "a recycled PID is never adopted and never signalled"
+      ;; if the registry had adopted proc_reused0003 it would appear in the
+      ;; list above; if it had signalled it this test process would be dead
+      (is (= runner (.-pid js/process))))
+    (testing "kill reaches the adopted detached session"
+      (let [res (parse-json (process/manage {:home home} {"action" "kill" "session_id" "proc_live000001"}))]
+        (is (= "terminating" (get res "status")))
+        (is (= "proc_live000001" (get res "session_id")))))
+    (testing "checkpoint rewrite drops entries recovery did not adopt"
+      (let [ids (set (map #(get % "session_id") (parse-json (h/slurp path))))]
+        (is (= #{"proc_live000001"} ids))))
+    (try (js/process.kill pid) (catch :default _ nil))
+    (h/rm home)))
