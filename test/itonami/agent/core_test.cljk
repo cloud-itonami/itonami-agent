@@ -1094,3 +1094,79 @@ plain: true
     (testing "the adoption grace is 30s, as Hermes"
       (is (= 30 execution-ledger/handoff-adoption-grace-seconds)))
     (h/rm home)))
+
+(deftest skill-guard-delete-contract
+  ;; Hermes tools/skill_manager_guards: essential/pinned guard deletion only,
+  ;; absorbed_into must be a real umbrella, and the delete target must
+  ;; resolve inside the skills root
+  (async done
+    (let [home (h/join (h/tmp-dir) (str "itonami-skills-" (h/random-hex 4)))
+          ctx {:home home :writes (atom [])}
+          call (fn [args] (p/let [s (tools/call ctx ["skill_manage"] "skill_manage" (h/json-str args))]
+                            (h/json-parse s)))
+          mk (fn [n] {"action" "create" "name" n
+                      "content" (str "---\nname: " n "\ndescription: d\n---\nbody")})]
+      (h/mkdirs (h/join home "skills"))
+      (-> (p/let [r1 (call {"operations" [(mk "hermes-agent") (mk "thing") (mk "umbrella")]})
+                  _ (is (true? (get r1 "success")) r1)
+                  r2 (call {"operations" [{"action" "delete" "name" "hermes-agent"}]})
+                  _ (is (str/includes? (str (get r2 "error")) "essential") "essential skills never delete")
+                  _ (h/spit (h/join home "skills" ".usage.json")
+                            (h/json-str {"thing" {"pinned" true "created_by" "agent"}}))
+                  r3 (call {"operations" [{"action" "delete" "name" "thing"}]})
+                  _ (is (str/includes? (str (get r3 "error")) "pinned") "pinned skills never delete")
+                  r4 (call {"operations" [{"action" "patch" "name" "thing" "content"
+                                           "---\nname: thing\ndescription: d\n---\npatched"}]})
+                  _ (is (true? (get r4 "success")) "pins guard deletion only; patches stay allowed")
+                  _ (h/spit (h/join home "skills" ".usage.json")
+                            (h/json-str {"thing" {"pinned" false "created_by" "agent"}}))
+                  r5 (call {"operations" [{"action" "delete" "name" "thing" "absorbed_into" "thing"}]})
+                  _ (is (str/includes? (str (get r5 "error")) "cannot equal"))
+                  r6 (call {"operations" [{"action" "delete" "name" "thing" "absorbed_into" "missing"}]})
+                  _ (is (str/includes? (str (get r6 "error")) "does not exist"))
+                  r7 (call {"operations" [{"action" "delete" "name" "thing" "absorbed_into" "umbrella"}]})
+                  _ (is (true? (get r7 "success")) "a verified consolidation deletes")]
+            nil)
+          (p/catch (fn [e] (is (nil? e) (str "skill guard test crashed: " (.-message e)))))
+          (p/finally (fn [_ _] (done)))))))
+
+(deftest skill-guard-review-mode
+  ;; Hermes background-review guards: read-before-write, curator-managed
+  ;; deletes only, consolidation requires absorbed_into
+  (async done
+    (let [home (h/join (h/tmp-dir) (str "itonami-review-" (h/random-hex 4)))
+          ctx (fn [] {:home home :writes (atom []) :review? true :review-read (atom #{})})
+          call (fn [c args] (p/let [s (tools/call c ["skill_manage" "skill_view"] "skill_manage" (h/json-str args))]
+                              (h/json-parse s)))
+          mk (fn [n] {"action" "create" "name" n
+                      "content" (str "---\nname: " n "\ndescription: d\n---\nbody")})]
+      (h/mkdirs (h/join home "skills"))
+      (-> (p/let [c1 (ctx)
+                  r1 (call c1 {"operations" [(mk "kept") (mk "absorbed") (mk "umb")]})
+                  _ (is (true? (get r1 "success")) r1)
+                  ;; read-before-write: a review fork must load the target first
+                  r2 (call (ctx) {"operations" [{"action" "patch" "name" "kept" "content"
+                                                 "---\nname: kept\ndescription: d\n---\nnope"}]})
+                  _ (is (str/includes? (str (get r2 "error")) "has not been loaded")
+                        "no write without a read in this review turn")
+                  c3 (ctx)
+                  _ (tools/call c3 ["skill_manage" "skill_view"] "skill_view" (h/json-str {"name" "kept"}))
+                  r3 (call c3 {"operations" [{"action" "patch" "name" "kept" "content"
+                                               "---\nname: kept\ndescription: d\n---\nok"}]})
+                  _ (is (true? (get r3 "success")) "the read mark unblocks the write")
+                  ;; user-owned (no usage record): never archived autonomously
+                  r4 (call (ctx) {"operations" [{"action" "delete" "name" "kept"}]})
+                  _ (is (str/includes? (str (get r4 "error")) "ownership could not be verified")
+                        "no provenance record fails closed")
+                  _ (h/spit (h/join home "skills" ".usage.json")
+                            (h/json-str {"kept" {"created_by" nil} "absorbed" {"created_by" "agent"} "umb" {"created_by" "agent"}}))
+                  r5 (call (ctx) {"operations" [{"action" "delete" "name" "kept"}]})
+                  _ (is (str/includes? (str (get r5 "error")) "not curator-managed"))
+                  r6 (call (ctx) {"operations" [{"action" "delete" "name" "absorbed"}]})
+                  _ (is (str/includes? (str (get r6 "error")) "absorbed_into")
+                        "a bare curator delete is refused (#29912)")
+                  r7 (call (ctx) {"operations" [{"action" "delete" "name" "absorbed" "absorbed_into" "umb"}]})
+                  _ (is (true? (get r7 "success")) "a declared consolidation is the one legitimate delete")]
+            nil)
+          (p/catch (fn [e] (is (nil? e) (str "review guard test crashed: " (.-message e)))))
+          (p/finally (fn [_ _] (done)))))))
