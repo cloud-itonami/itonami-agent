@@ -9,6 +9,7 @@
             [itonami.agent.provider :as provider]
             [itonami.agent.cron :as cron]
             [itonami.agent.notepad :as notepad]
+            [itonami.agent.delivery :as delivery]
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.tools :as tools]
@@ -902,3 +903,38 @@ plain: true
       (is (zero? (notepad/clear-notepad home "job1")))
       (is (not (h/exists? (notepad/db-path home))) "no notepad file -> no DB is created"))
     (h/rm home)))
+
+(deftest delivery-hermes-contract
+  (testing "deliver values normalize exactly as Hermes' _normalize_deliver_value"
+    (is (= "local" (delivery/normalize-deliver-value nil)))
+    (is (= "local" (delivery/normalize-deliver-value "")))
+    (is (= "local" (delivery/normalize-deliver-value [])))
+    (is (= "local" (delivery/normalize-deliver-value ["  " "" ])))
+    (is (= "telegram" (delivery/normalize-deliver-value ["telegram"])))
+    (is (= "telegram,all" (delivery/normalize-deliver-value [" telegram " "" "all"])))
+    (is (= "telegram" (delivery/normalize-deliver-value "telegram")))
+    (is (= ["telegram" "all"] (delivery/lanes ["telegram" "all"]))))
+  (testing "bot-chat tokens parse like Hermes parse_bot_chat_deliver_token"
+    (is (= "" (delivery/parse-bot-chat-token "bot-chat")))
+    (is (= "samu" (delivery/parse-bot-chat-token "Bot-Chat:samu")))
+    (is (nil? (delivery/parse-bot-chat-token "telegram")))
+    (is (nil? (delivery/parse-bot-chat-token "bot-chatty"))))
+  (testing "outcome vocabulary matches Hermes _classify_delivery_outcome"
+    (is (= "failed" (delivery/classify-outcome {:delivery-error "boom" :should-deliver true
+                                                :normalized-deliver "telegram" :success false})))
+    (is (= "queued" (delivery/classify-outcome {:should-deliver true :delivery-queued true
+                                                :normalized-deliver "telegram" :success true})))
+    (is (= "suppressed" (delivery/classify-outcome {:should-deliver true :notification-suppressed true
+                                                    :normalized-deliver "telegram" :success true})))
+    (is (= "not_configured" (delivery/classify-outcome {:should-deliver true :unresolved-origin true
+                                                        :normalized-deliver "telegram" :success true})))
+    (is (= "delivered" (delivery/classify-outcome {:should-deliver true
+                                                   :normalized-deliver "telegram" :success true})))
+    (is (= "suppressed_acked" (delivery/classify-outcome {:should-deliver false :incident-acked true
+                                                          :normalized-deliver "local" :success false})))
+    (is (= "suppressed" (delivery/classify-outcome {:should-deliver false
+                                                    :normalized-deliver "local" :success true}))))
+  (testing "delivery adapters register per lane"
+    (delivery/register-adapter! "telegram" (fn [& _] nil))
+    (is (fn? (delivery/adapter-for "telegram")))
+    (is (nil? (delivery/adapter-for "slack")))))
