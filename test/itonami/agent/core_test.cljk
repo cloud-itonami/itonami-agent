@@ -14,6 +14,7 @@
             [itonami.agent.vault :as vault]
             [itonami.agent.oauth :as oauth]
             [itonami.agent.browser-provider :as browser-provider]
+            [itonami.agent.browser-cloud :as browser-cloud]
             ["node:http" :as http]
             [itonami.agent.platform-adapters :as platform-adapters]
             [itonami.agent.execution-ledger :as execution-ledger]
@@ -1312,3 +1313,54 @@ plain: true
       (is (nil? (browser-provider/resolve-provider nil))))
     (cleanup)))
 
+
+(deftest cloud-provider-sessions
+  ;; the bundled browserbase / browser-use plugins: REST lifecycle, the
+  ;; session-metadata contract, and the 402 paid-feature fallback sequence
+  (async done
+    (let [srv (http/createServer
+               (fn [req res]
+                 (let [u (js/URL. (.-url req) "http://127.0.0.1")
+                       path (.-pathname u)
+                       method (.-method req)
+                       respond (fn [status body]
+                                 (.writeHead res status #js {"Content-Type" "application/json"})
+                                 (.end res (h/json-str body)))]
+                   (cond
+                     (and (= method "POST") (= path "/v1/sessions"))
+                     (let [chunks (atom "")]
+                       (.on req "data" (fn [c] (swap! chunks str c)))
+                       (.on req "end"
+                            (fn []
+                              ;; paid features (keepAlive / proxies) are 402 on
+                              ;; the mock's plan: the bare payload succeeds
+                              (if (or (str/includes? @chunks "keepAlive") (str/includes? @chunks "proxies"))
+                                (respond 402 {"error" "paid feature unavailable"})
+                                (respond 201 {"id" "bb-1" "connectUrl" "wss://cloud.example/cdp"})))))
+                     (and (= method "POST") (str/starts-with? path "/v1/sessions/"))
+                     (do (.writeHead res 200) (.end res "ok"))
+                     (and (= method "POST") (= path "/browsers"))
+                     (respond 201 {"id" "bu-1" "cdpUrl" "wss://bu.example/cdp" "timeoutAt" "2026-01-01T00:00:00Z"})
+                     (and (= method "PATCH") (str/starts-with? path "/browsers/"))
+                     (do (.writeHead res 200) (.end res "ok"))
+                     :else (do (.writeHead res 404) (.end res))))))]
+      (.listen srv 0 "127.0.0.1"
+               (fn []
+                 (let [base (str "http://127.0.0.1:" (.-port (.address srv)))]
+                   (aset (.-env js/process) "BROWSERBASE_API_KEY" "bb-key")
+                   (aset (.-env js/process) "BROWSERBASE_PROJECT_ID" "bb-proj")
+                   (aset (.-env js/process) "BROWSERBASE_BASE_URL" base)
+                   (aset (.-env js/process) "BROWSER_USE_API_KEY" "bu-key")
+                   (-> (p/let [bb (browser-cloud/browserbase-provider)
+                               _ (is (true? ((:is-available bb))))
+                               s1 (browser-provider/create-session! bb "task1")
+                               _ (do (is (= "bb-1" (get s1 "bb_session_id")))
+                                     (is (= "wss://cloud.example/cdp" (get s1 "cdp_url")))
+                                     (is (str/starts-with? (get s1 "session_name") "itonami_task1_"))
+                                     (is (false? (get-in s1 ["features" "keep_alive"])) "402 dropped keepAlive")
+                                     (is (false? (get-in s1 ["features" "proxies"])) "402 dropped proxies"))
+                               ok (browser-provider/close-session! bb "bb-1")
+                               _ (is (true? (js->clj ok)) "release POST /v1/sessions/<id> accepted")]
+                         nil)
+                       (p/catch (fn [e] (is (nil? e) (str "cloud session test crashed: " (.-message e)))))
+                       (p/finally (fn [_ _] (.close srv) (done))))))))))
