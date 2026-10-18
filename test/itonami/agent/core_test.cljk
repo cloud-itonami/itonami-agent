@@ -12,6 +12,8 @@
             [itonami.agent.delivery :as delivery]
             [itonami.agent.delivery-queue :as delivery-queue]
             [itonami.agent.vault :as vault]
+            [itonami.agent.oauth :as oauth]
+            ["node:http" :as http]
             [itonami.agent.platform-adapters :as platform-adapters]
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
@@ -1215,3 +1217,67 @@ plain: true
             nil)
           (p/catch (fn [e] (is (nil? e) (str "vault tools test crashed: " (.-message e)))))
           (p/finally (fn [_ _] (done)))))))
+
+(deftest mcp-oauth-pkce-login-flow
+  ;; Full PKCE loopback login against a mock authorization server: the code
+  ;; is exchanged only with the right verifier, and the cache is issuer-bound
+  ;; exactly as the Hermes MCP token cache reads it.
+  (async done
+    (let [home (h/join (h/tmp-dir) (str "itonami-oauth-" (h/random-hex 4)))
+          challenge-store (atom nil)
+          base (atom nil)]
+      (h/mkdirs home)
+      (let [srv (http/createServer
+                 (fn [req res]
+                   (let [u (js/URL. (.-url req) "http://127.0.0.1")
+                         path (.-pathname u)]
+                     (cond
+                       (= path "/.well-known/oauth-authorization-server")
+                       (do (.writeHead res 200 #js {"Content-Type" "application/json"})
+                           (.end res (h/json-str {"issuer" @base
+                                                  "authorization_endpoint" (str @base "/authorize")
+                                                  "token_endpoint" (str @base "/token")
+                                                  "registration_endpoint" (str @base "/register")})))
+                       (= path "/register")
+                       (do (.writeHead res 200 #js {"Content-Type" "application/json"})
+                           (.end res (h/json-str {"client_id" "test-client" "token_endpoint_auth_method" "none"})))
+                       (= path "/authorize")
+                       (let [redirect (.get (.-searchParams u) "redirect_uri")
+                             state (.get (.-searchParams u) "state")
+                             ch (.get (.-searchParams u) "code_challenge")]
+                         (reset! challenge-store ch)
+                         (.writeHead res 302 #js {"Location" (str redirect "?code=mock-code&state=" state)})
+                         (.end res))
+                       (= path "/token")
+                       (let [chunks (atom "")]
+                         (.on req "data" (fn [c] (swap! chunks str c)))
+                         (.on req "end"
+                              (fn []
+                                (let [params (js/URLSearchParams. @chunks)
+                                      verifier (.get params "code_verifier")
+                                      digest (oauth/verify-challenge verifier)]
+                                  (if (and (= "mock-code" (.get params "code")) (= @challenge-store digest))
+                                    (do (.writeHead res 200 #js {"Content-Type" "application/json"})
+                                        (.end res (h/json-str {"access_token" "at-1" "refresh_token" "rt-1"
+                                                               "expires_in" 3600 "token_type" "Bearer"})))
+                                    (do (.writeHead res 400 #js {"Content-Type" "application/json"})
+                                        (.end res (h/json-str {"error" "invalid_grant"}))))))))
+                       :else (do (.writeHead res 404) (.end res))))))]
+        (.listen srv 0 "127.0.0.1"
+                 (fn []
+                   (let [port (.-port (.address srv))
+                         _ (reset! base (str "http://127.0.0.1:" port))
+                         visit (fn [url]
+                                 ;; the user's browser: follow the authorize redirect to our loopback
+                                 (-> (js/fetch url #js {:redirect "manual"})
+                                     (.then (fn [r] (js/fetch (.get (.-headers r) "location"))))))]
+                     (-> (p/let [rec (oauth/login! home "mockserver" (str @base "/mcp") {:open-url visit})
+                                 saved (h/json-parse (h/slurp (h/join home "mcp-tokens" "mockserver.json")))
+                                 meta (h/json-parse (h/slurp (h/join home "mcp-tokens" "mockserver.meta.json")))
+                                 _ (do (is (= "at-1" (get saved "access_token")))
+                                       (is (= @base (get saved "hermes_issuer")) "the cache is issuer-bound")
+                                       (is (= (str @base "/token") (get meta "token_endpoint")))
+                                       (is (mcp/oauth-cache-ready? home "mockserver" {})))]
+                           nil)
+                         (p/catch (fn [e] (is (nil? e) (str "oauth flow crashed: " (.-message e)))))
+                         (p/finally (fn [_ _] (.close srv) (h/rm home) (done)))))))))))

@@ -48,6 +48,7 @@
             [itonami.agent.cron :as cron]
             [itonami.agent.notepad :as notepad]
             [itonami.agent.vault :as vault]
+            [itonami.agent.oauth :as oauth]
             [itonami.agent.mcp :as mcp]
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
@@ -374,6 +375,27 @@
         (println (if (vault/remove-login! home handle) "removed" (str "no such handle: " handle))))
 
       (die 2 "usage: itonami-agent vault add|list|remove"))))
+
+(defn mcp-cmd
+  "MCP server operations. `login` is the interactive OAuth login (PKCE over a
+  loopback redirect, or --device for the RFC 8628 device grant); the token
+  cache lands in the profile's mcp-tokens store, issuer-bound."
+  [opts [sub & args]]
+  (let [prof (profile/load-profile (:profile opts) {:secrets? false})
+        home (:home prof)
+        server (first args)
+        spec (get-in (:config prof) ["mcp_servers" (str server)])]
+    (case sub
+      "login"
+      (do (when-not (and server spec)
+            (die 2 "usage: itonami-agent mcp login <server> [--device]   (the server must be in config.yaml mcp_servers)"))
+          (-> (p/let [rec (if (:device opts)
+                            (oauth/device-login! home server (get spec "url") {})
+                            (oauth/login! home server (get spec "url") {}))]
+                (println (str "logged in: " server "  issuer-bound until " (get rec "expires_at"))))
+              (p/catch (fn [e] (die 1 (str "mcp login failed: " (.-message e)))))))
+
+      (die 2 "usage: itonami-agent mcp login <server> [--device]"))))
 
 ;; ---------------------------------------------------------------- profile
 
@@ -1037,6 +1059,7 @@
               "bridge" (bridge)
               "chat" (chat opts)
               "vault" (vault-cmd opts (rest pos))
+              "mcp" (mcp-cmd opts (rest pos))
               "cron" (cron-cmd opts (rest pos))
               "profile" (profile-cmd opts (rest pos))
               "gateway" (if (= "run" (second pos)) (gateway-run opts) (die 2 "usage: itonami-agent gateway run"))
