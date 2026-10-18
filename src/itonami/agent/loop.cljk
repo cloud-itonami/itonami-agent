@@ -20,7 +20,27 @@
             [itonami.agent.confine :as confine]))
 
 (def wrapup-notice
-  "\n\n[RUN BUDGET] You have used most of this run's time budget. Stop starting new work: finish the current step and give your final answer now.")
+  "Hermes agent/conversation_loop.RUN_BUDGET_WRAPUP_NOTICE, verbatim."
+  "[SYSTEM NOTICE — run time budget nearly exhausted] Run time budget nearly exhausted. Stop new discovery/verification work now. Produce the required final deliverable (answer/JSON/summary) from the state you already have, completing only mandatory writes.")
+
+(defn wrap-up?
+  "Hermes' _maybe_inject_run_budget_wrapup threshold: the notice fires at
+  elapsed >= 0.8 * budget — 5 * elapsed >= 4 * budget in whole milliseconds,
+  the `wrap-up` rule of system-one/loop.edn — and never on a non-positive
+  budget (Hermes treats an unset budget as dormant)."
+  [elapsed-ms budget-ms]
+  (and (pos? budget-ms) (>= (* 5 elapsed-ms) (* 4 budget-ms))))
+
+(defn maybe-inject-run-budget-wrapup
+  "Hermes agent/conversation_loop._maybe_inject_run_budget_wrapup: append the
+  one-shot wrap-up notice (\"\\n\\n\" + notice) to the NEWEST tool result.
+  `injected?` (an atom) latches only on a successful append, so a round with
+  no tool results leaves it open and a later round delivers the notice."
+  [results injected? budget-ms elapsed-ms]
+  (if (and (seq results) (not @injected?) (wrap-up? elapsed-ms budget-ms))
+    (do (reset! injected? true)
+        (update-in results [(dec (count results)) "content"] #(str % "\n\n" wrapup-notice)))
+    results))
 
 (def guidance
   "## Finishing the job
@@ -240,6 +260,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                           "\nThese tools are unavailable in this run; do not claim that you used them.")
                      :else nil)
         usage (atom {"prompt_tokens" 0 "completion_tokens" 0 "total_tokens" 0})
+        wrapup-injected? (atom false)
         add-usage! (fn [u] (when u (swap! usage #(merge-with + % (select-keys u ["prompt_tokens" "completion_tokens" "total_tokens"])))))]
       (p/finally
        (p/loop [messages (into [{"role" "system" "content"
@@ -328,9 +349,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                         (emit {:event :tool :name nm :bytes (count out)
                                                :ms (- (h/now-ms) t1) :denied (not approved?)})
                                         (p/recur more (conj acc {"role" "tool" "tool_call_id" (get c "id") "content" out})))))
-                          results (if (and (pos? budget-ms) (> (- (h/now-ms) t0) (* 0.8 budget-ms)) (seq results))
-                                    (update-in results [(dec (count results)) "content"] str wrapup-notice)
-                                    results)]
+                          results (maybe-inject-run-budget-wrapup
+                                   results wrapup-injected? budget-ms (- (h/now-ms) t0))]
                     (let [image-message (when (seq @images)
                                           {"role" "user"
                                            "content" (into [{"type" "text"
