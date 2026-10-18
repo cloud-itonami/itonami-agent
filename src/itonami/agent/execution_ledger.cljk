@@ -153,6 +153,17 @@
         (= 1 (.-changes r)))
       (finally (.close db)))))
 
+(defn set-delivery-outcome!
+  "Settle a queued delivery's outcome onto its execution row. Fenced on the
+  execution id (primary key): idempotent, never rewrites another run."
+  [home id delivery-outcome]
+  (let [db (open-db home)]
+    (try
+      (let [r (.run (.prepare db "UPDATE executions SET delivery_outcome=? WHERE id=?")
+                    (str delivery-outcome) (str id))]
+        (= 1 (.-changes r)))
+      (finally (.close db)))))
+
 (defn rows [home job-id]
   "Read-only helper used by cron status and tests."
   (let [db (open-db home)]
