@@ -1,0 +1,17 @@
+;; Unlisted capabilities are denied. The capability list is copied into
+;; itonami.edn and grants nothing by itself — this file is the authority.
+{:yakuwari/capabilities
+ [{:capability :read_source            :decision :autonomous}
+  {:capability :review_source          :decision :autonomous}
+  {:capability :run_local_verification :decision :autonomous}
+  {:capability :build_unsigned         :decision :autonomous}
+  {:capability :modify_source          :decision :autonomous
+   :note "one topic branch per tick; tests must be green before the PR"}
+  {:capability :git_push               :decision :autonomous
+   :note "topic branch only; never main"}
+  {:capability :git_merge              :decision :autonomous
+   :note "only its own PR, only when run-tests is green"}
+  {:capability :use_signing_identity   :decision :blocked}
+  {:capability :export_private_keys    :decision :blocked}
+  {:capability :enable_cron            :decision :blocked}]
+ :yakuwari/runners [{:runner :hermes :weight 1}]}

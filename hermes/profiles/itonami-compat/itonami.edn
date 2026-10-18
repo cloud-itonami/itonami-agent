@@ -1,0 +1,17 @@
+;; itonami profile (cloud.itonami.profile.v2). Additive to the Hermes layout:
+;; Hermes ignores this file; removing it returns the profile to plain Hermes.
+{:itonami/schema "cloud.itonami.profile.v2"
+ :profile/id "itonami-compat"
+ :profile/description "Hermes-compatibility implementer for itonami-agent (1 tick = 1 gap item = at most 1 PR)"
+ :profile/hermes-compatible true
+ :agent/kind :worker
+ :runtime {:engine :itonami-agent :scheduler :hermes}
+ :placement {:mode :local :inference-rail :murakumo}
+ :inference {:rails [:murakumo] :authorities ["api.murakumo.cloud"] :deny-hosts ["openrouter.ai"]}
+ :state {:workspace :host-local :results :cid-receipts :secrets :never-leave-host}
+ :ids {:repo "kotoba-lang/itonami-agent"}
+ :authority {:default-decision :approval-required :source :yakuwari :ref "yakuwari.edn"}
+ :capabilities []
+ :org/world :host
+ :invocation :resident
+ :cron? true}

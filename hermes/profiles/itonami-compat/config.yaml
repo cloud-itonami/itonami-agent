@@ -1,0 +1,23 @@
+model:
+  provider: murakumo
+  default: mishima
+  max_tokens: 16384
+  context_length: 131072
+providers:
+  murakumo:
+    base_url: https://api.murakumo.cloud/v1
+    api_mode: chat_completions
+    key_env: MURAKUMO_API_TOKEN
+    models:
+      mishima:
+        context_length: 131072
+        max_tokens: 16384
+    stale_timeout_seconds: 600
+    request_timeout_seconds: 2000
+    extra_headers:
+      HTTP-Referer: https://itonami.cloud
+      X-OpenRouter-Title: Itonami By KotobaLabs
+      X-Title: Itonami By KotobaLabs
+agent:
+  max_turns: 500
+  run_budget_seconds: 1800

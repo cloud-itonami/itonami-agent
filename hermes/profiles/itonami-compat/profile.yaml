@@ -1,0 +1,2 @@
+name: itonami-compat
+description: itonami-agent を Hermes Agent の完全互換にすることを毎 tick 前進させる自律実装 bot（1 tick 1 項目、実装・検証・PR）
