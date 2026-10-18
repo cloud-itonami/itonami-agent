@@ -35,6 +35,23 @@ Definition = `SOUL.md`, `profile.yaml`, `config.yaml`, `.env`,
 `cron/output/`, `cron/usage_audit.jsonl`, `cron/ticker_*`,
 `cron/itonami-runs.jsonl`. Each store keeps its own.
 
+### Two CLIs, two inference rails
+
+The same split applies to inference — the two CLIs never share a rail:
+
+| | hermes agent CLI | itonami-agent CLI |
+|---|---|---|
+| profile store | `~/.hermes/profiles/` | `~/.itonami/profiles/` |
+| 推論 rail | `config.yaml` `model:`（openrouter 等） | `itonami.edn` `:inference`（murakumo / mishima 等） |
+| murakumo / mishima | **使わない** | **専用** |
+
+A Hermes agent profile must not use murakumo/mishima — not in `config.yaml`,
+not in a cron job's `model`/`provider` pin (the pin wins over config, so both
+are banned). `itonami.edn :inference` is read only by itonami-agent; Hermes
+skips the file entirely. `profile import`/`export` move a definition between
+the two stores unchanged — the file format is the shared surface, the store
+and the rail stay separate.
+
 | Hermes surface | itonami-agent |
 |---|---|
 | `SOUL.md`, `profile.yaml`, `config.yaml`, `.env`, `secrets.command` | read the same way. YAML reader is checked against PyYAML on all 1,954 host files: 0 differences |
