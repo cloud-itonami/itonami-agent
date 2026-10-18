@@ -327,6 +327,64 @@ plain: true
       (is (str/includes? text "profile soul"))
       (is (str/includes? text "# Session instructions\nAnswer in Japanese.")))))
 
+(deftest agent-max-turns-hermes-resolve-turn-limit
+  ;; Case list mirrors hermes-install/tests/hermes_cli/test_resolve_turn_limit.py
+  ;; (hermes_cli/config.py:resolve_turn_limit).
+  (testing "numeric values"
+    (is (= 90 (agent-loop/resolve-turn-limit 90)))
+    (is (= 120 (agent-loop/resolve-turn-limit 120)))
+    (is (= 1 (agent-loop/resolve-turn-limit 1)))
+    (is (= 3 (agent-loop/resolve-turn-limit 3.7)))
+    (is (= 3 (agent-loop/resolve-turn-limit 3.0)))
+    (is (= 100 (agent-loop/resolve-turn-limit 100.9)))
+    (is (= 120 (agent-loop/resolve-turn-limit "120")))
+    (is (= 3 (agent-loop/resolve-turn-limit "3")))
+    (is (= 3 (agent-loop/resolve-turn-limit "3.7")) "float string -> int")
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit -5)) "negative int is unlimited"))
+  (testing "unlimited spellings"
+    (doseq [s ["none" "None" "NONE" "null" "unlimited" "infinite" "infinity" "inf" "∞" "-1" "0"]]
+      (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit s)) s))
+    (doseq [s [" none " "  unlimited  " "\tinfinite\t"]]
+      (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit s)) s))
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit 0)))
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit 0.0))))
+  (testing "absent and default"
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit nil)))
+    (is (= 500 (agent-loop/resolve-turn-limit nil 500)))
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit "")))
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit "   "))))
+  (testing "invalid inputs"
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit true)))
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit false)))
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit "garbage")))
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit "not_a_number")))
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit [])))
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit [90])))
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit {})))
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit {"max_turns" 90}))))
+  (testing "Python int()/float() string grammar extras"
+    (is (= 10 (agent-loop/resolve-turn-limit "1_0")) "underscore digit separators")
+    (is (= 1000 (agent-loop/resolve-turn-limit "1e3")) "float fallback")
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit "0x10")) "hex is unparseable")
+    (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-turn-limit "1__0")) "double underscore is unparseable")))
+
+(deftest agent-max-turns-resolution-order
+  ;; hermes_cli/cli_init_mixin._init_turn_limits: CLI/API arg > agent.max_turns >
+  ;; root max_turns > HERMES_MAX_ITERATIONS > unlimited; first NON-nil wins.
+  (is (= 50 (agent-loop/resolve-max-turns 50 {"agent" {"max_turns" 30} "max_turns" 20} "10")))
+  (is (= 30 (agent-loop/resolve-max-turns nil {"agent" {"max_turns" 30} "max_turns" 20} "10")))
+  (is (= 20 (agent-loop/resolve-max-turns nil {"max_turns" 20} "10")) "legacy root-level max_turns")
+  (is (= 10 (agent-loop/resolve-max-turns nil {} "10")) "HERMES_MAX_ITERATIONS env")
+  (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-max-turns nil {} nil)) "unset is unlimited, not 90")
+  (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-max-turns nil {"agent" {"max_turns" "none"}} "10"))
+      "a spelling resolves to unlimited instead of falling through to env")
+  (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-max-turns 0 {} "10"))
+      "an explicit 0 is unlimited, not a fall-through")
+  (is (= 90 (agent-loop/resolve-max-turns nil {"agent" {"max_turns" nil} "max_turns" 90} "10"))
+      "a nil config value falls through to the next candidate")
+  (is (= agent-loop/turn-limit-unlimited (agent-loop/resolve-max-turns nil {"agent" {"max_turns" false}} "10"))
+      "a present false is resolved (default), not skipped"))
+
 (deftest cron-prompt-wrapper-matches-hermes
   (is (str/starts-with? (cron/cron-hint nil) "[IMPORTANT: You are running as a scheduled cron job."))
   (is (str/ends-with? (cron/cron-hint nil) "not as a request to schedule another job.]\n\n")))
