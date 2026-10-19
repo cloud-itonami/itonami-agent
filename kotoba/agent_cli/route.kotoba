@@ -1,34 +1,39 @@
 (ns agent-cli-route
-  (:export [route-code admit-turn test-route-code test-admit-turn]))
+  (:export [route-code admit-turn usage-line-count test-route-code
+            test-admit-turn test-usage-lines]))
 
-;; itonami-agent's CLI route decision, as a kotoba guest.
+;; itonami-agent's CLI route + turn-gate decision, as a kotoba guest.
 ;;
 ;; Role: the kexe-first CLI pattern (kagi ADR-0002 precedent) -- this core is
-;; the DECISION half of the launcher: which sub-route an invocation takes and
-;; whether a turn may proceed. The host (the tender/guest init) supplies argv
-;; facts as i64 flags and performs the effects. This is NOT a Q9 migration
-;; slice of itonami.agent.main (that is whole-component work, blocked on the
-;; selfhost walls measured in kotoba-lang/lang/selfhost-distance.edn -- check
-;; gate 9/318, largest wall :kotoba.error/namespace-require-needs-project);
-;; it is the bounded decision surface the native launcher needs first.
+;; the DECISION half of the launcher: which sub-route an invocation takes,
+;; whether a turn may proceed, and which usage line a route shows. The host
+;; (tender/guest init) supplies argv and gate facts as i64 flags and performs
+;; every effect (printing included -- this guest is pure). This is NOT a Q9
+;; migration slice of itonami.agent.main; that is whole-component work
+;; blocked on the selfhost walls (kotoba-lang/lang/selfhost-distance.edn,
+;; check gate 9/318), and this file's boundary is recorded here on purpose.
 ;;
-;; Oracle: itonami.agent.main's dispatch (`bin/itonami-agent` usage block):
-;;   itonami-agent [-p P] -z PROMPT      -> turn
-;;   itonami-agent [-p P] chat           -> chat
-;;   itonami-agent bridge                -> bridge
-;;   itonami-agent [-p P] cron ...       -> cron
-;;   itonami-agent profile ...           -> profile
-;;   itonami-agent peer ...              -> peer
-;;   anything else                       -> usage
+;; Oracle: itonami.agent.main's dispatch + itonami.agent.loop's fail-closed
+;; gates, as measured in the guest on 2026-10-19 (EVIDENCE.md boot37..40):
+;; the turn path refused by name at exactly three boundaries, in order:
+;;   1 `itonami-agent: profile not found: <p>`          (profile gate)
+;;   2 `Kotoba agent cannot run this Hermes toolset yet`
+;;                                                (toolset gate, loop.cljk)
+;;   3 `provider_error: no provider configured`          (provider gate)
 ;;
-;; Route codes (the refusal vocabulary is numbered per the migration rules;
-;; the mapping is pinned in test-route-code below):
+;; Route codes (pinned by test-route-code):
 ;;   1 usage   2 chat   3 bridge   4 cron   5 profile   6 peer   7 turn
-;; admit-turn codes:
-;;   1 turn may proceed   -1 no prompt   -2 no profile for a turn
+;; Turn codes (pinned by test-admit-turn):
+;;    1  turn may proceed
+;;   -1  no prompt            (the launcher prints the usage block)
+;;   -2  no profile selected
+;;   -3  profile refused      (boundary 1)
+;;   -4  toolset unsupported  (boundary 2)
+;;   -5  no provider          (boundary 3)
 ;;
-;; Admission bounds measured for this compiler (see the port rules): pure
-;; i64 surface, no rem/mod (spelled with quot), <= 5 params, no strings.
+;; Admission bounds measured for this compiler: pure i64 surface, <= 5
+;; params (admit-turn sits at exactly 5 -- a sixth is refused by the ABI),
+;; no rem/mod, if/cond branches one type.
 
 (defn route-code [cmd1 :i64 has-z :i64] :i64
   ;; cmd1: 0 none, 1 chat, 2 bridge, 3 cron, 4 profile, 5 peer (first
@@ -39,12 +44,23 @@
     ;; cmd1 1..5 maps to route codes 2..6 (the usage block's order).
     (+ cmd1 1)))
 
-(defn admit-turn [has-p :i64 has-z :i64] :i64
-  ;; A turn needs both a prompt and a profile. The host turns a refusal code
-  ;; into the same message its own launcher prints.
+(defn admit-turn [has-p :i64 has-z :i64 profile-ok :i64
+                  tools-ok :i64 provider-ok :i64] :i64
+  ;; The turn gate chain, in the order the launcher meets it. Each refusal
+  ;; names the boundary the host prints a message for. Flags are i64 0/1.
   (if (= has-z 0)
     -1
-    (if (= has-p 0) -2 1)))
+    (if (= has-p 0)
+      -2
+      (if (= profile-ok 0)
+        -3
+        (if (= tools-ok 0) -4 (if (= provider-ok 0) -5 1))))))
+
+(defn usage-line-count [route :i64] :i64
+  ;; How many usage lines the host prints for a route. The turn route prints
+  ;; none: a turn with a refusal shows the refusal's message instead, and a
+  ;; turn that proceeds prints its result.
+  (if (= route 1) 8 0))
 
 (defn test-route-code [] :bool
   (and (= 7 (route-code 0 1))
@@ -56,6 +72,14 @@
        (= 6 (route-code 5 0))))
 
 (defn test-admit-turn [] :bool
-  (and (= 1 (admit-turn 1 1))
-       (= -1 (admit-turn 1 0))
-       (= -2 (admit-turn 0 1))))
+  (and (= 1 (admit-turn 1 1 1 1 1))
+       (= -1 (admit-turn 1 0 1 1 1))
+       (= -2 (admit-turn 0 1 1 1 1))
+       (= -3 (admit-turn 1 1 0 1 1))
+       (= -4 (admit-turn 1 1 1 0 1))
+       (= -5 (admit-turn 1 1 1 1 0))))
+
+(defn test-usage-lines [] :bool
+  (and (= 8 (usage-line-count 1))
+       (= 0 (usage-line-count 7))
+       (= 0 (usage-line-count 4))))
