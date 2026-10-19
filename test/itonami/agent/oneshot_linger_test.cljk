@@ -1,0 +1,392 @@
+(ns itonami.agent.oneshot-linger-test
+  "Hermes' one-shot exit linger (`tests/tools/test_oneshot_completion_linger.py`
+  and `tests/hermes_cli/test_quiet_turn_author.py`):
+  `terminal.oneshot_completion_wait_seconds` resolution
+  (`ProcessRegistry._oneshot_completion_wait_seconds`), the bounded
+  `wait_for_pending_completions` linger, and the quiet notify-resume loop
+  `continue_quiet_notify_completions`."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.process :as process]
+            [itonami.agent.quiet :as quiet]))
+
+(defn- parse-json [s] (js->clj (js/JSON.parse s)))
+
+(defn- fresh-home [tag]
+  (let [home (h/join (h/tmp-dir) (str "test-linger-" tag "-" (.-pid js/process) "-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    home))
+
+(defn- spawn-sh!
+  "Spawn a script; resolves `exited` when its on-exit hook fires (the exit is
+  booked and the completion event set). Never touches wait/log/poll — those
+  consume the completion."
+  [ctx opts script]
+  (let [resolve-exit (atom nil)
+        exited (js/Promise. (fn [res] (reset! resolve-exit res)))
+        res (parse-json (process/spawn! ctx (merge {:argv ["/bin/sh" "-c" script]
+                                                    :command script
+                                                    :env (h/process-env)
+                                                    :cwd (:home ctx)
+                                                    :on-exit (fn [_ _] (@resolve-exit true))}
+                                                   opts)))]
+    [res exited]))
+
+(defn- kill! [ctx id]
+  (parse-json (process/manage ctx {"action" "kill" "session_id" id})))
+
+;; ── oneshot-completion-wait-seconds: config default + reader fallback ──────
+
+(deftest oneshot-completion-wait-seconds-defaults-and-clamp
+  (testing "unset / unparseable values fall back to config_defaults' 600.0"
+    (is (= 600.0 (process/oneshot-completion-wait-seconds nil)))
+    (is (= 600.0 (process/oneshot-completion-wait-seconds {})))
+    (is (= 600.0 (process/oneshot-completion-wait-seconds {"terminal" {}})))
+    (is (= 600.0 (process/oneshot-completion-wait-seconds
+                  {"terminal" {"oneshot_completion_wait_seconds" nil}})))
+    (is (= 600.0 (process/oneshot-completion-wait-seconds
+                  {"terminal" {"oneshot_completion_wait_seconds" "abc"}})))
+    (is (= 600.0 (process/oneshot-completion-wait-seconds
+                  {"terminal" {"oneshot_completion_wait_seconds" ""}})))
+    (is (= 600.0 (process/oneshot-completion-wait-seconds
+                  {"terminal" {"oneshot_completion_wait_seconds" {"nested" 1}}}))))
+  (testing "float()-shaped values: numbers and numeric strings, floored at zero"
+    (is (= 10.0 (process/oneshot-completion-wait-seconds
+                 {"terminal" {"oneshot_completion_wait_seconds" 10}})))
+    (is (= 10.5 (process/oneshot-completion-wait-seconds
+                 {"terminal" {"oneshot_completion_wait_seconds" 10.5}})))
+    (is (= 120.0 (process/oneshot-completion-wait-seconds
+                  {"terminal" {"oneshot_completion_wait_seconds" "120"}})))
+    (is (= 0.0 (process/oneshot-completion-wait-seconds
+                {"terminal" {"oneshot_completion_wait_seconds" -5}})))
+    (is (= 0.0 (process/oneshot-completion-wait-seconds
+                {"terminal" {"oneshot_completion_wait_seconds" 0}})))
+    (is (= 1.0 (process/oneshot-completion-wait-seconds
+                {"terminal" {"oneshot_completion_wait_seconds" true}})))
+    (is (= 0.0 (process/oneshot-completion-wait-seconds
+                {"terminal" {"oneshot_completion_wait_seconds" false}})))))
+
+;; ── wait_for_pending_completions: unit semantics ───────────────────────────
+
+(deftest wait-no-pending-is-immediate-noop
+  (async done
+    (let [home (fresh-home "noop")
+          ctx {:home home :task-id "task-a" :session-key ""}
+          t0 (h/now-ms)]
+      (-> (process/wait-for-pending-completions! {:timeout 30 :config {}})
+          (p/then (fn [result]
+                    (is (< (- (h/now-ms) t0) 1000))
+                    (is (= {"waited" [] "completed" [] "timed_out" []} result))
+                    (h/rm home)
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest wait-non-notify-background-processes-are-not-waited-on
+  ;; Servers/daemons without notify_on_complete carry no completion contract.
+  (async done
+    (let [home (fresh-home "silent")
+          ctx {:home home :task-id "task-a" :session-key ""}
+          [res exited] (spawn-sh! ctx {} "sleep 3")
+          id (get res "session_id")
+          t0 (h/now-ms)]
+      (-> (process/wait-for-pending-completions! {:timeout 10 :config {}})
+          (p/then (fn [result]
+                    (is (< (- (h/now-ms) t0) 1000))
+                    (is (= [] (get result "waited")))
+                    (is (not (contains? (set (get result "timed_out")) id)))
+                    (kill! ctx id)
+                    exited))
+          (p/then (fn [_] (h/rm home) (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest wait-returns-when-process-completes
+  (async done
+    (let [home (fresh-home "complete")
+          ctx {:home home :task-id "task-a" :session-key "s1"}
+          [res exited] (spawn-sh! ctx {:notify-on-complete? true} "sleep 0.3; exit 0")
+          id (get res "session_id")
+          t0 (h/now-ms)]
+      (-> (process/wait-for-pending-completions! {:timeout 30 :poll-interval 0.1 :config {}})
+          (p/then (fn [result]
+                    (is (= [id] (get result "waited")))
+                    (is (= [id] (get result "completed")))
+                    (is (= [] (get result "timed_out")))
+                    (is (< (- (h/now-ms) t0) 10000))
+                    exited))
+          (p/then (fn [_]
+                    ;; the completion landed for this session exactly once
+                    ;; (the registry is global — earlier suite events may share
+                    ;; the drain key, as in Hermes' single registry)
+                    (let [pairs (process/drain-notifications! {:session-key "s1"})
+                          mine (filter (fn [[e _]] (= id (get e "session_id"))) pairs)]
+                      (is (= 1 (count mine)))
+                      (is (= id (get (first (first mine)) "session_id"))))
+                    (h/rm home)
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest wait-times-out-on-stuck-process
+  (async done
+    (let [home (fresh-home "stuck")
+          ctx {:home home :task-id "task-a" :session-key ""}
+          [res exited] (spawn-sh! ctx {:notify-on-complete? true} "sleep 4")
+          id (get res "session_id")
+          t0 (h/now-ms)]
+      (-> (process/wait-for-pending-completions! {:timeout 0.4 :poll-interval 0.1 :config {}})
+          (p/then (fn [result]
+                    (is (= [id] (get result "waited")))
+                    (is (= [] (get result "completed")))
+                    (is (= [id] (get result "timed_out")))
+                    (let [elapsed (- (h/now-ms) t0)]
+                      (is (<= 300 elapsed 5000)))
+                    (kill! ctx id)
+                    exited))
+          (p/then (fn [_] (h/rm home) (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest wait-timeout-zero-disables-linger
+  (async done
+    (let [home (fresh-home "disabled")
+          ctx {:home home :task-id "task-a" :session-key ""}
+          [res exited] (spawn-sh! ctx {:notify-on-complete? true} "sleep 4")
+          id (get res "session_id")]
+      (-> (process/wait-for-pending-completions! {:timeout 0 :config {}})
+          (p/then (fn [result]
+                    (is (= {"waited" [] "completed" [] "timed_out" []} result))
+                    (kill! ctx id)
+                    exited))
+          (p/then (fn [_] (h/rm home) (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest wait-config-resolved-zero-disables-linger
+  ;; timeout=nil resolves through oneshot-completion-wait-seconds.
+  (async done
+    (let [home (fresh-home "cfg-zero")
+          ctx {:home home :task-id "task-a" :session-key ""}
+          [res exited] (spawn-sh! ctx {:notify-on-complete? true} "sleep 4")
+          id (get res "session_id")]
+      (-> (process/wait-for-pending-completions!
+           {:config {"terminal" {"oneshot_completion_wait_seconds" -5}}})
+          (p/then (fn [result]
+                    (is (= {"waited" [] "completed" [] "timed_out" []} result))
+                    (kill! ctx id)
+                    exited))
+          (p/then (fn [_] (h/rm home) (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest wait-task-id-filter-scopes-the-wait
+  ;; The filter matches ownership (`owner_task_id`), not the container key.
+  (async done
+    (let [home (fresh-home "filter")
+          ctx-a {:home home :task-id "task-a" :session-key ""}
+          ctx-b {:home home :task-id "task-b" :session-key ""}
+          [res-a exited-a] (spawn-sh! ctx-a {:notify-on-complete? true} "sleep 4")
+          [res-b exited-b] (spawn-sh! ctx-b {:notify-on-complete? true} "sleep 4")
+          id-a (get res-a "session_id")
+          id-b (get res-b "session_id")]
+      (-> (process/wait-for-pending-completions!
+           {:task-id "task-a" :timeout 0.3 :poll-interval 0.1 :config {}})
+          (p/then (fn [result]
+                    (is (= [id-a] (get result "waited")))
+                    (is (not (contains? (set (get result "waited")) id-b)))
+                    (is (not (contains? (set (get result "timed_out")) id-b)))
+                    (kill! ctx-a id-a)
+                    (kill! ctx-b id-b)
+                    (p/all [exited-a exited-b])))
+          (p/then (fn [_] (h/rm home) (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest wait-covers-multiple-pending-processes
+  (async done
+    (let [home (fresh-home "multi")
+          ctx {:home home :task-id "task-a" :session-key ""}
+          [res1 exited1] (spawn-sh! ctx {:notify-on-complete? true} "sleep 0.2")
+          [res2 exited2] (spawn-sh! ctx {:notify-on-complete? true} "sleep 0.2")
+          ids [(get res1 "session_id") (get res2 "session_id")]]
+      (-> (process/wait-for-pending-completions! {:timeout 30 :poll-interval 0.1 :config {}})
+          (p/then (fn [result]
+                    (is (= (set ids) (set (get result "completed"))))
+                    (is (= [] (get result "timed_out")))
+                    (is (= (set ids) (set (get result "waited"))))
+                    (p/all [exited1 exited2])))
+          (p/then (fn [_] (h/rm home) (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest wait-reconciles-orphaned-pipe-exit
+  ;; #17327: the direct child exits while a descendant keeps the stdout pipe
+  ;; open, so Node's `close` (like Python's reader EOF) never fires in time.
+  ;; The reconcile pass books the real exit (`Popen.poll()` → exitCode) and the
+  ;; linger completes well before the pipe holder is gone.
+  (async done
+    (let [home (fresh-home "orphan")
+          ctx {:home home :task-id "task-a" :session-key "s1"}
+          [res exited] (spawn-sh! ctx {:notify-on-complete? true} "(sleep 3) & exit 7")
+          id (get res "session_id")
+          t0 (h/now-ms)]
+      (-> (process/wait-for-pending-completions! {:timeout 20 :poll-interval 0.1 :config {}})
+          (p/then (fn [result]
+                    (is (= [id] (get result "completed")))
+                    (is (= [] (get result "timed_out")))
+                    (is (< (- (h/now-ms) t0) 2500))
+                    exited))
+          (p/then (fn [_]
+                    (let [pairs (process/drain-notifications! {:session-key "s1"})
+                          evt (ffirst (filter (fn [[e _]] (= id (get e "session_id"))) pairs))]
+                      (is (some? evt))
+                      (is (= 7 (get evt "exit_code"))))
+                    (h/rm home)
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+;; ── continue_quiet_notify_completions: the notify-resume loop ──────────────
+
+(deftest quiet-loop-returns-nil-when-nothing-owned-completed
+  (async done
+    (let [calls (atom [])]
+      (-> (quiet/continue-quiet-notify-completions!
+           "" (fn [t] (swap! calls conj t) (p/resolved {:exit-reason "completed" :final "x"}))
+           {:config {}
+            :wait-fn (fn [_] (p/resolved {"waited" [] "completed" [] "timed_out" []}))
+            :drain-fn (fn [] [])})
+          (p/then (fn [r]
+                    (is (nil? r))
+                    (is (= [] @calls))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest quiet-loop-runs-owned-completion-text-as-follow-up-turn
+  (async done
+    (let [drained (atom [[{"type" "completion" "session_id" "proc_a"}
+                          "[IMPORTANT: Background process proc_a exited (exit code 0).]"]
+                         [{"type" "watch_match" "session_id" "proc_a"} "[IMPORTANT: matched]"]])
+          calls (atom [])]
+      (-> (quiet/continue-quiet-notify-completions!
+           "" (fn [t] (swap! calls conj t) (p/resolved {:exit-reason "completed" :final "follow"}))
+           {:config {}
+            :wait-fn (fn [_] (p/resolved {"waited" [] "completed" [] "timed_out" []}))
+            :drain-fn (fn [] (let [d @drained] (reset! drained []) d))})
+          (p/then (fn [r]
+                    ;; ONE follow-up turn per round, texts joined with \n\n
+                    (is (= 1 (count @calls)))
+                    (is (= (str "[IMPORTANT: Background process proc_a exited (exit code 0).]\n\n"
+                                "[IMPORTANT: matched]")
+                           (first @calls)))
+                    (is (= "follow" (:final r)))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest quiet-loop-diagnostic-only-wake-never-displaces-the-answer
+  ;; `_diagnostic_only_wake_muted`: the wake still RUNS, but a wake made only
+  ;; of automatic diagnostics under suppression never displaces the requested
+  ;; one-shot answer.
+  (async done
+    (let [calls (atom [])
+          config {"display" {"suppress_warning_notifications" true}}]
+      (-> (quiet/continue-quiet-notify-completions!
+           "" (fn [t] (swap! calls conj t) (p/resolved {:exit-reason "completed" :final "follow"}))
+           {:config config
+            :wait-fn (fn [_] (p/resolved {"waited" [] "completed" [] "timed_out" []}))
+            :drain-fn (let [once (atom true)]
+                        (fn [] (if @once
+                                 (do (reset! once false)
+                                     [[{"type" "watch_disabled" "session_id" ""} "[IMPORTANT: quiet]"]])
+                                 [])))})
+          (p/then (fn [r]
+                    (is (= 1 (count @calls)))
+                    (is (nil? r))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest quiet-loop-stops-when-a-process-timed-out
+  ;; "a process that times out is waited on no further this run: after the
+  ;; current round's drained texts run, the loop stops."
+  (async done
+    (let [calls (atom [])]
+      (-> (quiet/continue-quiet-notify-completions!
+           "" (fn [t] (swap! calls conj t) (p/resolved {:exit-reason "completed" :final "one"}))
+           {:config {}
+            :wait-fn (fn [_] (p/resolved {"waited" ["proc_x"] "completed" [] "timed_out" ["proc_x"]}))
+            :drain-fn (let [once (atom true)]
+                        (fn [] (if @once
+                                 (do (reset! once false)
+                                     [[{"type" "completion" "session_id" "proc_y"} "text-y"]])
+                                 [])))})
+          (p/then (fn [r]
+                    (is (= 1 (count @calls)))
+                    (is (= "one" (:final r)))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest quiet-loop-stops-after-max-rounds
+  ;; `_MAX_QUIET_NOTIFY_ROUNDS` caps a runaway chain.
+  (async done
+    (let [calls (atom [])]
+      (-> (quiet/continue-quiet-notify-completions!
+           "" (fn [t] (swap! calls conj t) (p/resolved {:exit-reason "completed" :final "r"}))
+           {:config {}
+            :wait-fn (fn [_] (p/resolved {"waited" [] "completed" [] "timed_out" []}))
+            :drain-fn (fn [] [[{"type" "completion" "session_id" "proc_z"} "text"]])})
+          (p/then (fn [r]
+                    (is (= 8 (count @calls)))
+                    (is (= "r" (:final r)))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest quiet-loop-shares-one-linger-budget
+  ;; The whole loop shares ONE `terminal.oneshot_completion_wait_seconds`
+  ;; budget — a stuck notify_on_complete child cannot stack round-after-round
+  ;; waits.
+  (async done
+    (let [t (atom 0.0)
+          timeouts (atom [])]
+      (-> (quiet/continue-quiet-notify-completions!
+           "" (fn [_] (p/resolved {:exit-reason "completed" :final "r"}))
+           {:config {"terminal" {"oneshot_completion_wait_seconds" 8}}
+            :now-fn (fn [] @t)
+            :wait-fn (fn [timeout]
+                       (swap! timeouts conj timeout)
+                       (swap! t + 1000.0)
+                       (p/resolved {"waited" [] "completed" [] "timed_out" []}))
+            :drain-fn (fn [] [[{"type" "completion" "session_id" "p"} "t"]])
+            :max-rounds 3})
+          (p/then (fn [_]
+                    (is (= [8.0 7.0 6.0] @timeouts))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+;; ── _wait_for_oneshot_background_completions: the finalize linger ──────────
+
+(deftest exit-linger-skipped-when-quiet-loop-consumed-the-budget
+  (async done
+    (let [calls (atom 0)
+          wait-fn (fn [] (swap! calls inc) (p/resolved {"waited" [] "completed" [] "timed_out" []}))]
+      (-> (p/all [(quiet/oneshot-exit-linger! {} true {:wait-fn wait-fn})
+                  (quiet/oneshot-exit-linger! {} false {:wait-fn wait-fn})])
+          (p/then (fn [[skipped ran]]
+                    (is (= 1 @calls))
+                    (is (nil? skipped))
+                    (is (nil? ran))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest exit-linger-swallows-a-failing-wait
+  ;; A raising wait must not break the exit path.
+  (async done
+    (-> (quiet/oneshot-exit-linger! {} false
+                                    {:wait-fn (fn [] (p/rejected (js/Error. "wait exploded")))})
+        (p/then (fn [r]
+                  (is (nil? r))
+                  (done)))
+        (p/catch (fn [e] (is (nil? e) (str e)) (done))))))
+
+;; ── turn-failed?: the gate that arms the notify-resume loop ────────────────
+
+(deftest turn-failed-gate-matches-hermes-failed
+  ;; Hermes runs the linger loop only for `not result.get("failed")`: a hard
+  ;; failure / cancellation is failed; a merely unfinished turn is not.
+  (is (true? (quiet/turn-failed? {:error {:error "provider down"} :exit-reason "provider_error"})))
+  (is (true? (quiet/turn-failed? {:exit-reason "interrupted"})))
+  (is (false? (quiet/turn-failed? {:exit-reason "completed" :final "hi"})))
+  (is (false? (quiet/turn-failed? {:exit-reason "max_iterations_reached(3/3)"})))
+  (is (false? (quiet/turn-failed? {:exit-reason "budget_exhausted"}))))

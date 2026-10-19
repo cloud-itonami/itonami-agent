@@ -43,6 +43,7 @@
             [itonami.agent.manifest :as manifest]
             [itonami.agent.loop :as agent-loop]
             [itonami.agent.process :as proc]
+            [itonami.agent.quiet :as quiet]
             [itonami.agent.tools :as tools]
             [itonami.agent.browser :as browser]
             [itonami.agent.computer-use :as computer-use]
@@ -184,16 +185,37 @@
 ;; ---------------------------------------------------------------- -z / chat
 
 (defn oneshot [opts]
-  (p/let [prof (profile/load-profile (:profile opts))
-          r ((executor opts) prof (:oneshot opts) (run-opts opts prof))]
-    (if (and (= "completed" (:exit-reason r)) (not (str/blank? (:final r))))
-      (do (println (:final r))
-          (when (:verbose opts)
-            (binding [*print-fn* *print-err-fn*]
-              (println (str "[itonami-agent] " (:provider r) "/" (:model r) " turns=" (:turns r)
-                            (when (:peer r) (str " peer=" (:peer r))))))))
-      (die 1 (str "itonami-agent -z: " (:exit-reason r)
-                  (when-let [e (get-in r [:error :error])] (str ": " e)))))))
+  ;; Hermes `_run_quiet_single_query` + `_finalize_single_query` phase 3: the
+  ;; turn, then — when it did not fail — `continue_quiet_notify_completions`
+  ;; (owned `notify_on_complete` completions re-enter as follow-up turns under
+  ;; ONE shared linger budget and may displace the printed answer), then the
+  ;; bounded exit linger, skipped when the notify loop already consumed the
+  ;; budget (`_quiet_notify_linger_done`).
+  (let [linger-done? (atom false)
+        history (atom nil)]
+    (p/let [prof (profile/load-profile (:profile opts))
+            config (:config prof)
+            run-turn (fn [prompt]
+                       (p/let [r ((executor opts) prof prompt
+                                  (assoc (run-opts opts prof) :history @history))]
+                         (when (seq (:messages r)) (reset! history (:messages r)))
+                         r))
+            r (run-turn (:oneshot opts))
+            r (if (quiet/turn-failed? r)
+                r
+                (do (reset! linger-done? true)
+                    (p/then (quiet/continue-quiet-notify-completions!
+                             "" run-turn {:config config})
+                            (fn [continued] (if (map? continued) continued r)))))
+            _ (quiet/oneshot-exit-linger! config @linger-done?)]
+      (if (and (= "completed" (:exit-reason r)) (not (str/blank? (:final r))))
+        (do (println (:final r))
+            (when (:verbose opts)
+              (binding [*print-fn* *print-err-fn*]
+                (println (str "[itonami-agent] " (:provider r) "/" (:model r) " turns=" (:turns r)
+                              (when (:peer r) (str " peer=" (:peer r))))))))
+        (die 1 (str "itonami-agent -z: " (:exit-reason r)
+                    (when-let [e (get-in r [:error :error])] (str ": " e))))))))
 
 (defn chat [opts]
   (let [prof (profile/load-profile (:profile opts))
