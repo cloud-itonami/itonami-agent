@@ -1,0 +1,197 @@
+(ns itonami.agent.process-watch-test
+  "Hermes watch/heartbeat events (`ProcessRegistry._check_watch_patterns` /
+  `_emit_heartbeat` / `_global_watch_admit` and
+  `process_registry_notifications`' heartbeat/watch formatting)."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [itonami.agent.process :as process]
+            [itonami.agent.tools :as tools]))
+
+(defn- fake-session [id key watch-patterns]
+  {:id id :command "cmd" :started-at 100000
+   :task-id (atom (str "session:" key))
+   :owner-task-id (atom (str "session:" key))
+   :session-key (atom key)
+   :handoff-note (atom "")
+   :notify-on-complete? (atom false)
+   :completion-output-chars 0
+   :watch-patterns (vec watch-patterns)
+   :heartbeat-seconds 0
+   :watch (atom {:hits 0 :suppressed 0 :disabled? false :cooldown-until 0.0
+                 :strike-candidate? false :consecutive-strikes 0})
+   :hb (atom {:last 0.0 :total-at-last 0 :seq 0})
+   :total-chars (atom 0)
+   :killed-by (atom nil) :finished-at (atom nil)
+   :state (atom :running) :exit-code (atom nil)
+   :output (atom "")})
+
+(deftest format-age-heartbeat-tail-and-text
+  (testing "process_registry_notifications._format_age, verbatim"
+    (is (= "45s" (process/format-age 45)))
+    (is (= "1m" (process/format-age 60)))
+    (is (= "3m5s" (process/format-age 185)))
+    (is (= "2h" (process/format-age 7200)))
+    (is (= "2h3m" (process/format-age 7380)))
+    (is (= "?" (process/format-age "x"))))
+  (testing "heartbeat_output_tail, verbatim"
+    (is (= ["abc" 0] (process/heartbeat-output-tail "abc")))
+    (let [[out omitted] (process/heartbeat-output-tail (apply str (repeat 2500 "a")))]
+      (is (= 2000 (count out)))
+      (is (= 500 omitted)))
+    (is (= ["xy" 7] (process/heartbeat-output-tail "xy" 7))))
+  (testing "heartbeat_output_text, verbatim"
+    (is (= "out" (process/heartbeat-output-text {"output" "out" "omitted" 0})))
+    (is (= "...(5 earlier characters omitted)\nout"
+           (process/heartbeat-output-text {"output" "out" "omitted" 5})))))
+
+(deftest watch-match-event-and-text
+  (process/reset-watch-breaker!)
+  (let [s (fake-session "proc_w1" "key-w1" ["READY"])
+        _ (process/check-watch-patterns! s "server READY at :8080\n" 100.0)
+        pairs (process/drain-notifications! {:session-key "key-w1"})
+        [evt text] (first pairs)]
+    (is (= 1 (count pairs)))
+    (is (= "watch_match" (get evt "type")))
+    (is (= "READY" (get evt "pattern")))
+    (is (= "server READY at :8080" (get evt "output")))
+    (is (= 0 (get evt "suppressed")))
+    (is (re-matches #"[0-9a-f]{32}" (get evt "event_id")))
+    (is (= (str "[IMPORTANT: Background process proc_w1 matched watch pattern \"READY\".\n"
+                "Command: cmd\nMatched output:\nserver READY at :8080]")
+           text))))
+
+(deftest watch-rate-limit-and-strike-breaker
+  (process/reset-watch-breaker!)
+  (let [s (fake-session "proc_w2" "key-w2" ["GO"])]
+    ;; t=100 emit #1 (cooldown to 115); t=105 strike 1; t=106 dropped;
+    ;; t=120 emit #2 (suppressed 2, strikes stay 1); t=121 strike 2;
+    ;; t=140 emit #3 (suppressed 1, strikes stay 2); t=141 strike 3 -> disabled
+    (process/check-watch-patterns! s "GO now" 100.0)
+    (process/check-watch-patterns! s "GO again" 105.0)
+    (process/check-watch-patterns! s "GO again" 106.0)
+    (process/check-watch-patterns! s "GO x" 120.0)
+    (process/check-watch-patterns! s "GO y" 121.0)
+    (process/check-watch-patterns! s "GO z" 140.0)
+    (process/check-watch-patterns! s "GO w" 141.0)
+    (let [evts (mapv first (process/drain-notifications! {:session-key "key-w2"}))]
+      (is (= ["watch_match" "watch_match" "watch_match" "watch_disabled"]
+             (mapv #(get % "type") evts)))
+      (is (= [0 2 1] (mapv #(get % "suppressed") (take 3 evts))))
+      (is (= (str "Watch patterns disabled for process proc_w2 — 3 consecutive rate-limit "
+                  "windows triggered (min spacing 15s). Falling back to notify_on_complete "
+                  "semantics; you'll get exactly one notification when the process exits.")
+             (get (nth evts 3) "message")))
+      (is (true? @(:notify-on-complete? s)))
+      (is (empty? (process/drain-notifications! {:session-key "key-w2"}))))))
+
+(deftest watch-lifetime-cap
+  (process/reset-watch-breaker!)
+  (let [s (fake-session "proc_w3" "key-w3" ["GO"])]
+    (doseq [i (range 8)]
+      (process/check-watch-patterns! s "GO" (double (* 30 i))))
+    (let [evts (mapv first (process/drain-notifications! {:session-key "key-w3"}))]
+      (is (= 9 (count evts)))
+      (is (= (repeat 8 "watch_match") (map #(get % "type") (butlast evts))))
+      (is (= (str "Watch patterns disabled for process proc_w3 — reached the lifetime cap "
+                  "of 8 delivered matches. Falling back to notify_on_complete semantics; "
+                  "you'll get exactly one notification when the process exits.")
+             (get (last evts) "message")))
+      (is (true? @(:notify-on-complete? s))))))
+
+(deftest global-watch-breaker
+  (process/reset-watch-breaker!)
+  ;; 16 sessions matching at the same instant: 15 admitted, the 16th trips
+  (doseq [i (range 16)]
+    (process/check-watch-patterns! (fake-session (str "proc_g" i) "key-g" ["GO"]) "GO" 500.0))
+  (let [evts (mapv first (process/drain-notifications! {:session-key "key-g"}))]
+    (is (= 15 (count (filter #(= "watch_match" (get % "type")) evts))))
+    (is (= "watch_overflow_tripped" (get (last evts) "type")))
+    (is (= (str "Watch-pattern overflow: >15 notifications in 10s across all processes. "
+                "Suppressing further watch_match events for 30s.")
+           (get (last evts) "message"))))
+  ;; dropped inside the cooldown
+  (process/check-watch-patterns! (fake-session "proc_g17" "key-g" ["GO"]) "GO" 501.0)
+  (is (empty? (process/drain-notifications! {:session-key "key-g"})))
+  ;; cooldown over: one released summary (2 suppressed: the trip + the drop), then admit
+  (process/check-watch-patterns! (fake-session "proc_g18" "key-g" ["GO"]) "GO" 531.0)
+  (let [evts (mapv first (process/drain-notifications! {:session-key "key-g"}))]
+    (is (= ["watch_overflow_released" "watch_match"] (mapv #(get % "type") evts)))
+    (is (= "Watch-pattern notifications resumed. 2 match event(s) were suppressed during the flood."
+           (get (first evts) "message")))))
+
+(deftest heartbeat-events
+  (process/reset-watch-breaker!)
+  (let [s (assoc (fake-session "proc_h1" "key-h1" []) :heartbeat-seconds 60)]
+    ;; quiet tick: skipped outright
+    (process/emit-heartbeat! s 200.0)
+    (is (empty? (process/drain-notifications! {:session-key "key-h1"})))
+    ;; new output since the last tick
+    (reset! (:total-chars s) 11)
+    (reset! (:output s) "hello\nworld")
+    (process/emit-heartbeat! s 260.0)
+    (let [pairs (process/drain-notifications! {:session-key "key-h1"})
+          [evt text] (first pairs)]
+      (is (= 1 (count pairs)))
+      (is (= "heartbeat" (get evt "type")))
+      (is (= 1 (get evt "seq")))
+      (is (= 60 (get evt "interval")))
+      (is (= 160 (get evt "elapsed")))
+      (is (= "hello\nworld" (get evt "output")))
+      (is (= 0 (get evt "omitted")))
+      (is (= (str "[Background process proc_h1 heartbeat #1 — still running after 2m40s "
+                  "(next in 60s when there is new output; you will also be told when it exits).\n"
+                  "Command: cmd\nOutput since last heartbeat:\nhello\nworld]")
+             text)))
+    ;; quiet again: skipped
+    (process/emit-heartbeat! s 320.0)
+    (is (empty? (process/drain-notifications! {:session-key "key-h1"})))
+    ;; long tick: capped to the newest 2000 chars with `omitted`
+    (reset! (:total-chars s) 2511)
+    (reset! (:output s) (str "hello\nworld" (apply str (repeat 2500 "a"))))
+    (process/emit-heartbeat! s 380.0)
+    (let [[evt text] (first (process/drain-notifications! {:session-key "key-h1"}))]
+      (is (= 2 (get evt "seq")))
+      ;; output SINCE the last tick = 2500 chars; tail capped to 2000
+      (is (= 2000 (count (get evt "output"))))
+      (is (= 500 (get evt "omitted")))
+      (is (str/includes? text "...(500 earlier characters omitted)\n")))))
+
+(deftest grouping-watches-are-barriers
+  (let [c (fn [id] [{"type" "completion" "session_id" id} (str "text-" id)])
+        w [{"type" "watch_match" "session_id" "p"} "watch-text"]
+        h [{"type" "heartbeat" "session_id" "p"} "hb-text"]
+        groups (process/group-process-notifications [(c "a") (c "b") w (c "c") h])]
+    (is (= [["text-a" "text-b"] ["watch-text"] ["text-c"] ["hb-text"]]
+           (mapv #(mapv second %) groups)))))
+
+(deftest watch-and-overflow-formatting
+  (is (= "[IMPORTANT: hello]"
+         (process/format-completion-notification {"type" "watch_disabled" "message" "hello"})))
+  (is (= "[IMPORTANT: resumed]"
+         (process/format-completion-notification
+          {"type" "watch_overflow_released" "message" "resumed"}))))
+
+(deftest notify-arg-normalization
+  (testing "notify is the advertised interface"
+    (is (= {:notify-on-complete? true :watch-patterns nil :heartbeat-seconds 0}
+           (tools/resolve-notify-args {"background" true "notify" true})))
+    (is (= {:notify-on-complete? false :watch-patterns ["x" "y"] :heartbeat-seconds 0}
+           (tools/resolve-notify-args {"background" true "notify" ["x" "y"]})))
+    (is (= {:notify-on-complete? false :watch-patterns nil :heartbeat-seconds 0}
+           (tools/resolve-notify-args {"background" true "notify" false "notify_on_complete" true}))))
+  (testing "legacy notify_on_complete / watch_patterns stay accepted"
+    (is (= {:notify-on-complete? true :watch-patterns ["a"] :heartbeat-seconds 0}
+           (tools/resolve-notify-args {"background" true "notify_on_complete" true "watch_patterns" ["a"]}))))
+  (testing "refusals answer Hermes' verbatim errors"
+    (is (= {:error "notify must be true/false (notify on exit) or a list of strings (notify on output pattern match)."}
+           (tools/resolve-notify-args {"background" true "notify" "junk"})))
+    (is (= {:error "notify only applies to background commands (foreground results return directly). Either drop it, or run as terminal(command=..., background=true, notify=...)."}
+           (tools/resolve-notify-args {"background" false "notify" true})))
+    (doseq [hb [true 1.5 -1]]
+      (is (= {:error "heartbeat must be a whole number of seconds (0 disables; positive values are clamped to min 60)."}
+             (tools/resolve-notify-args {"background" true "heartbeat" hb})))))
+  (testing "foreground heartbeat is normalized away; background heartbeat implies notify"
+    (is (= {:notify-on-complete? false :watch-patterns nil :heartbeat-seconds 0}
+           (tools/resolve-notify-args {"background" false "heartbeat" 60})))
+    (is (= {:notify-on-complete? true :watch-patterns nil :heartbeat-seconds 30}
+           (tools/resolve-notify-args {"background" true "heartbeat" 30})))))

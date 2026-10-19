@@ -39,7 +39,11 @@
                "timeout" {"type" "integer" "description" "Seconds before the command is killed (default 180)"}
                "workdir" {"type" "string" "description" "Working directory (default: the profile's terminal cwd)"}
                "background" {"type" "boolean" "description" "Start a background process; use process_manage to poll, wait, read output, send stdin, or terminate it"}
-               "notify_on_complete" {"type" "boolean" "description" "Push a completion notice to you when the background process exits (background only; subagents cannot receive one — hand the process to your parent with process_manage instead)"}}
+               "notify_on_complete" {"type" "boolean" "description" "Push a completion notice to you when the background process exits (background only; subagents cannot receive one — hand the process to your parent with process_manage instead)"}
+               "notify" {"description" "With background=true. true: one notification on exit; use it for anything that ends (builds, tests, deploys), or the job runs silently. ['pattern', ...]: notify when a line matches, only for one-shot readiness on processes that never exit; rate-limited. Omit for servers/daemons."
+                         "anyOf" [{"type" "boolean"} {"type" "array" "items" {"type" "string"}}]}
+               "heartbeat" {"type" "integer" "minimum" 0 "default" 0
+                            "description" "With background=true: also notify every N seconds (min 60) with new output; quiet ticks are skipped. For bounded jobs you must react to mid-run, never servers. Implies notify=true; 0 = off."}}
               ["command"])
    "process_manage"
    (fn-schema "process_manage" "Poll, wait on, read, or control a background terminal process started in this Kotoba agent runtime. Completed results are retained for up to 7 days, newest 64 per profile, while the agent runtime is alive."
@@ -549,15 +553,70 @@
 
 ;; ---------------------------------------------------------------- tools
 
+(defn- py-truthy?
+  "Python truthiness for tool arguments arriving over JSON (Hermes gates
+  notification intent with `if notify or watch_patterns or notify_on_complete`:
+  false/None/empty list/0 are all falsy)."
+  [x]
+  (cond
+    (or (nil? x) (false? x)) false
+    (and (string? x) (= x "")) false
+    (and (sequential? x) (empty? x)) false
+    (and (number? x) (zero? x)) false
+    :else true))
+
+(defn resolve-notify-args
+  "Hermes `tools/terminal_tool._handle_terminal`'s notify/heartbeat
+  normalization, verbatim: `notify` is the advertised interface (true →
+  notify_on_complete, [...] → watch_patterns); the legacy `notify_on_complete`
+  / `watch_patterns` args stay accepted and explicit `notify` wins.
+  Notification intent on a foreground call is refused with the corrected call;
+  a foreground `heartbeat` carries no intent and is normalized away.
+  `heartbeat` must be a whole number of seconds (0 disables; positive values
+  are clamped to min 60 at spawn) and implies notify_on_complete. Returns
+  `{:error ...}` or `{:notify-on-complete? bool :watch-patterns [...]|nil
+  :heartbeat-seconds n}`."
+  [{:strs [notify notify_on_complete watch_patterns heartbeat background]}]
+  (let [hb (or heartbeat 0)]
+    (cond
+      (or (boolean? hb) (not (js/Number.isInteger hb)) (< hb 0))
+      {:error "heartbeat must be a whole number of seconds (0 disables; positive values are clamped to min 60)."}
+
+      (and (not background)
+           (or (py-truthy? notify) (py-truthy? watch_patterns) (py-truthy? notify_on_complete)))
+      {:error "notify only applies to background commands (foreground results return directly). Either drop it, or run as terminal(command=..., background=true, notify=...)."}
+
+      :else
+      (let [hb (if background hb 0)
+            base (if (some? notify)
+                   (cond
+                     (boolean? notify)
+                     {:notify-on-complete? notify :watch-patterns nil}
+
+                     (sequential? notify)
+                     {:notify-on-complete? false :watch-patterns (vec notify)}
+
+                     :else
+                     {:error "notify must be true/false (notify on exit) or a list of strings (notify on output pattern match)."})
+                   {:notify-on-complete? (py-truthy? notify_on_complete)
+                    :watch-patterns (when (sequential? watch_patterns) (vec watch_patterns))})]
+        (if (:error base)
+          base
+          (cond-> (assoc base :heartbeat-seconds (if (pos? hb) hb 0))
+            (pos? hb) (assoc :notify-on-complete? true)))))))
+
 (defn terminal
   "A shell command under the OS sandbox of ctx's :terminal-policy (see
   itonami.agent.confine): writes only inside the run's roots (or its cwd),
   no secret stores, no network unless granted, only the env it names."
-  [ctx {:strs [command timeout workdir background notify_on_complete]}]
+  [ctx {:strs [command timeout workdir background] :as args}]
   (let [cwd (if workdir (resolve-path ctx workdir) (:cwd ctx))
-        pol (policy ctx)]
-    (if (and (:roots ctx) (not (writable? ctx cwd)))
-      (err (str "workdir outside this run's roots: " cwd))
+        pol (policy ctx)
+        notify (resolve-notify-args args)]
+    (cond
+      (:error notify) (err (:error notify))
+      (and (:roots ctx) (not (writable? ctx cwd))) (err (str "workdir outside this run's roots: " cwd))
+      :else
       (let [c (confine/command pol {:cmd (str command)
                                     :write-roots (or (:roots ctx) [(:cwd ctx)])
                                     :read-roots (read-roots ctx)
@@ -569,7 +628,9 @@
           (if background
             (process/spawn! ctx {:argv (:argv c) :env (:env c) :cwd cwd :tmpdir (:tmpdir c)
                                  :command (str command)
-                                 :notify-on-complete? (boolean notify_on_complete)
+                                 :notify-on-complete? (:notify-on-complete? notify)
+                                 :watch-patterns (:watch-patterns notify)
+                                 :heartbeat-seconds (:heartbeat-seconds notify)
                                  :on-exit (fn [exit stderr]
                                             (confine/audit! {:profile (:profile ctx) :peer? (:peer? pol)
                                                              :sandbox (:sandbox c) :cmd (str command)
