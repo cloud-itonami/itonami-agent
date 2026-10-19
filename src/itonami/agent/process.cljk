@@ -174,10 +174,10 @@
      "watcher_message_id" ""
      "watcher_interval" 0
      "parent_session_id" ""
-     "notify_on_complete" (boolean (:notify-on-complete? session))
+     "notify_on_complete" (boolean @(:notify-on-complete? session))
      "completion_output_chars" (or (:completion-output-chars session) 0)
-     "watch_patterns" []
-     "heartbeat_seconds" 0
+     "watch_patterns" (vec (:watch-patterns session))
+     "heartbeat_seconds" (:heartbeat-seconds session)
      "persist_on_release" false
      "output_log" ""}))
 
@@ -236,6 +236,275 @@
     (cond-> {"output" (redact-command (subs s (max 0 (- (count s) limit))))}
       (pos? cut) (assoc "output_cut" cut))))
 
+;; ---- watch patterns & heartbeats (Hermes watch/heartbeat events) ----
+;; `terminal(notify=[...])` / legacy `watch_patterns` arm watch-pattern
+;; matching on every output chunk; `terminal(heartbeat=N)` arms periodic
+;; "still running, here is the output since last time" ticks. Both queue
+;; Hermes-shaped events on `completion_queue` (tools/process_registry.py
+;; `_check_watch_patterns` / `_emit_heartbeat`).
+
+(def ^:private watch-min-interval-seconds
+  "Hermes tools/process_registry.py `WATCH_MIN_INTERVAL_SECONDS`."
+  15)
+
+(def ^:private watch-strike-limit
+  "Hermes tools/process_registry.py `WATCH_STRIKE_LIMIT`."
+  3)
+
+(def ^:private watch-lifetime-max-hits
+  "Hermes tools/process_registry.py `WATCH_LIFETIME_MAX_HITS`."
+  8)
+
+(def ^:private watch-global-max-per-window
+  "Hermes tools/process_registry.py `WATCH_GLOBAL_MAX_PER_WINDOW`."
+  15)
+
+(def ^:private watch-global-window-seconds
+  "Hermes tools/process_registry.py `WATCH_GLOBAL_WINDOW_SECONDS`."
+  10)
+
+(def ^:private watch-global-cooldown-seconds
+  "Hermes tools/process_registry.py `WATCH_GLOBAL_COOLDOWN_SECONDS`."
+  30)
+
+(def ^:private heartbeat-min-seconds
+  "Hermes tools/process_registry.py `HEARTBEAT_MIN_SECONDS`."
+  60)
+
+(def ^:private heartbeat-tick-seconds
+  "Hermes tools/process_registry.py `HEARTBEAT_TICK_SECONDS`."
+  5)
+
+(def ^:private heartbeat-output-chars
+  "Hermes tools/process_registry_notifications.HEARTBEAT_OUTPUT_CHARS`."
+  2000)
+
+(defn- now-sec [] (/ (h/now-ms) 1000))
+
+(defn- watch-event-base
+  "Hermes `ProcessRegistry._watch_event_base`: the session identity every
+  watch/heartbeat event carries. The command is redacted as
+  `_redact_process_result` redacts it before the event reaches the model; the
+  watcher routing fields ride the checkpoint only (see `checkpoint-entry`).
+  `event_id` is Hermes' `uuid.uuid4().hex` shape (32 hex chars)."
+  [session]
+  {"event_id" (h/random-hex 16)
+   "started_at" (/ (:started-at session) 1000)
+   "parent_session_id" ""
+   "session_id" (:id session)
+   "session_key" @(:session-key session)
+   "task_id" @(:task-id session)
+   "owner_task_id" @(:owner-task-id session)
+   "command" (redact-command (:command session))})
+
+;; Hermes `ProcessRegistry`'s global watch circuit breaker state.
+(defonce ^:private global-watch (atom {:window-start 0.0 :window-hits 0 :tripped-until 0.0 :suppressed 0}))
+
+(defn reset-watch-breaker!
+  "Fresh global watch-breaker state — a fresh `ProcessRegistry` (per-runtime
+  singleton) starts with this; tests reset it between cases."
+  []
+  (reset! global-watch {:window-start 0.0 :window-hits 0 :tripped-until 0.0 :suppressed 0}))
+
+(defn- global-watch-event
+  "Hermes `ProcessRegistry._global_watch_event`: unaddressed (all-sessions)
+  watch breaker event."
+  [type message extra]
+  (merge {"session_id" "" "session_key" "" "command" "" "type" type
+          "message" message
+          "platform" "" "chat_id" "" "user_id" "" "user_name" "" "thread_id" ""}
+         extra))
+
+(defn- global-watch-admit!
+  "Hermes `ProcessRegistry._global_watch_admit`: true when this watch_match may
+  pass the global breaker. In cooldown: drop and count. Otherwise slide the
+  rolling window; exceeding the cap trips the breaker for
+  `watch-global-cooldown-seconds` with ONE \"tripped\" summary, and the
+  cooldown's end emits ONE \"released\" summary."
+  [now]
+  ;; Node runs this synchronously (no await inside), so a plain
+  ;; read-modify-write is atomic like Hermes' lock.
+  (let [g @global-watch]
+    (when (and (pos? (:tripped-until g)) (>= now (:tripped-until g)))
+      (let [suppressed (:suppressed g)]
+        (reset! global-watch {:window-start now :window-hits 0
+                              :tripped-until 0.0 :suppressed 0})
+        (when (pos? suppressed)
+          (swap! completion-queue conj
+                 (global-watch-event "watch_overflow_released"
+                                     (str "Watch-pattern notifications resumed. "
+                                          suppressed " match event(s) were suppressed during the flood.")
+                                     {"suppressed" suppressed}))))
+      nil)
+    (let [g @global-watch]
+      (if (and (pos? (:tripped-until g)) (< now (:tripped-until g)))
+        (do (swap! global-watch update :suppressed inc)
+            false)
+        (let [g (if (>= (- now (:window-start g)) watch-global-window-seconds)
+                  (assoc g :window-start now :window-hits 0)
+                  g)]
+          (if (< (:window-hits g) watch-global-max-per-window)
+            (do (reset! global-watch (update g :window-hits inc))
+                true)
+            (do (reset! global-watch (-> g
+                                         (assoc :tripped-until (+ now watch-global-cooldown-seconds))
+                                         (update :suppressed inc)))
+                (swap! completion-queue conj
+                       (global-watch-event "watch_overflow_tripped"
+                                           (str "Watch-pattern overflow: >" watch-global-max-per-window
+                                                " notifications in " watch-global-window-seconds
+                                                "s across all processes. Suppressing further watch_match "
+                                                "events for " watch-global-cooldown-seconds "s.")
+                                           {}))
+                false)))))))
+
+(defn- emit-watch-disabled!
+  "Hermes `ProcessRegistry._emit_watch_disabled`: the one-shot watch_disabled
+  summary (strike-limit or lifetime-cap path)."
+  [session suppressed why]
+  (swap! completion-queue conj
+         (merge (watch-event-base session)
+                {"type" "watch_disabled"
+                 "suppressed" suppressed
+                 "message" (str "Watch patterns disabled for process " (:id session) " — " why
+                                "Falling back to notify_on_complete semantics; you'll get "
+                                "exactly one notification when the process exits.")})))
+
+(defn heartbeat-output-tail
+  "Hermes `process_registry_notifications.heartbeat_output_tail`, verbatim: a
+  tick's output capped to its newest characters (a long job's latest lines are
+  what matters), and the count of characters cut before it. `omitted` counts
+  characters already cut before `output`."
+  ([output] (heartbeat-output-tail output 0))
+  ([output omitted]
+   (if (> (count output) heartbeat-output-chars)
+     [(subs output (- (count output) heartbeat-output-chars))
+      (+ omitted (- (count output) heartbeat-output-chars))]
+     [output omitted])))
+
+(defn check-watch-patterns!
+  "Hermes `ProcessRegistry._check_watch_patterns`: scan a freshly-read chunk
+  for watch patterns and queue notifications. Per-session rate limiting (the
+  `watch-*` constants): one match per cooldown window, a match inside the
+  window is one strike, `watch-strike-limit` consecutive strikes or
+  `watch-lifetime-max-hits` total deliveries disable watching and promote the
+  session to `notify_on_complete`. `now` is epoch seconds."
+  [session new-text now]
+  (let [patterns (vec (:watch-patterns session))]
+    (when (and (seq patterns)
+               (not (:disabled? @(:watch session)))
+               (= :running @(:state session)))
+      (let [hits (into []
+                       (for [line (str/split-lines new-text)
+                             :let [p (some (fn [p] (when (str/includes? line p) p)) patterns)]
+                             :when p]
+                         [p (str/replace line #"\s+$" "")]))]
+        (when (seq hits)
+          (let [matched-pattern (first (first hits))
+                matched-lines (mapv second hits)
+                w @(:watch session)]
+            (if (and (pos? (:cooldown-until w)) (< now (:cooldown-until w)))
+              ;; Inside the cooldown: drop, count one strike per window,
+              ;; disable + promote once the strike limit is hit.
+              (do (swap! (:watch session) update :suppressed + (count matched-lines))
+                  (when-not (:strike-candidate? @(:watch session))
+                    (swap! (:watch session) assoc :strike-candidate? true)
+                    (swap! (:watch session) update :consecutive-strikes inc)
+                    (when (>= (:consecutive-strikes @(:watch session)) watch-strike-limit)
+                      (swap! (:watch session) assoc :disabled? true)
+                      ;; Promote so the agent still gets exactly one
+                      ;; notification on exit, plus exactly one summary so it
+                      ;; sees why things went quiet.
+                      (reset! (:notify-on-complete? session) true)
+                      (emit-watch-disabled!
+                       session (:suppressed @(:watch session))
+                       (str watch-strike-limit " consecutive rate-limit windows triggered "
+                            "(min spacing " watch-min-interval-seconds "s). ")))))
+              ;; Cooldown expired. A prior window with no drops resets the
+              ;; consecutive-strike counter (healthy cadence again).
+              (let [w (cond-> w
+                        (and (pos? (:cooldown-until w)) (not (:strike-candidate? w)))
+                        (assoc :consecutive-strikes 0))
+                    ;; Emit and start a new cooldown window.
+                    w (-> w
+                          (assoc :strike-candidate? false)
+                          (assoc :cooldown-until (+ now watch-min-interval-seconds))
+                          (update :hits inc))
+                    suppressed (:suppressed w)
+                    w (assoc w :suppressed 0)
+                    ;; Lifetime cap: this match is still delivered, but no
+                    ;; further ones.
+                    lifetime-exhausted (>= (:hits w) watch-lifetime-max-hits)
+                    w (cond-> w lifetime-exhausted (assoc :disabled? true))]
+                (reset! (:watch session) w)
+                (when lifetime-exhausted
+                  (reset! (:notify-on-complete? session) true))
+                (let [output (let [lines (str/join "\n" (take 20 matched-lines))]
+                               (if (> (count lines) 2000)
+                                 (str (subs lines 0 2000) "\n...(truncated)")
+                                 lines))]
+                  (when (global-watch-admit! now)
+                    (swap! completion-queue conj
+                           (merge (watch-event-base session)
+                                  {"type" "watch_match"
+                                   "pattern" matched-pattern
+                                   "output" (redact-command output)
+                                   "suppressed" suppressed})))
+                  ;; Even when the breaker drops the final match, still
+                  ;; explain the silence.
+                  (when lifetime-exhausted
+                    (emit-watch-disabled!
+                     session 0
+                     (str "reached the lifetime cap of " watch-lifetime-max-hits
+                          " delivered matches. "))))))))))))
+
+(defn emit-heartbeat!
+  "Hermes `ProcessRegistry._emit_heartbeat`: queue a heartbeat carrying the
+  output since the last one. A tick with nothing new is skipped outright:
+  every queued event costs the owner a full model turn."
+  [session now]
+  (let [hb @(:hb session)]
+    (reset! (:hb session) (assoc hb :last now))
+    (let [delta (- @(:total-chars session) (:total-at-last hb))
+          buf @(:output session)
+          raw (if (pos? delta) (subs buf (max 0 (- (count buf) delta))) "")]
+      (reset! (:hb session) (assoc @(:hb session) :total-at-last @(:total-chars session)))
+      (when-not (= raw "")
+        (let [[output omitted] (heartbeat-output-tail raw)
+              seq (inc (:seq @(:hb session)))]
+          (reset! (:hb session) (assoc @(:hb session) :seq seq))
+          (swap! completion-queue conj
+                 (merge (watch-event-base session)
+                        {"type" "heartbeat"
+                         "seq" seq
+                         "interval" (:heartbeat-seconds session)
+                         "elapsed" (js/Math.trunc (- now (/ (:started-at session) 1000)))
+                         "output" (redact-command output)
+                         "omitted" omitted
+                         "started_at" (/ (:started-at session) 1000)})))))))
+
+(defonce ^:private heartbeat-timer (atom nil))
+
+(defn- heartbeat-loop
+  "Hermes `ProcessRegistry._heartbeat_loop`: one daemon thread for every
+  heartbeat session (Kotoba: one unref'd interval timer)."
+  []
+  (let [now (now-sec)]
+    (doseq [[_ s] @sessions
+            :when (and (= :running @(:state s))
+                       (pos? (:heartbeat-seconds s))
+                       (>= (- now (:last @(:hb s))) (:heartbeat-seconds s)))]
+      (emit-heartbeat! s now))))
+
+(defn- ensure-heartbeat-timer!
+  "Start the single heartbeat tick timer (`_ensure_heartbeat_thread`). The
+  timer is unref'd — a daemon thread must not keep the runtime alive."
+  []
+  (when-not @heartbeat-timer
+    (let [t (js/setInterval heartbeat-loop (* 1000 heartbeat-tick-seconds))]
+      (when (fn? (.-unref t)) (.unref t))
+      (reset! heartbeat-timer t))))
+
 (defn- completion-event
   "Hermes `ProcessRegistry._publish_finished`'s notification payload, minus
   what Kotoba has no producer for (watcher fields ride the checkpoint only).
@@ -259,7 +528,7 @@
   (when (compare-and-set! (:state session) :running :exited)
     (reset! (:exit-code session) exit-code)
     (reset! (:finished-at session) (h/now-ms))
-    (when (:notify-on-complete? session)
+    (when @(:notify-on-complete? session)
       (swap! completion-queue conj (completion-event session exit-code reason source)))
     (try
       (when on-exit (on-exit exit-code detail))
@@ -269,10 +538,14 @@
         (write-checkpoint! (:home session))))))
 
 (defn- append-output! [session chunk]
-  (swap! (:output session)
-         (fn [s]
-           (let [s (str s (.toString chunk "utf8"))]
-             (subs s (max 0 (- (count s) max-output-chars)))))))
+  (let [text (.toString chunk "utf8")]
+    (swap! (:total-chars session) + (count text))
+    (swap! (:output session)
+           (fn [s]
+             (let [s (str s text)]
+               (subs s (max 0 (- (count s) max-output-chars))))))
+    ;; Hermes' reader thread scans each freshly-read chunk for watch patterns.
+    (check-watch-patterns! session text (now-sec))))
 
 (defn- process-status [session]
   (if (= :running @(:state session)) "running" "exited"))
@@ -310,8 +583,15 @@
                                                       (get entry "task_id") "")))
                          :session-key (atom (str (or (get entry "session_key") "")))
                          :handoff-note (atom "")
-                         :notify-on-complete? (boolean (get entry "notify_on_complete"))
+                         :notify-on-complete? (atom (boolean (get entry "notify_on_complete")))
                          :completion-output-chars (or (get entry "completion_output_chars") 0)
+                         :watch-patterns (vec (or (get entry "watch_patterns") []))
+                         :heartbeat-seconds (int (or (get entry "heartbeat_seconds") 0))
+                         :watch (atom {:hits 0 :suppressed 0 :disabled? false
+                                       :cooldown-until 0.0 :strike-candidate? false
+                                       :consecutive-strikes 0})
+                         :hb (atom {:last 0.0 :total-at-last 0 :seq 0})
+                         :total-chars (atom 0)
                          :killed-by (atom nil)
                          :started-at (long (* 1000 (if (number? started)
                                                      started
@@ -362,7 +642,8 @@
   away at drain time by child-ownership, and a handoff re-owns it) while its
   result says so, with Hermes' `subagent_note`
   (`terminal_tool_background`'s delegated-child branch)."
-  [ctx {:keys [argv env cwd tmpdir command on-exit notify-on-complete? completion-output-chars]}]
+  [ctx {:keys [argv env cwd tmpdir command on-exit notify-on-complete? completion-output-chars
+               watch-patterns heartbeat-seconds]}]
   (let [home (:home ctx)
         _ (ensure-recovered! home)
         _ (prune-sessions! home)
@@ -391,8 +672,22 @@
                      :owner-task-id (atom owner)
                      :session-key (atom session-key)
                      :handoff-note (atom "")
-                     :notify-on-complete? notify-requested
+                     :notify-on-complete? (atom notify-requested)
                      :completion-output-chars (or completion-output-chars 0)
+                     ;; Hermes `arm_heartbeat`: the effective interval is
+                     ;; clamped to the floor; the output baseline stays 0
+                     ;; (spawn) so the first heartbeat carries everything
+                     ;; printed since spawn, exactly as `_heartbeat_total_at_last`
+                     ;; defaults to 0 in `ProcessSession`.
+                     :watch-patterns (vec (or watch-patterns []))
+                     :heartbeat-seconds (if (and (number? heartbeat-seconds) (pos? heartbeat-seconds))
+                                          (max (int heartbeat-seconds) heartbeat-min-seconds)
+                                          0)
+                     :watch (atom {:hits 0 :suppressed 0 :disabled? false
+                                   :cooldown-until 0.0 :strike-candidate? false
+                                   :consecutive-strikes 0})
+                     :hb (atom {:last (now-sec) :total-at-last 0 :seq 0})
+                     :total-chars (atom 0)
                      :killed-by (atom nil)
                      :started-at (h/now-ms) :finished-at (atom nil)
                      :state (atom :running) :exit-code (atom nil)
@@ -402,6 +697,7 @@
               (h/json-str {"error" (str "background spawn failed: " (.-message child))}))
           (do
             (swap! sessions assoc id session)
+            (when (pos? (:heartbeat-seconds session)) (ensure-heartbeat-timer!))
             (.on (.-stdout child) "data" #(append-output! session %))
             (.on (.-stderr child) "data" #(append-output! session %))
             (.on child "error" (fn [e]
@@ -711,36 +1007,81 @@
                (when-not (= goal "") (str " Task: \"" goal "\""))))
         (str "Started by subagent " raw-owner " (delegate_task).")))))
 
-(defn format-completion-notification
-  "Hermes `process_registry_notifications.format_process_notification` — the
-  completion branch, verbatim (heartbeats and watch matches have no Kotoba
-  producer). `handoff_note` overrides the delegation attribution, as in Hermes:
-  the parent is told the process was handed to it and why."
+(defn format-age
+  "Hermes `process_registry_notifications._format_age`, verbatim:
+  human-friendly elapsed string ('18m', '2h3m', '45s')."
+  [seconds]
+  (let [s (try (js/Math.trunc (max 0 seconds)) (catch :default _ nil))]
+    (cond
+      (or (nil? s) (js/Number.isNaN s)) "?"
+      (< s 60) (str s "s")
+      :else (let [m (quot s 60) r (rem s 60)]
+              (if (< m 60)
+                (str m "m" (when (pos? r) (str r "s")))
+                (let [hh (quot m 60) mm (rem m 60)]
+                  (str hh "h" (when (pos? mm) (str mm "m")))))))))
+
+(defn heartbeat-output-text
+  "Hermes `process_registry_notifications.heartbeat_output_text`, verbatim: a
+  tick's output as the agent reads it — the cut marker, rendered here only,
+  then the tail."
   [evt]
-  (let [sid (get evt "session_id" "unknown")
-        cmd (get evt "command" "unknown")
-        attribution (if (get evt "handoff_note")
-                      (str "Handed off to you by a subagent before it finished. Purpose: "
-                           (get evt "handoff_note"))
-                      (delegation-attribution-line evt))
-        exit (get evt "exit_code" "?")
-        out (get evt "output" "")
-        signal (if (contains? #{-15 143 "-15" "143"} exit) ", SIGTERM" "")
-        out (cond
-              (and attribution (string? out) (> (count out) 600))
-              (str "...(output trimmed — subagent-owned process; see the "
-                   "delegation's live transcript for full output)\n"
-                   (subs out (- (count out) 600)))
+  (let [omitted (int (or (get evt "omitted") 0))
+        output (str (or (get evt "output") ""))]
+    (if (pos? omitted)
+      (str "...(" omitted " earlier characters omitted)\n" output)
+      output)))
 
-              (get evt "output_cut")
-              (str "...(first " (get evt "output_cut") " characters cut — process(action=\"log\", "
-                   "session_id=\"" sid "\") has the full output)\n" out)
+(defn format-completion-notification
+  "Hermes `process_registry_notifications.format_process_notification`, verbatim
+  (`async_delegation` has no Kotoba producer — that surface is the delegation
+  result path). `handoff_note` overrides the delegation attribution, as in
+  Hermes: the parent is told the process was handed to it and why."
+  [evt]
+  (let [evt-type (get evt "type" "completion")]
+    (if (contains? #{"watch_disabled" "watch_overflow_tripped" "watch_overflow_released"} evt-type)
+      (str "[IMPORTANT: " (get evt "message" "") "]")
+      (let [sid (get evt "session_id" "unknown")
+            cmd (get evt "command" "unknown")
+            attribution (if (get evt "handoff_note")
+                          (str "Handed off to you by a subagent before it finished. Purpose: "
+                               (get evt "handoff_note"))
+                          (delegation-attribution-line evt))
+            attribution (if attribution (str attribution "\n") "")]
+        (cond
+          (= "heartbeat" evt-type)
+          (str "[Background process " sid " heartbeat #" (get evt "seq" "?")
+               " — still running after " (format-age (or (get evt "elapsed") 0))
+               " (next in " (get evt "interval" "?") "s when there is new output; you will also be told when it exits).\n"
+               attribution "Command: " cmd "\nOutput since last heartbeat:\n"
+               (heartbeat-output-text evt) "]")
 
-              :else out)]
-    (str "[IMPORTANT: Background process " sid " " (completion-status evt)
-         " (exit code " exit signal ").\n"
-         (when attribution (str attribution "\n"))
-         "Command: " cmd "\nOutput:\n" out "]")))
+          (= "watch_match" evt-type)
+          (let [sup (or (get evt "suppressed") 0)]
+            (str "[IMPORTANT: Background process " sid " matched watch pattern \""
+                 (get evt "pattern" "?") "\".\n"
+                 attribution "Command: " cmd "\nMatched output:\n" (get evt "output" "")
+                 (when (pos? sup) (str "\n(" sup " earlier matches were suppressed by rate limit)"))
+                 "]"))
+
+          :else
+          (let [exit (get evt "exit_code" "?")
+                out (get evt "output" "")
+                signal (if (contains? #{-15 143 "-15" "143"} exit) ", SIGTERM" "")
+                out (cond
+                      (and attribution (string? out) (> (count out) 600))
+                      (str "...(output trimmed — subagent-owned process; see the "
+                           "delegation's live transcript for full output)\n"
+                           (subs out (- (count out) 600)))
+
+                      (get evt "output_cut")
+                      (str "...(first " (get evt "output_cut") " characters cut — process(action=\"log\", "
+                           "session_id=\"" sid "\") has the full output)\n" out)
+
+                      :else out)]
+            (str "[IMPORTANT: Background process " sid " " (completion-status evt)
+                 " (exit code " exit signal ").\n"
+                 attribution "Command: " cmd "\nOutput:\n" out "]")))))))
 
 (defn notification-batch-text
   "Hermes `ProcessNotificationBatch.render`: consecutive completions enter the
@@ -793,8 +1134,39 @@
     (reset! completion-queue @kept)
     @out))
 
-(defn pending-notification-text
-  "This run's owned completion notices as one Hermes-batched message (or nil),
-  for delivery as a message between model turns."
+(defn group-process-notifications
+  "Hermes `process_registry_notifications.group_process_notifications`,
+  verbatim: group consecutive completions only; watches, heartbeats and
+  delegations are barriers. Returns vectors of `[event text]` pairs."
+  [notifications]
+  (let [groups (atom [])
+        batch (atom [])]
+    (doseq [[evt text] notifications]
+      (if (= "completion" (get evt "type" "completion"))
+        (swap! batch conj [evt text])
+        (do (when (seq @batch)
+              (swap! groups conj @batch)
+              (reset! batch []))
+            (swap! groups conj [[evt text]]))))
+    (when (seq @batch) (swap! groups conj @batch))
+    @groups))
+
+(defn pending-notification-messages
+  "This run's owned process notices as Hermes delivers them: one message per
+  `group_process_notifications` group — a completion batch rendered by
+  `notification-batch-text`, a watch/heartbeat event as its own message (the
+  CLI's `_pending_input.put` per group)."
   [opts]
-  (notification-batch-text (drain-notifications! opts)))
+  (vec (keep (fn [group]
+               (let [evt (first (first group))]
+                 (if (= "completion" (get evt "type" "completion"))
+                   (notification-batch-text group)
+                   (second (first group)))))
+             (group-process-notifications (drain-notifications! opts)))))
+
+(defn pending-notification-text
+  "The pending messages joined with a blank line. Callers that must keep
+  Hermes' one-message-per-group boundary use `pending-notification-messages`."
+  [opts]
+  (let [msgs (pending-notification-messages opts)]
+    (when (seq msgs) (str/join "\n\n" msgs))))

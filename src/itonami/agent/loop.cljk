@@ -297,13 +297,13 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
          :attempts attempts :writes @writes :provider (:provider last-hop) :model (:model last-hop)}
 
         :else
-        ;; pushed background-process completions (Hermes' completion queue)
-        ;; re-enter as a message between model turns, batched as Hermes batches
-        ;; them (ProcessNotificationBatch.render)
-        (let [notice (proc/pending-notification-text
-                      {:session-key session-key
-                       :surface-child? (boolean (get-in config ["delegation" "surface_child_process_notifications"]))})
-              messages (cond-> messages notice (conj {"role" "user" "content" notice}))]
+        ;; pushed background-process notices (Hermes' completion queue)
+        ;; re-enter as messages between model turns, one per
+        ;; group_process_notifications group (watches/heartbeats are barriers)
+        (let [notices (proc/pending-notification-messages
+                       {:session-key session-key
+                        :surface-child? (boolean (get-in config ["delegation" "surface_child_process_notifications"]))})
+              messages (into messages (map (fn [n] {"role" "user" "content" n}) notices))]
         (p/let [r (provider/complete hops env {:messages messages :tools schemas
                                                :reasoning-effort (or reasoning-effort
                                                                      (get-in config ["agent" "reasoning_effort"]))

@@ -211,9 +211,18 @@
                                   (fn [answer] (resolve (= "y" (str/lower-case (str/trim answer))))))))
                             true)))]
     (println (str "itonami-agent · profile " (:name prof) " · /exit to quit"))
-    (letfn [(ask []
+    (letfn [(run-notices [notices]
+              ;; one turn per group_process_notifications group, as the CLI's
+              ;; pending input queue does (`_pending_input.put` per group)
+              (if (seq notices)
+                (-> ((executor opts) prof (first notices) (run-opts opts prof))
+                    (p/then (fn [r]
+                              (when (:final r) (println (:final r)))
+                              (run-notices (rest notices)))))
+                (p/resolved nil)))
+            (ask []
               (let [pending (agent-loop/delegate-pending-results!)
-                    notice (proc/pending-notification-text {:session-key ""})]
+                    notices (proc/pending-notification-messages {:session-key ""})]
                 (cond
                   (seq pending)
                   ;; background results re-enter as a message between turns
@@ -229,14 +238,12 @@
                                 (when (:final r) (println (:final r)))
                                 (ask))))
 
-                  ;; a pushed background-process completion (Hermes'
-                  ;; completion queue) enters as its own turn, as the CLI's
-                  ;; pending input does
-                  notice
-                  (-> ((executor opts) prof notice (run-opts opts prof))
-                      (p/then (fn [r]
-                                (when (:final r) (println (:final r)))
-                                (ask))))
+                  ;; pushed background-process notices (Hermes' completion
+                  ;; queue) enter as their own turns, as the CLI's pending
+                  ;; input does
+                  (seq notices)
+                  (-> (run-notices notices)
+                      (p/then (fn [_] (ask))))
 
                   :else
                   (.question rl "> "
