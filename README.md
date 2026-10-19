@@ -11,6 +11,23 @@ bin/itonami-agent peer serve --port 7420                # run turns for trusted 
 bin/itonami-agent peer run -p hiraku-soudan -z "質問"   # run this turn on a peer
 ```
 
+## Running where `env -S` is missing (guest VMs, busybox)
+
+The launcher's shebang is `#!/usr/bin/env -S kbb --backend sci`, which needs
+an `env` that understands `-S` (GNU coreutils, BSD). Busybox `env` does not
+(measured 2026-10-19 in an Alpine aarch64 initramfs: `env: Usage: ...` and
+nothing else). On such hosts invoke the same launcher through kbb directly --
+it is equivalent, the launcher adds `src/` itself:
+
+```
+kbb --backend sci bin/itonami-agent -p <profile> -z "…"
+```
+
+Two more guest notes from the same run: profiles resolve under `ITONAMI_DIR`
+(default `~/.itonami`) so set it when `HOME` is not where the profiles live;
+and the toolset gate refuses to start when the selected Hermes tools exceed
+the Kotoba implementation (`-t terminal,file,web` selects a supported set).
+
 ## Compatibility with Hermes Agent
 
 itonami-agent is Hermes-compatible in FORMAT, not in STORE. It keeps its own
