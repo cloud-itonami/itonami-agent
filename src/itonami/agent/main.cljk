@@ -42,6 +42,7 @@
             [itonami.agent.soul :as soul]
             [itonami.agent.manifest :as manifest]
             [itonami.agent.loop :as agent-loop]
+            [itonami.agent.process :as proc]
             [itonami.agent.tools :as tools]
             [itonami.agent.browser :as browser]
             [itonami.agent.computer-use :as computer-use]
@@ -211,20 +212,33 @@
                             true)))]
     (println (str "itonami-agent · profile " (:name prof) " · /exit to quit"))
     (letfn [(ask []
-              (let [pending (agent-loop/delegate-pending-results!)]
-                (if (seq pending)
+              (let [pending (agent-loop/delegate-pending-results!)
+                    notice (proc/pending-notification-text {:session-key ""})]
+                (cond
+                  (seq pending)
                   ;; background results re-enter as a message between turns
                   ;; (one message per call): acknowledge, then end the turn
                   (-> ((executor opts) prof
                        (str "## Delegated task results (arrived between your turns)\n"
                             (str/join "\n" (for [r pending]
-                                              (str "- " (get r "goal") " [" (get r "status") "]: "
-                                                   (or (get r "summary") (get r "error")))))
+                                             (str "- " (get r "goal") " [" (get r "status") "]: "
+                                                  (or (get r "summary") (get r "error")))))
                             "\n\nAcknowledge these results in one line, then end your turn.")
                        (run-opts (assoc opts :join-children? false) prof))
                       (p/then (fn [r]
                                 (when (:final r) (println (:final r)))
                                 (ask))))
+
+                  ;; a pushed background-process completion (Hermes'
+                  ;; completion queue) enters as its own turn, as the CLI's
+                  ;; pending input does
+                  notice
+                  (-> ((executor opts) prof notice (run-opts opts prof))
+                      (p/then (fn [r]
+                                (when (:final r) (println (:final r)))
+                                (ask))))
+
+                  :else
                   (.question rl "> "
                          (fn [line]
                            (if (or (nil? line) (#{"/exit" "/quit"} (str/trim line)))

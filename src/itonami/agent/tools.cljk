@@ -38,7 +38,8 @@
               {"command" {"type" "string" "description" "The command to execute"}
                "timeout" {"type" "integer" "description" "Seconds before the command is killed (default 180)"}
                "workdir" {"type" "string" "description" "Working directory (default: the profile's terminal cwd)"}
-               "background" {"type" "boolean" "description" "Start a background process; use process_manage to poll, wait, read output, send stdin, or terminate it"}}
+               "background" {"type" "boolean" "description" "Start a background process; use process_manage to poll, wait, read output, send stdin, or terminate it"}
+               "notify_on_complete" {"type" "boolean" "description" "Push a completion notice to you when the background process exits (background only; subagents cannot receive one — hand the process to your parent with process_manage instead)"}}
               ["command"])
    "process_manage"
    (fn-schema "process_manage" "Poll, wait on, read, or control a background terminal process started in this Kotoba agent runtime. Completed results are retained for up to 7 days, newest 64 per profile, while the agent runtime is alive."
@@ -552,7 +553,7 @@
   "A shell command under the OS sandbox of ctx's :terminal-policy (see
   itonami.agent.confine): writes only inside the run's roots (or its cwd),
   no secret stores, no network unless granted, only the env it names."
-  [ctx {:strs [command timeout workdir background]}]
+  [ctx {:strs [command timeout workdir background notify_on_complete]}]
   (let [cwd (if workdir (resolve-path ctx workdir) (:cwd ctx))
         pol (policy ctx)]
     (if (and (:roots ctx) (not (writable? ctx cwd)))
@@ -568,6 +569,7 @@
           (if background
             (process/spawn! ctx {:argv (:argv c) :env (:env c) :cwd cwd :tmpdir (:tmpdir c)
                                  :command (str command)
+                                 :notify-on-complete? (boolean notify_on_complete)
                                  :on-exit (fn [exit stderr]
                                             (confine/audit! {:profile (:profile ctx) :peer? (:peer? pol)
                                                              :sandbox (:sandbox c) :cmd (str command)

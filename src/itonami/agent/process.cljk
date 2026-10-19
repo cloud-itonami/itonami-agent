@@ -45,6 +45,32 @@
   "Hermes tools/process_registry.py `_MAX_HANDOFFS_PER_CHILD`."
   3)
 
+;; ---- completion notices (Hermes ProcessRegistry.completion_queue) ----
+;; A session that spawned with `notify_on_complete` enqueues one Hermes-shaped
+;; completion event when it exits (first finisher only). `drain-notifications!`
+;; routes events to their owner exactly as `ProcessRegistry.drain_notifications`
+;; does and formats them with `process_registry_notifications
+;; .format_process_notification` (the completion branch).
+
+(def ^:private completion-output-chars-default
+  "Hermes tools/process_registry.py `COMPLETION_OUTPUT_CHARS`."
+  2000)
+
+(def ^:private subagent-notify-note
+  "Hermes tools/terminal_tool_background.py `_SUBAGENT_NOTIFY_NOTE`, verbatim."
+  (str "You are a subagent: this process's completion notice will NOT reach your parent, and the process is killed when "
+       "you finish. Before you finish, either wait for it (process_manage wait), kill it, or hand it to your parent with "
+       "process_manage(action='handoff', session_id=..., data='<purpose>') so the parent receives its completion. For CI "
+       "watchers prefer returning the fact (PR number, SHA) and letting the parent watch."))
+
+(defonce ^:private completion-queue (atom []))
+;; Hermes ProcessRegistry._completion_consumed: exits the agent already saw
+;; inline (wait/log), which must not be re-injected as a notice.
+(defonce ^:private completion-consumed (atom #{}))
+;; Hermes ProcessRegistry._poll_observed: exits observed via a read-only poll;
+;; skipped by drains that pass skip-poll-observed (the CLI agent path).
+(defonce ^:private poll-observed (atom #{}))
+
 (defn container-task-id
   "Hermes `tools/terminal_tool._resolve_container_task_id` for a non-container
   backend (Kotoba has no Docker/SSH environments; delegate children share the
@@ -70,6 +96,16 @@
 
 (defn- session-pid [session]
   (or (:pid session) (when-let [c (:child session)] (.-pid c))))
+
+(defn- signal-number
+  "POSIX signal number for a Node close-event signal name (process.constants
+  is not on every runtime's `js/process` global), or nil when unknown."
+  [signal]
+  (try
+    (let [sigs (or (some-> (js/require "node:process") (.-constants) (.-signals))
+                   (some-> js/process (.-constants) (.-signals)))]
+      (when sigs (aget sigs signal)))
+    (catch :default _ nil)))
 
 (defn- ps-probe
   "One `ps` read of a host PID: process state and start wall time, or nil when
@@ -138,8 +174,8 @@
      "watcher_message_id" ""
      "watcher_interval" 0
      "parent_session_id" ""
-     "notify_on_complete" false
-     "completion_output_chars" 0
+     "notify_on_complete" (boolean (:notify-on-complete? session))
+     "completion_output_chars" (or (:completion-output-chars session) 0)
      "watch_patterns" []
      "heartbeat_seconds" 0
      "persist_on_release" false
@@ -188,12 +224,45 @@
         entries (into mine (foreign-handoffs path known))]
     (h/spit-atomic path (h/json-str entries))))
 
-(defn- finish! [session code detail on-exit tmpdir]
+(defn- completion-output
+  "Hermes `_completion_output`: `output` sized by the session's
+  `completion_output_chars` (or `COMPLETION_OUTPUT_CHARS` when 0) plus
+  `output_cut` when trimmed."
+  [session]
+  (let [n (:completion-output-chars session)
+        limit (if (and (number? n) (pos? n)) n completion-output-chars-default)
+        s @(:output session)
+        cut (- (count s) limit)]
+    (cond-> {"output" (redact-command (subs s (max 0 (- (count s) limit))))}
+      (pos? cut) (assoc "output_cut" cut))))
+
+(defn- completion-event
+  "Hermes `ProcessRegistry._publish_finished`'s notification payload, minus
+  what Kotoba has no producer for (watcher fields ride the checkpoint only).
+  The command is redacted exactly as the checkpoint entry is (`_redact_process_result`
+  redacts the command before the event reaches the model)."
+  [session exit-code reason source]
+  (cond-> {"type" "completion"
+           "session_id" (:id session)
+           "session_key" @(:session-key session)
+           "task_id" @(:task-id session)
+           "owner_task_id" @(:owner-task-id session)
+           "command" (redact-command (:command session))
+           "exit_code" exit-code
+           "completion_reason" reason
+           "termination_source" source
+           "started_at" (/ (:started-at session) 1000)}
+    (not (str/blank? @(:handoff-note session))) (assoc "handoff_note" @(:handoff-note session))
+    true (into (completion-output session))))
+
+(defn- finish! [session exit-code reason source detail on-exit tmpdir]
   (when (compare-and-set! (:state session) :running :exited)
-    (reset! (:exit-code session) code)
+    (reset! (:exit-code session) exit-code)
     (reset! (:finished-at session) (h/now-ms))
+    (when (:notify-on-complete? session)
+      (swap! completion-queue conj (completion-event session exit-code reason source)))
     (try
-      (when on-exit (on-exit code detail))
+      (when on-exit (on-exit exit-code detail))
       (finally
         (when tmpdir (h/rm tmpdir))
         (prune-sessions! (:home session))
@@ -241,6 +310,9 @@
                                                       (get entry "task_id") "")))
                          :session-key (atom (str (or (get entry "session_key") "")))
                          :handoff-note (atom "")
+                         :notify-on-complete? (boolean (get entry "notify_on_complete"))
+                         :completion-output-chars (or (get entry "completion_output_chars") 0)
+                         :killed-by (atom nil)
                          :started-at (long (* 1000 (if (number? started)
                                                      started
                                                      (/ (h/now-ms) 1000))))
@@ -284,12 +356,18 @@
 
 (defn spawn!
   "Start the already-confined argv from confine/command. The caller owns the
-  policy decision and audit record; this namespace only manages the child."
-  [ctx {:keys [argv env cwd tmpdir command on-exit]}]
+  policy decision and audit record; this namespace only manages the child.
+  `notify-on-complete?` arms Hermes' pushed completion notice (terminal
+  `notify_on_complete`); a subagent spawn stays armed (the notice is routed
+  away at drain time by child-ownership, and a handoff re-owns it) while its
+  result says so, with Hermes' `subagent_note`
+  (`terminal_tool_background`'s delegated-child branch)."
+  [ctx {:keys [argv env cwd tmpdir command on-exit notify-on-complete? completion-output-chars]}]
   (let [home (:home ctx)
         _ (ensure-recovered! home)
         _ (prune-sessions! home)
-        running (filter #(and (= home (:home %)) (= :running @(:state %))) (vals @sessions))]
+        running (filter #(and (= home (:home %)) (= :running @(:state %))) (vals @sessions))
+        notify-requested (boolean notify-on-complete?)]
     (cond
       (>= (count running) max-processes)
       (h/json-str {"error" (str "background process limit reached (" max-processes ")")})
@@ -313,6 +391,9 @@
                      :owner-task-id (atom owner)
                      :session-key (atom session-key)
                      :handoff-note (atom "")
+                     :notify-on-complete? notify-requested
+                     :completion-output-chars (or completion-output-chars 0)
+                     :killed-by (atom nil)
                      :started-at (h/now-ms) :finished-at (atom nil)
                      :state (atom :running) :exit-code (atom nil)
                      :output (atom "")}]
@@ -324,13 +405,32 @@
             (.on (.-stdout child) "data" #(append-output! session %))
             (.on (.-stderr child) "data" #(append-output! session %))
             (.on child "error" (fn [e]
-                                 (finish! session -1 (str (.-message e)) on-exit tmpdir)))
+                                 (finish! session -1 "failed_start" "failed_start"
+                                          (str (.-message e)) on-exit tmpdir)))
             (.on child "close" (fn [code signal]
-                                 (finish! session code (when signal (str "signal " signal)) on-exit tmpdir)))
+                                 ;; Python Popen returncode semantics: a signal
+                                 ;; death reports the negated signal number
+                                 ;; (SIGTERM -> -15, the formatter's marker set).
+                                 (let [killed @(:killed-by session)
+                                       exit (if (number? code)
+                                              code
+                                              (- (or (signal-number signal) 1)))]
+                                   (finish! session exit
+                                            (if killed "killed" "exited")
+                                            (str (or killed ""))
+                                            (when signal (str "signal " signal))
+                                            on-exit tmpdir))))
             (write-checkpoint! home)
             (h/json-str (merge (result-base session)
                                {"status" "running"
-                                "note" "Use process_manage to poll, wait, read logs, send stdin, or terminate."}))))))))
+                                "note" "Use process_manage to poll, wait, read logs, send stdin, or terminate."}
+                               (cond
+                                 ;; Hermes terminal_tool_background: the session
+                                 ;; stays armed, but a delegated child's result
+                                 ;; says the notice will not reach the parent.
+                                 (and notify-requested (:subagent ctx))
+                                 {"notify_on_complete" false "subagent_note" subagent-notify-note}
+                                 notify-requested {"notify_on_complete" true})))))))))
 
 (defn- resolve-session [ctx requested]
   (let [matches (filter (fn [[id s]] (and (= (:home ctx) (:home s))
@@ -341,6 +441,10 @@
       :else (val (first matches)))))
 
 (defn- snapshot [session]
+  ;; Hermes poll(): a read-only exit observation records `_poll_observed` —
+  ;; it suppresses the CLI's duplicate-notice drain but not the watcher's.
+  (when (= :exited @(:state session))
+    (swap! poll-observed conj (:id session)))
   (merge (result-base session)
          {"exit_code" @(:exit-code session)
           "output_preview" (let [s @(:output session)] (subs s (max 0 (- (count s) 1000))))}))
@@ -350,6 +454,13 @@
         total (count lines)
         start (if (nil? offset) (max 0 (- total limit)) (max 0 offset))
         selected (take limit (drop start lines))]
+    ;; Hermes log(): an exited result read through to the end is CONSUMED
+    ;; (`_completion_consumed`) — the agent has the result this turn, so no
+    ;; completion notice may re-inject it.
+    (when (and (= :exited @(:state session))
+               (or (zero? total)
+                   (and (seq selected) (>= (+ start (count selected)) total))))
+      (swap! completion-consumed conj (:id session)))
     (merge (result-base session)
            {"output" (str/join "\n" selected)
             "total_lines" total
@@ -361,7 +472,10 @@
     (p/loop []
       (let [s (or (refresh-detached! session) session)]
         (cond
-          (= :exited @(:state s)) (snapshot s)
+          (= :exited @(:state s))
+          ;; Hermes wait(): the wait consumed the completion.
+          (do (swap! completion-consumed conj (:id session))
+              (snapshot s))
           (>= (- (h/now-ms) started) timeout-ms) (assoc (snapshot s) "timed_out" true)
           :else (p/let [_ (p/delay 100)] (p/recur)))))))
 
@@ -460,6 +574,10 @@
         (if (= :exited @(:state session))
           (h/json-str (merge (snapshot session) {"status" "already_exited"}))
           (try
+            ;; Hermes kill_process: the registry-initiated kill stamps the
+            ;; termination source the completion notice reports ("killed …
+            ;; terminated by process.kill").
+            (reset! (:killed-by session) "process.kill")
             ;; a detached session owns no group we track: signal the PID itself
             (js/process.kill (if (:detached? session)
                                (session-pid session)
@@ -479,3 +597,125 @@
               (h/json-str {"status" "ok" "session_id" (:id session)})
               (catch :default e (h/json-str {"status" "error" "error" (.-message e)})))))
         :else (h/json-str {"error" (str "unknown process action: " action)})))))
+
+;; ---- completion-notice routing (Hermes drain_notifications + format_process_notification) ----
+
+(defn is-completion-consumed?
+  "Hermes `ProcessRegistry.is_completion_consumed`: the agent already has this
+  result this turn (consumed via wait/log), so no notice may re-inject it."
+  [session-id]
+  (contains? @completion-consumed session-id))
+
+(defn- child-notification?
+  "Hermes `is_child_process_notification` on the RAW spawning id: Kotoba
+  subagent ids are `sub-…` (Hermes' are `sa-…`) — raw child process noise,
+  not a delegation deliverable."
+  [evt]
+  (str/starts-with? (str (or (get evt "owner_task_id") (get evt "task_id") "")) "sub-"))
+
+(def ^:private reason-status
+  "Hermes `process_registry_notifications._REASON_STATUS`, verbatim."
+  {"lost" "marked lost because the process backend disappeared"
+   "failed_start" "failed to start"})
+
+(defn- completion-status
+  "Hermes `process_registry_notifications._completion_status`, verbatim."
+  [evt]
+  (let [reason (or (get evt "completion_reason") "exited")]
+    (cond
+      (= reason "killed") (str "terminated by " (or (get evt "termination_source") "Hermes"))
+      (contains? reason-status reason) (get reason-status reason)
+      (= 0 (get evt "exit_code" "?")) "completed normally"
+      :else "exited")))
+
+(defn format-completion-notification
+  "Hermes `process_registry_notifications.format_process_notification` — the
+  completion branch, verbatim (heartbeats and watch matches have no Kotoba
+  producer). `handoff_note` overrides the delegation attribution, as in Hermes:
+  the parent is told the process was handed to it and why."
+  [evt]
+  (let [sid (get evt "session_id" "unknown")
+        cmd (get evt "command" "unknown")
+        raw-owner (str (or (get evt "owner_task_id") (get evt "task_id") ""))
+        attribution (if (get evt "handoff_note")
+                      (str "Handed off to you by a subagent before it finished. Purpose: "
+                           (get evt "handoff_note"))
+                      (when (child-notification? evt)
+                        ;; Hermes `_delegation_attribution_line`'s no-registry
+                        ;; fallback (the delegation goal lookup is not wired).
+                        (str "Started by subagent " raw-owner " (delegate_task).")))
+        exit (get evt "exit_code" "?")
+        out (get evt "output" "")
+        signal (if (contains? #{-15 143 "-15" "143"} exit) ", SIGTERM" "")
+        out (cond
+              (and attribution (string? out) (> (count out) 600))
+              (str "...(output trimmed — subagent-owned process; see the "
+                   "delegation's live transcript for full output)\n"
+                   (subs out (- (count out) 600)))
+
+              (get evt "output_cut")
+              (str "...(first " (get evt "output_cut") " characters cut — process(action=\"log\", "
+                   "session_id=\"" sid "\") has the full output)\n" out)
+
+              :else out)]
+    (str "[IMPORTANT: Background process " sid " " (completion-status evt)
+         " (exit code " exit signal ").\n"
+         (when attribution (str attribution "\n"))
+         "Command: " cmd "\nOutput:\n" out "]")))
+
+(defn notification-batch-text
+  "Hermes `ProcessNotificationBatch.render`: consecutive completions enter the
+  conversation as one batch — a single notice as-is, several under one header.
+  Events consumed since the drain are dropped at render time."
+  [pairs]
+  (let [live (vec (for [[evt text] pairs
+                        :when (not (is-completion-consumed? (get evt "session_id" "")))]
+                    text))]
+    (cond
+      (empty? live) nil
+      (= 1 (count live)) (first live)
+      :else (str/join "\n\n"
+                      (cons (str "[IMPORTANT: " (count live) " background processes completed. "
+                                 "Treat these results as one batch and give one consolidated response; "
+                                 "preserve failures and actionable results.]")
+                            live)))))
+
+(defn drain-notifications!
+  "Hermes `ProcessRegistry.drain_notifications`: pop pending events and return
+  `[event text]` pairs, formatted with `format-completion-notification`.
+  Routing (`_owns_event`): an event that carries a `session_key` needs positive
+  proof of ownership — it is consumed only by a drainer with the same key and
+  re-queued for its owner otherwise; an unkeyed event goes to whichever agent
+  drains first (Hermes' legacy single-session behavior). Exits already consumed
+  via wait/log are skipped; a read-only poll observation is skipped too unless
+  `skip-poll-observed?` is false (the CLI agent path passes true). Subagent-owned
+  notices (`sub-…` owner) are dropped — NOT requeued — unless `surface-child?`:
+  the delegation result is the deliverable."
+  [{:keys [session-key skip-poll-observed? surface-child?]
+    :or {skip-poll-observed? true surface-child? false}}]
+  (let [key (str (or session-key ""))
+        kept (atom [])
+        out (atom [])]
+    (doseq [evt @completion-queue]
+      (let [evt-key (str (or (get evt "session_key") ""))]
+        (cond
+          (and (not (str/blank? evt-key)) (not (str/blank? key)) (not= evt-key key))
+          (swap! kept conj evt)
+
+          (and (= "completion" (get evt "type" "completion"))
+               (or (contains? @completion-consumed (get evt "session_id"))
+                   (and skip-poll-observed? (contains? @poll-observed (get evt "session_id")))))
+          nil
+
+          (and (child-notification? evt) (not surface-child?))
+          nil
+
+          :else (swap! out conj [evt (format-completion-notification evt)]))))
+    (reset! completion-queue @kept)
+    @out))
+
+(defn pending-notification-text
+  "This run's owned completion notices as one Hermes-batched message (or nil),
+  for delivery as a message between model turns."
+  [opts]
+  (notification-batch-text (drain-notifications! opts)))

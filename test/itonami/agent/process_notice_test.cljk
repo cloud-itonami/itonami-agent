@@ -1,0 +1,252 @@
+(ns itonami.agent.process-notice-test
+  "Hermes pushed completion notices for background processes
+  (`ProcessRegistry._publish_finished` / `drain_notifications` /
+  `process_registry_notifications.format_process_notification`)."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.process :as process]))
+
+(defn- parse-json [s] (js->clj (js/JSON.parse s)))
+
+(defn- fresh-home [tag]
+  (let [home (h/join (h/tmp-dir) (str "test-notice-" tag "-" (.-pid js/process) "-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    home))
+
+(defn- spawn-sh!
+  "Spawn a short-lived process; resolves when its on-exit hook fires (after the
+  completion event is enqueued — never via wait/log/poll, which consume it)."
+  [ctx opts script]
+  (let [resolve-exit (atom nil)
+        exited (js/Promise. (fn [res] (reset! resolve-exit res)))
+        res (parse-json (process/spawn! ctx (merge {:argv ["/bin/sh" "-c" script]
+                                                    :command script
+                                                    :env (h/process-env)
+                                                    :cwd (:home ctx)
+                                                    :on-exit (fn [_ _] (@resolve-exit true))}
+                                                   opts)))]
+    [res exited]))
+
+(deftest completion-notice-hermes-payload-and-text
+  (async done
+    (let [home (fresh-home "shape")
+          ctx {:home home :task-id "task-a" :session-key "s1"}
+          [res exited] (spawn-sh! ctx {:notify-on-complete? true} "echo hi --token=SUPERSECRET; exit 3")
+          id (get res "session_id")]
+      (is (true? (get res "notify_on_complete")))
+      (-> exited
+          (p/then (fn [_]
+                    (let [pairs (process/drain-notifications! {:session-key "s1"})
+                          [evt text] (first pairs)]
+                      (testing "exit enqueues one Hermes _publish_finished event"
+                        (is (= 1 (count pairs)))
+                        (is (= "completion" (get evt "type")))
+                        (is (= id (get evt "session_id")))
+                        (is (= "s1" (get evt "session_key")))
+                        (is (= "session:s1" (get evt "task_id")))
+                        (is (= "task-a" (get evt "owner_task_id")))
+                        (is (= 3 (get evt "exit_code")))
+                        (is (= "exited" (get evt "completion_reason")))
+                        (is (= "" (get evt "termination_source")))
+                        (is (number? (get evt "started_at")))
+                        (is (str/includes? (get evt "output") "hi"))
+                        (is (not (str/includes? (str (get evt "command")) "SUPERSECRET"))))
+                      (testing "format_process_notification's completion text, verbatim"
+                        (is (= (str "[IMPORTANT: Background process " id " exited (exit code 3).\n"
+                                    "Command: " (get evt "command") "\nOutput:\n" (get evt "output") "]")
+                               text)))
+                      (testing "the drain consumed it"
+                        (is (= [] (process/drain-notifications! {:session-key "s1"}))))
+                      (h/rm home)
+                      (done))))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest completion-notice-needs-notify-on-complete
+  (async done
+    (let [home (fresh-home "silent")
+          ctx {:home home :task-id "task-a" :session-key ""}
+          [res exited] (spawn-sh! ctx {} "echo hi")]
+      (is (nil? (get res "notify_on_complete")))
+      (-> exited
+          (p/then (fn [_]
+                    (is (= [] (process/drain-notifications! {:session-key ""})))
+                    (h/rm home)
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest subagent-spawn-stays-armed-but-result-denies
+  ;; Hermes terminal_tool_background's delegated-child branch: the session
+  ;; keeps notify_on_complete (a handoff re-owns the notice to the parent),
+  ;; the RESULT says false and carries _SUBAGENT_NOTIFY_NOTE verbatim.
+  (async done
+    (let [home (fresh-home "subagent")
+          ctx {:home home :task-id "sub-abc123" :session-key ""
+               :subagent {:parent-owner "task-parent9" :parent-session-key "" :handed (atom [])}}
+          [res exited] (spawn-sh! ctx {:notify-on-complete? true} "echo hi")
+          id (get res "session_id")]
+      (is (false? (get res "notify_on_complete")))
+      (is (str/includes? (get res "subagent_note")
+                         "this process's completion notice will NOT reach your parent"))
+      (-> exited
+          (p/then (fn [_]
+                    (testing "surface_child_process_notifications surfaces it with Hermes' fallback attribution"
+                      (let [pairs (process/drain-notifications! {:session-key "" :surface-child? true})
+                            [evt text] (first pairs)]
+                        (is (= 1 (count pairs)))
+                        (is (= id (get evt "session_id")))
+                        (is (str/includes? text (str "Started by subagent sub-abc123 (delegate_task).")))))
+                    (let [[_res2 exited2] (spawn-sh! ctx {:notify-on-complete? true} "echo hi")]
+                      (p/then exited2
+                              (fn [_]
+                                (testing "the default drain drops child-owned notices — the delegation result is the deliverable"
+                                  (is (= [] (process/drain-notifications! {:session-key ""}))))
+                                (h/rm home)
+                                (done))))))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest handoff-note-rides-the-notice-to-the-parent
+  (async done
+    (let [home (fresh-home "handoff-notice")
+          child-ctx {:home home :task-id "sub-abc123" :session-key ""
+                     :subagent {:parent-owner "task-parent9" :parent-session-key "" :handed (atom [])}}
+          [res exited] (spawn-sh! child-ctx {:notify-on-complete? true} "echo work")
+          id (get res "session_id")
+          _ (-> exited
+                (p/then (fn [_] nil))
+                (p/catch (fn [_] nil)))]
+      ;; wait for the child to finish first, then hand the RUN to the parent —
+      ;; model the transfer on a second run of the same registry instead: kill
+      ;; is not needed; do the handoff while it still runs.
+      (let [r (parse-json (process/manage child-ctx {"action" "handoff" "session_id" id "data" "CI watcher"}))]
+        (is (= "handed_off" (get r "status"))))
+      (-> exited
+          (p/then (fn [_]
+                    (let [pairs (process/drain-notifications! {:session-key ""})
+                          [_evt text] (first pairs)]
+                      (is (= 1 (count pairs)))
+                      (is (str/includes? text "Handed off to you by a subagent before it finished. Purpose: CI watcher"))
+                      (is (str/includes? text "Background process proc_"))
+                      (h/rm home)
+                      (done))))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest drain-routes-by-session-key
+  (async done
+    (let [home (fresh-home "routing")
+          [res-a exited-a] (spawn-sh! {:home home :task-id "task-a" :session-key "s1"}
+                                      {:notify-on-complete? true} "echo a")
+          [res-b exited-b] (spawn-sh! {:home home :task-id "task-b" :session-key "s2"}
+                                      {:notify-on-complete? true} "echo b")
+          [res-c exited-c] (spawn-sh! {:home home :task-id "task-c" :session-key ""}
+                                      {:notify-on-complete? true} "echo c")]
+      (-> (p/all [exited-a exited-b exited-c])
+          (p/then (fn [_]
+                    (testing "an unkeyed event goes to whichever agent drains first (Hermes' legacy single-session rule)"
+                      (let [pairs (process/drain-notifications! {:session-key "s3"})]
+                        (is (= 1 (count pairs)))
+                        (is (= (get res-c "session_id") (get (first (first pairs)) "session_id")))))
+                    (testing "a keyed event needs positive proof of ownership"
+                      (is (= [] (process/drain-notifications! {:session-key "s3"})))
+                      (let [pairs (process/drain-notifications! {:session-key "s2"})]
+                        (is (= 1 (count pairs)))
+                        (is (= (get res-b "session_id") (get (first (first pairs)) "session_id"))))
+                      (let [pairs (process/drain-notifications! {:session-key "s1"})]
+                        (is (= 1 (count pairs)))
+                        (is (= (get res-a "session_id") (get (first (first pairs)) "session_id")))))
+                    (h/rm home)
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest consumed-and-poll-observed-exits-are-not-re-injected
+  (async done
+    (let [home (fresh-home "dedup")
+          ctx {:home home :task-id "task-a" :session-key ""}
+          [res-w exited-w] (spawn-sh! ctx {:notify-on-complete? true} "echo w")
+          id-w (get res-w "session_id")]
+      (-> exited-w
+          (p/then (fn [_] (process/manage ctx {"action" "wait" "session_id" id-w "timeout" 5})))
+          (p/then (fn [_]
+                    (testing "wait consumes the completion (Hermes _completion_consumed)"
+                      (is (process/is-completion-consumed? id-w))
+                      (is (= [] (process/drain-notifications! {:session-key ""}))))
+                    (let [[res-p exited-p] (spawn-sh! ctx {:notify-on-complete? true} "echo p")
+                          id-p (get res-p "session_id")]
+                      (p/then exited-p
+                              (fn [_]
+                                (process/manage ctx {"action" "poll" "session_id" id-p})
+                                (testing "a read-only poll observation is skipped by the CLI drain"
+                                  (is (= [] (process/drain-notifications! {:session-key ""}))))
+                                (testing "…unless skip-poll-observed is off (the watcher path)"
+                                  ;; the event was dropped by the prior drain, so re-check with a fresh one
+                                  (let [[res-q exited-q] (spawn-sh! ctx {:notify-on-complete? true} "echo q")]
+                                    (p/then exited-q
+                                            (fn [_]
+                                              (process/manage ctx {"action" "poll" "session_id" (get res-q "session_id")})
+                                              (let [pairs (process/drain-notifications! {:session-key ""
+                                                                                          :skip-poll-observed? false})]
+                                                (is (= 1 (count pairs))))
+                                              (h/rm home)
+                                              (done))))))))))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest format-process-notification-variants
+  (let [fmt process/format-completion-notification]
+    (testing "Hermes _completion_status, verbatim"
+      (is (str/includes? (fmt {"type" "completion" "session_id" "proc_x" "command" "sleep 1"
+                               "exit_code" 0 "completion_reason" "exited" "termination_source" "" "output" ""})
+                         "completed normally (exit code 0)."))
+      (is (str/includes? (fmt {"session_id" "proc_x" "command" "make" "exit_code" 2
+                               "completion_reason" "exited" "termination_source" "" "output" ""})
+                         "exited (exit code 2)."))
+      (is (str/includes? (fmt {"session_id" "proc_x" "command" "make" "exit_code" -15
+                               "completion_reason" "killed" "termination_source" "process.kill" "output" ""})
+                         "terminated by process.kill (exit code -15, SIGTERM)."))
+      (is (str/includes? (fmt {"session_id" "proc_x" "command" "make" "exit_code" 1
+                               "completion_reason" "lost" "termination_source" "backend_lost" "output" ""})
+                         "marked lost because the process backend disappeared (exit code 1)."))
+      (is (str/includes? (fmt {"session_id" "proc_x" "command" "make" "exit_code" -1
+                               "completion_reason" "failed_start" "termination_source" "failed_start" "output" ""})
+                         "failed to start (exit code -1).")))
+    (testing "handoff_note overrides the delegation attribution and trims long output"
+      (let [text (fmt {"session_id" "proc_x" "command" "make" "exit_code" 0
+                       "completion_reason" "exited" "termination_source" ""
+                       "owner_task_id" "task-parent9" "handoff_note" "CI watcher"
+                       "output" (apply str (repeat 700 "x"))})]
+        (is (str/includes? text "Handed off to you by a subagent before it finished. Purpose: CI watcher"))
+        (is (str/includes? text "...(output trimmed — subagent-owned process; see the delegation's live transcript for full output)"))
+        (is (not (str/includes? text "Started by subagent")))))
+    (testing "output_cut is marked where the output is the payload"
+      (let [text (fmt {"session_id" "proc_x" "command" "make" "exit_code" 0
+                       "completion_reason" "exited" "termination_source" ""
+                       "output" "tail" "output_cut" 40})]
+        (is (str/includes? text "...(first 40 characters cut — process(action=\"log\", session_id=\"proc_x\") has the full output)"))))))
+
+(deftest notification-batch-text-matches-hermes
+  (let [pairs [[{"session_id" "a"} "text-a"] [{"session_id" "b"} "text-b"]]]
+    (is (nil? (process/notification-batch-text [])))
+    (is (= "text-a" (process/notification-batch-text (take 1 pairs))))
+    (is (= (str "[IMPORTANT: 2 background processes completed. "
+                "Treat these results as one batch and give one consolidated response; "
+                "preserve failures and actionable results.]\n\ntext-a\n\ntext-b")
+           (process/notification-batch-text pairs)))))
+
+(deftest kill-stamps-termination-source
+  (async done
+    (let [home (fresh-home "kill")
+          ctx {:home home :task-id "task-a" :session-key ""}
+          [res exited] (spawn-sh! ctx {:notify-on-complete? true} "sleep 30")
+          id (get res "session_id")]
+      (process/manage ctx {"action" "kill" "session_id" id})
+      (-> exited
+          (p/then (fn [_]
+                    (let [pairs (process/drain-notifications! {:session-key ""})
+                          [evt text] (first pairs)]
+                      (is (= 1 (count pairs)))
+                      (is (= "killed" (get evt "completion_reason")))
+                      (is (= "process.kill" (get evt "termination_source")))
+                      (is (str/includes? text "terminated by process.kill"))
+                      (h/rm home)
+                      (done))))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))

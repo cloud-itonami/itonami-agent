@@ -12,6 +12,7 @@
             [promesa.core :as p]
             [itonami.agent.host :as h]
             [itonami.agent.provider :as provider]
+            [itonami.agent.process :as proc]
             [itonami.agent.browser :as browser-runtime]
             [itonami.agent.computer-use :as computer-use]
             [itonami.agent.tools :as tools]
@@ -296,6 +297,13 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
          :attempts attempts :writes @writes :provider (:provider last-hop) :model (:model last-hop)}
 
         :else
+        ;; pushed background-process completions (Hermes' completion queue)
+        ;; re-enter as a message between model turns, batched as Hermes batches
+        ;; them (ProcessNotificationBatch.render)
+        (let [notice (proc/pending-notification-text
+                      {:session-key session-key
+                       :surface-child? (boolean (get-in config ["delegation" "surface_child_process_notifications"]))})
+              messages (cond-> messages notice (conj {"role" "user" "content" notice}))]
         (p/let [r (provider/complete hops env {:messages messages :tools schemas
                                                :reasoning-effort (or reasoning-effort
                                                                      (get-in config ["agent" "reasoning_effort"]))
@@ -367,7 +375,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                              "text" "Image output from the preceding tool call(s):"}]
                                                            @images)})]
                       (p/recur (cond-> (into messages results) image-message (conj image-message))
-                               (inc n) attempts resp))))))))))
+                               (inc n) attempts resp)))))))))))
        (fn [] (browser-runtime/close-session ctx)))))
 
 (def delegate-children
