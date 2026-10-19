@@ -1,0 +1,167 @@
+(ns itonami.agent.quiet
+  "Hermes `hermes_cli/quiet_single_query.py`'s one-shot notify linger:
+  `continue_quiet_notify_completions` (the loop), `quiet_notify_linger_seconds`
+  (the shared budget), `_diagnostic_only_wake_muted` (the displacement
+  admission rule) over `agent.notification_presentation
+  .diagnostic_process_event` and `gateway.warning_notifications
+  .warning_notifications_enabled` (the `suppress_warning_notifications`
+  display resolver). The turn-report / reported-child half of that module
+  belongs to the Bot-Chat delivery spawner and has no Kotoba producer."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.process :as process]))
+
+(def max-quiet-notify-rounds
+  "Hermes `quiet_single_query._MAX_QUIET_NOTIFY_ROUNDS`."
+  8)
+
+(defn- norm-suppress-warning-notifications
+  "Hermes `gateway.display_config._norm_suppress_warning_notifications`,
+  verbatim: only an explicit, recognized opt-in may hide engine diagnostics."
+  [v]
+  (cond
+    (boolean? v) v
+    (string? v) (contains? #{"true" "1" "yes" "on"} (str/lower-case (str/trim v)))
+    :else false))
+
+(defn- configured-suppress-warning-notifications
+  "Hermes `gateway.display_config._configured_display_value` for
+  `suppress_warning_notifications`: the first non-None operator value —
+  `display.platforms.<platform>.<key>` then `display.<key>`. The legacy
+  `tool_progress_overrides` branch is key-specific and `display.streaming` is
+  CLI-only, so neither applies to this key."
+  [config platform]
+  (let [display (get config "display")
+        display (if (map? display) display {})
+        platforms (get display "platforms")
+        plat (when (map? platforms) (get platforms platform))
+        override (when (map? plat) (get plat "suppress_warning_notifications"))]
+    (if (some? override)
+      override
+      (get display "suppress_warning_notifications"))))
+
+(defn warning-notifications-enabled?
+  "Hermes `gateway.warning_notifications.warning_notifications_enabled`:
+  `not resolve_display_setting(user_config, platform, \"suppress_warning_notifications\", False)`.
+  `resolve_display_setting` falls through the configured values to platform
+  tier defaults and then `_GLOBAL_DEFAULTS` (= False for this key) — and no
+  built-in tier overrides `suppress_warning_notifications`, so the fall-through
+  is False on every platform. Unknown values never opt in (`_norm_...`), null
+  inherits."
+  [platform config]
+  (let [configured (configured-suppress-warning-notifications config platform)]
+    (if (some? configured)
+      (not (norm-suppress-warning-notifications configured))
+      true)))
+
+(defn diagnostic-process-event?
+  "Hermes `agent.notification_presentation.diagnostic_process_event`, verbatim:
+  early failure/monitor diagnostics, not the explicitly requested final result."
+  [evt]
+  (or (boolean (get evt "task_failure_notice"))
+      (contains? #{"watch_disabled" "watch_overflow_tripped" "watch_overflow_released"}
+                 (get evt "type"))))
+
+(defn diagnostic-only-wake-muted?
+  "Hermes `quiet_single_query._diagnostic_only_wake_muted`: true when every
+  drained event is an automatic diagnostic AND the CLI policy suppresses them."
+  [events config]
+  (and (seq events)
+       (every? diagnostic-process-event? events)
+       (not (warning-notifications-enabled? "cli" config))))
+
+(defn quiet-notify-linger-seconds
+  "Hermes `quiet_single_query.quiet_notify_linger_seconds`: the shared linger
+  budget for one quiet run — `terminal.oneshot_completion_wait_seconds`."
+  [config]
+  (process/oneshot-completion-wait-seconds config))
+
+(defn turn-failed?
+  "Hermes `cli_single_query`'s `result.get(\"failed\")` gate over a Kotoba run
+  result: a hard failure (`:error` — provider/peer/placement) or a cancellation
+  (Hermes exits on KeyboardInterrupt before the linger) is failed; a merely
+  unfinished turn (`max_iterations_reached`, `budget_exhausted`) is not."
+  [r]
+  (or (some? (:error r))
+      (= "interrupted" (:exit-reason r))))
+
+(defn continue-quiet-notify-completions!
+  "Hermes `quiet_single_query.continue_quiet_notify_completions`: linger for
+  `notify_on_complete` work, then run owned completion texts as follow-up
+  turns. Returns the last `run-turn` result, or nil when nothing owned
+  completed. The whole loop shares ONE linger budget (default
+  `terminal.oneshot_completion_wait_seconds`; `:linger-budget` overrides) — a
+  process that times out is waited on no further this run: after the current
+  round's drained texts run, the loop stops.
+
+  Every drained event type that rendered is kept (`drain-notifications!` pops
+  owned events of every type, so filtering by type would consume-and-silently
+  drop owned results) and run as ONE follow-up turn per round, the texts
+  joined with `\\n\\n`. The wake always runs; a wake made only of automatic
+  diagnostics never displaces the requested one-shot answer
+  (`diagnostic-only-wake-muted?`). At most `max-quiet-notify-rounds` rounds.
+
+  Kotoba has no durable `async_delegation` events (that surface is the
+  delegation result path), so Hermes' `claim_event_delivery` /
+  `complete_event_delivery` handshake has nothing to fence here."
+  [session-key run-turn {:keys [config linger-budget max-rounds surface-child?
+                                drain-fn wait-fn now-fn]
+                         :or {max-rounds max-quiet-notify-rounds}
+                         :as opts}]
+  (let [budget (if (some? linger-budget)
+                 linger-budget
+                 (quiet-notify-linger-seconds config))
+        now (or now-fn h/now-ms)
+        deadline (+ (now) (* 1000 (max (double budget) 0.0)))
+        wait (or wait-fn
+                 (fn [timeout] (process/wait-for-pending-completions!
+                                {:timeout timeout :config config})))
+        ;; Hermes' `drain_notifications` resolves
+        ;; `delegation.surface_child_process_notifications` from the config
+        ;; itself (default False) when the caller does not override it.
+        surface-child? (if (contains? opts :surface-child?)
+                         (boolean surface-child?)
+                         (boolean (get-in config ["delegation" "surface_child_process_notifications"])))
+        drain (or drain-fn
+                  (fn [] (process/drain-notifications!
+                          {:session-key (str (or session-key ""))
+                           :surface-child? surface-child?})))
+        key (str (or session-key ""))]
+    (letfn [(round [n last]
+              (if (>= n max-rounds)
+                (p/resolved last)
+                (p/let [w (wait (max (/ (- deadline (now)) 1000) 0.0))
+                        drained (drain)
+                        rendered (vec (for [[evt text] drained :when text] [evt text]))
+                        texts (mapv second rendered)]
+                  (p/let [last (if (seq texts)
+                                 (p/then (run-turn (str/join "\n\n" texts))
+                                         (fn [follow]
+                                           (if (diagnostic-only-wake-muted? (mapv first rendered) config)
+                                             last
+                                             follow)))
+                                 last)]
+                    (cond
+                      ;; `wait["timed_out"]` is an id LIST — Python's empty
+                      ;; list is falsy, a Clojure empty vector is not.
+                      (seq (get w "timed_out")) (p/resolved last)
+                      (empty? texts) (p/resolved last)
+                      :else (round (inc n) last))))))]
+      (round 0 nil))))
+
+(defn oneshot-exit-linger!
+  "Hermes `cli_shutdown._wait_for_oneshot_background_completions`: the bounded
+  exit linger for `notify_on_complete` children (the parent owns their pipes;
+  only they carry a completion contract — `wait_for_pending_completions(None)`
+  waits on the whole registry). Skipped when the quiet notify-resume loop
+  already consumed the run's linger budget (`_quiet_notify_linger_done`), so a
+  stuck child can never be waited on twice. A failing wait never blocks the
+  exit (Hermes swallows it in `_finalize_single_query`)."
+  [config linger-done? & [{:keys [wait-fn]}]]
+  (if linger-done?
+    (p/resolved nil)
+    (p/then (p/catch ((or wait-fn
+                          (fn [] (process/wait-for-pending-completions! {:config config}))))
+                     (fn [_] nil))
+            (fn [_] nil))))

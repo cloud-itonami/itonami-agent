@@ -528,8 +528,15 @@
   (when (compare-and-set! (:state session) :running :exited)
     (reset! (:exit-code session) exit-code)
     (reset! (:finished-at session) (h/now-ms))
-    (when @(:notify-on-complete? session)
-      (swap! completion-queue conj (completion-event session exit-code reason source)))
+    (try
+      (when @(:notify-on-complete? session)
+        (swap! completion-queue conj (completion-event session exit-code reason source)))
+      (finally
+        ;; Hermes `_move_to_finished` releases the one-shot linger's waiters
+        ;; (`_completion_event.set()`) only after the notice is queued (or its
+        ;; publish failed), so a waiter can never park forever and can never
+        ;; miss a queued notice.
+        (reset! (:completion-event? session) true)))
     (try
       (when on-exit (on-exit exit-code detail))
       (finally
@@ -584,6 +591,8 @@
                          :session-key (atom (str (or (get entry "session_key") "")))
                          :handoff-note (atom "")
                          :notify-on-complete? (atom (boolean (get entry "notify_on_complete")))
+                         :completion-event? (atom false)
+                         :on-exit nil :tmpdir nil
                          :completion-output-chars (or (get entry "completion_output_chars") 0)
                          :watch-patterns (vec (or (get entry "watch_patterns") []))
                          :heartbeat-seconds (int (or (get entry "heartbeat_seconds") 0))
@@ -628,9 +637,15 @@
     (let [fate (pid-fate (:pid session) (:host-start-time session))]
       (case fate
         "running" session
-        "reused" (do (swap! sessions dissoc (:id session)) nil)
+        ;; Hermes `_close_reused_detached` / `_prune_uncollected_detached`:
+        ;; the entry is closed without a collected exit status and its
+        ;; completion event is set (no completion is queued — there is no
+        ;; exit status to report), so a parked linger releases.
+        "reused" (do (reset! (:completion-event? session) true)
+                     (swap! sessions dissoc (:id session)) nil)
         (do (when (compare-and-set! (:state session) :running :exited)
               (reset! (:finished-at session) (h/now-ms))
+              (reset! (:completion-event? session) true)
               (prune-sessions! (:home session)))
             session)))))
 
@@ -673,6 +688,10 @@
                      :session-key (atom session-key)
                      :handoff-note (atom "")
                      :notify-on-complete? (atom notify-requested)
+                     ;; Hermes `ProcessSession._completion_event`: set exactly
+                     ;; when the exit is booked (finish! / detached close).
+                     :completion-event? (atom false)
+                     :on-exit on-exit :tmpdir tmpdir
                      :completion-output-chars (or completion-output-chars 0)
                      ;; Hermes `arm_heartbeat`: the effective interval is
                      ;; clamped to the floor; the output baseline stays 0
@@ -1170,3 +1189,122 @@
   [opts]
   (let [msgs (pending-notification-messages opts)]
     (when (seq msgs) (str/join "\n\n" msgs))))
+
+;; ---- one-shot exit linger (Hermes wait_for_pending_completions) ----
+;; A one-shot CLI run (`-z`) exits when its turn ends; a `notify_on_complete`
+;; background process it spawned still holds pipes owned by the dying parent.
+;; Only `notify_on_complete` processes carry a completion contract —
+;; servers/daemons/watchers aren't the parent's to wait for.
+
+(defn- reconcile-local-exit!
+  "Hermes `ProcessRegistry._reconcile_local_exit`, Node mapping: reconcile
+  `:state` against the real child. Node fires `exit` when the direct child dies
+  but `close` only once its stdio streams close — a descendant that inherited
+  the pipe holds `close` exactly as it held Python's reader (issue #17327's
+  orphaned pipe), and `poll()`/state would report \"running\" forever.
+  `child.exitCode` / `child.signalCode` are the `Popen.poll()` equivalent: once
+  set while the session is still running, book the exit (`finish!`, the
+  `_move_to_finished` equivalent that publishes the completion). No-op for
+  exited and detached sessions."
+  [session]
+  (when (and session (not (:detached? session)) (= :running @(:state session)))
+    (when-let [child (:child session)]
+      (let [code (.-exitCode child)
+            sig (.-signalCode child)
+            exit (cond
+                   (number? code) code
+                   (string? sig) (- (or (signal-number sig) 1)))]
+        (when exit
+          (let [killed @(:killed-by session)]
+            (finish! session exit
+                     (if killed "killed" "exited")
+                     (str (or killed "")) nil
+                     (:on-exit session) (:tmpdir session))))))))
+
+(def oneshot-completion-wait-seconds-default
+  "Hermes `hermes_cli.config_defaults` `terminal.oneshot_completion_wait_seconds`
+  and `ProcessRegistry._config_seconds`'s fallback."
+  600.0)
+
+(defn oneshot-completion-wait-seconds
+  "Hermes `ProcessRegistry._oneshot_completion_wait_seconds` via
+  `_config_seconds(key, 600.0)`: `terminal.oneshot_completion_wait_seconds` as
+  a non-negative number (0 disables), clamped at zero; the default when the
+  value is unset or unparseable. Booleans count as 1.0/0.0 and numeric strings
+  parse, as Python `float()` does there. (Kotoba additionally falls back on a
+  NaN parse — where Python `float(\"nan\")` yields `nan` — so a garbage config
+  can never wedge the linger.)"
+  [config]
+  (let [raw (get-in (or config {}) ["terminal" "oneshot_completion_wait_seconds"])
+        v (cond
+            (nil? raw) oneshot-completion-wait-seconds-default
+            (number? raw) (double raw)
+            (boolean? raw) (if raw 1.0 0.0)
+            (string? raw) (let [s (str/trim raw)]
+                            (cond
+                              (re-matches #"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?" s) (js/Number s)
+                              (contains? #{"inf" "+inf" "-inf" "infinity" "+infinity" "-infinity"}
+                                         (str/lower-case s)) (if (str/starts-with? s "-") js/-Infinity js/Infinity)
+                              :else oneshot-completion-wait-seconds-default))
+            :else oneshot-completion-wait-seconds-default)]
+    (if (js/Number.isNaN v)
+      oneshot-completion-wait-seconds-default
+      (js/Math.max v 0))))
+
+(defn- pending-completion-sessions
+  "Hermes `wait_for_pending_completions`'s pending set: `notify_on_complete`
+  sessions whose completion event is not yet set (running AND just-finished —
+  `_move_to_finished` moves the session before its publish lands), optionally
+  scoped by `owner_task_id`. Ordered by start time = Python's dict insertion
+  order over `_running` then `_finished`."
+  [task-id]
+  (->> @sessions
+       vals
+       (filter (fn [s] (and @(:notify-on-complete? s)
+                            (not @(:completion-event? s))
+                            (or (nil? task-id)
+                                (= (str task-id) @(:owner-task-id s))))))
+       (sort-by :started-at)
+       vec))
+
+(defn wait-for-pending-completions!
+  "Hermes `ProcessRegistry.wait_for_pending_completions`, verbatim semantics:
+  bounded linger for `notify_on_complete` background processes at one-shot
+  exit. `task-id` nil waits on every tracked process; `timeout` is seconds and
+  nil reads `terminal.oneshot_completion_wait_seconds` (<= 0 disables). Each
+  pass re-reconciles child state (`reconcile-local-exit!` then
+  `refresh-detached!`) so an orphaned-pipe exit cannot wedge the linger; a
+  session that timed out is waited on no further. Resolves to
+  `{\"waited\" \"completed\" \"timed_out\"}` id lists — `\"waited\"` empty (and
+  the call immediate) when nothing is pending or the timeout disables the wait.
+  Hermes' KeyboardInterrupt branch has no Node equivalent (the CLI dies on
+  SIGINT instead of raising into the linger)."
+  [{:keys [task-id timeout poll-interval config]}]
+  (let [timeout (double (if (some? timeout) timeout (oneshot-completion-wait-seconds config)))
+        timeout (if (js/Number.isNaN timeout) 0.0 timeout)
+        pending (pending-completion-sessions task-id)]
+    (if (or (empty? pending) (<= timeout 0))
+      (p/resolved {"waited" [] "completed" [] "timed_out" []})
+      (let [deadline (+ (h/now-ms) (* 1000 (max timeout 0.0)))
+            interval (max (double (or poll-interval 1.0)) 0.05)]
+        (p/loop [remaining (seq pending)
+                 completed []
+                 timed-out []]
+          (if-let [s (first remaining)]
+            (p/let [done? (p/loop []
+                            (cond
+                              @(:completion-event? s) (p/resolved true)
+                              (<= (- deadline (h/now-ms)) 0) (p/resolved false)
+                              :else (p/let [_ (do (reconcile-local-exit! s)
+                                                  (refresh-detached! s))]
+                                      (if @(:completion-event? s)
+                                        (p/resolved true)
+                                        (p/let [remaining-s (/ (max (- deadline (h/now-ms)) 0) 1000)
+                                                _ (p/delay (* 1000 (min remaining-s interval)))]
+                                          (p/recur))))))]
+              (p/recur (next remaining)
+                       (if done? (conj completed (:id s)) completed)
+                       (if done? timed-out (conj timed-out (:id s)))))
+            (p/resolved {"waited" (mapv :id pending)
+                         "completed" completed
+                         "timed_out" timed-out})))))))
