@@ -1,0 +1,61 @@
+(ns agent-cli-route
+  (:export [route-code admit-turn test-route-code test-admit-turn]))
+
+;; itonami-agent's CLI route decision, as a kotoba guest.
+;;
+;; Role: the kexe-first CLI pattern (kagi ADR-0002 precedent) -- this core is
+;; the DECISION half of the launcher: which sub-route an invocation takes and
+;; whether a turn may proceed. The host (the tender/guest init) supplies argv
+;; facts as i64 flags and performs the effects. This is NOT a Q9 migration
+;; slice of itonami.agent.main (that is whole-component work, blocked on the
+;; selfhost walls measured in kotoba-lang/lang/selfhost-distance.edn -- check
+;; gate 9/318, largest wall :kotoba.error/namespace-require-needs-project);
+;; it is the bounded decision surface the native launcher needs first.
+;;
+;; Oracle: itonami.agent.main's dispatch (`bin/itonami-agent` usage block):
+;;   itonami-agent [-p P] -z PROMPT      -> turn
+;;   itonami-agent [-p P] chat           -> chat
+;;   itonami-agent bridge                -> bridge
+;;   itonami-agent [-p P] cron ...       -> cron
+;;   itonami-agent profile ...           -> profile
+;;   itonami-agent peer ...              -> peer
+;;   anything else                       -> usage
+;;
+;; Route codes (the refusal vocabulary is numbered per the migration rules;
+;; the mapping is pinned in test-route-code below):
+;;   1 usage   2 chat   3 bridge   4 cron   5 profile   6 peer   7 turn
+;; admit-turn codes:
+;;   1 turn may proceed   -1 no prompt   -2 no profile for a turn
+;;
+;; Admission bounds measured for this compiler (see the port rules): pure
+;; i64 surface, no rem/mod (spelled with quot), <= 5 params, no strings.
+
+(defn route-code [cmd1 :i64 has-z :i64] :i64
+  ;; cmd1: 0 none, 1 chat, 2 bridge, 3 cron, 4 profile, 5 peer (first
+  ;; positional, already classified by the host's positional scan).
+  ;; has-z: 1 when -z/--prompt was given.
+  (if (= cmd1 0)
+    (if (= has-z 1) 7 1)
+    ;; cmd1 1..5 maps to route codes 2..6 (the usage block's order).
+    (+ cmd1 1)))
+
+(defn admit-turn [has-p :i64 has-z :i64] :i64
+  ;; A turn needs both a prompt and a profile. The host turns a refusal code
+  ;; into the same message its own launcher prints.
+  (if (= has-z 0)
+    -1
+    (if (= has-p 0) -2 1)))
+
+(defn test-route-code [] :bool
+  (and (= 7 (route-code 0 1))
+       (= 1 (route-code 0 0))
+       (= 2 (route-code 1 0))
+       (= 3 (route-code 2 0))
+       (= 4 (route-code 3 0))
+       (= 5 (route-code 4 0))
+       (= 6 (route-code 5 0))))
+
+(defn test-admit-turn [] :bool
+  (and (= 1 (admit-turn 1 1))
+       (= -1 (admit-turn 1 0))
+       (= -2 (admit-turn 0 1))))
