@@ -489,6 +489,11 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                          (min 300 configured-budget)
                          300)
               t0 (h/now-ms)
+              ;; one delegation id per delegate_task call, the id shape of
+              ;; Hermes' live-transcript batch
+              ;; (`tools/delegation_live_log.create_live_transcripts`:
+              ;; `deleg_` + 8 hex) — every child of the batch shares it
+              delegation-id (str "deleg_" (h/random-hex 4))
               ids (mapv (fn [_] (str "sub-" (h/random-hex 6))) tasks)
               child-run (fn [id task]
                           (let [goal (get task "goal")
@@ -523,9 +528,16 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                                             "status" (get base "status")
                                                                             "summary" (get base "summary")})
                                          (swap! delegate-ctl dissoc id)
+                                         ;; Hermes tools/delegate_tool_registry._unregister_subagent:
+                                         ;; the record moves to the bounded recent FIFO
+                                         (proc/unregister-subagent-attribution! id)
                                          base))]
                             (swap! delegate-children assoc id {"goal" goal "status" "running"})
                             (swap! delegate-ctl assoc id ctl)
+                            ;; Hermes tools/delegate_tool_registry._register_child:
+                            ;; the process-notice attribution record
+                            (proc/register-subagent-attribution!
+                             {"subagent_id" id "goal" goal "delegation_id" delegation-id})
                             (-> (run prof prompt (assoc child-options :budget-s budget-s))
                                 (p/then (fn [result]
                                           (if-not schema
@@ -543,6 +555,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                     (p/catch (fn [_] (done result v)))))))))
                                 (p/catch (fn [e]
                                            (swap! delegate-children assoc id {"goal" goal "status" "failed"})
+                                           (proc/unregister-subagent-attribution! id)
                                            {"subagent_id" id "goal" goal "status" "failed" "error" (.-message e)})))))
               child-runs (mapv child-run ids tasks)]
           (if (false? (:join-children? parent-options))

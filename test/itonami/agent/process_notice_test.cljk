@@ -250,3 +250,97 @@
                       (h/rm home)
                       (done))))
           (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+(deftest subagent-attribution-registry
+  ;; Hermes tools/delegate_tool_registry.get_subagent_attribution: the
+  ;; `{subagent_id goal delegation_id}` projection over the live registry plus
+  ;; the bounded recent FIFO (its tests: tests/tools/
+  ;; test_delegate_control_actions.py "Process-notification attribution").
+  (reset! process/active-subagents {})
+  (reset! process/recent-subagents [])
+  (testing "resolves a live child"
+    (process/register-subagent-attribution!
+     {"subagent_id" "sub-attr0001" "goal" "test goal" "delegation_id" "deleg_attr_1"})
+    (is (= {"subagent_id" "sub-attr0001" "goal" "test goal" "delegation_id" "deleg_attr_1"}
+           (process/get-subagent-attribution "sub-attr0001")))
+    (process/unregister-subagent-attribution! "sub-attr0001"))
+  (testing "attribution survives child completion — its background processes outlive it"
+    (is (= {"subagent_id" "sub-attr0001" "goal" "test goal" "delegation_id" "deleg_attr_1"}
+           (process/get-subagent-attribution "sub-attr0001"))))
+  (testing "unknown, empty and non-string task ids are nil"
+    (is (nil? (process/get-subagent-attribution "proc-not-a-subagent")))
+    (is (nil? (process/get-subagent-attribution "")))
+    (is (nil? (process/get-subagent-attribution nil)))
+    (is (nil? (process/get-subagent-attribution 7))))
+  (testing "the recent retention is the bounded FIFO of 200 (Hermes _RECENT_SUBAGENTS_CAP)"
+    (reset! process/active-subagents {})
+    (reset! process/recent-subagents [])
+    (doseq [i (range 201)]
+      (let [id (str "sub-f" i)]
+        (process/register-subagent-attribution! {"subagent_id" id "goal" (str "g" i) "delegation_id" "deleg_f"})
+        (process/unregister-subagent-attribution! id)))
+    (is (= 200 (count @process/recent-subagents)))
+    (is (nil? (process/get-subagent-attribution "sub-f0")) "the oldest stub aged out")
+    (is (= "g1" (get (process/get-subagent-attribution "sub-f1") "goal")))
+    (is (= "g200" (get (process/get-subagent-attribution "sub-f200") "goal"))))
+  (testing "a live record shadows its aged stub"
+    (process/register-subagent-attribution!
+     {"subagent_id" "sub-f200" "goal" "fresh" "delegation_id" "deleg_new"})
+    (is (= "fresh" (get (process/get-subagent-attribution "sub-f200") "goal")))
+    (process/unregister-subagent-attribution! "sub-f200")
+    (is (= "fresh" (get (process/get-subagent-attribution "sub-f200") "goal"))
+        "the stub was replaced in place")))
+
+(deftest delegation-attribution-line-in-completion-text
+  ;; Hermes process_registry_notifications._delegation_attribution_line over
+  ;; format_process_notification's completion branch.
+  (reset! process/active-subagents {})
+  (reset! process/recent-subagents [])
+  (process/register-subagent-attribution!
+   {"subagent_id" "sub-attr0003" "goal" "run the npm ci for the desktop app" "delegation_id" "deleg_attr_3"})
+  (testing "the completion text names the subagent, its delegation and its goal; owner_task_id wins"
+    (is (= (str "[IMPORTANT: Background process proc_ownerattr01 completed normally (exit code 0).\n"
+                "Started by subagent sub-attr0003 of delegation deleg_attr_3. Task: \"run the npm ci for the desktop app\"\n"
+                "Command: npm ci\nOutput:\nadded 1500 packages]")
+           (process/format-completion-notification
+            {"type" "completion" "session_id" "proc_ownerattr01" "task_id" "default"
+             "owner_task_id" "sub-attr0003" "command" "npm ci" "exit_code" 0
+             "output" "added 1500 packages"}))))
+  (testing "a goal over 120 characters truncates to 117 + ...; exactly 120 stays whole"
+    (process/register-subagent-attribution!
+     {"subagent_id" "sub-attr0004" "goal" (apply str (repeat 121 "g")) "delegation_id" "deleg_attr_4"})
+    (is (str/includes? (process/format-completion-notification
+                       {"type" "completion" "session_id" "p1" "task_id" "sub-attr0004"
+                        "command" "c" "exit_code" 0 "output" "o"})
+                      (str "Task: \"" (apply str (repeat 117 "g")) "...\"")))
+    (process/register-subagent-attribution!
+     {"subagent_id" "sub-attr0005" "goal" (apply str (repeat 120 "g")) "delegation_id" "deleg_attr_5"})
+    (is (str/includes? (process/format-completion-notification
+                       {"type" "completion" "session_id" "p2" "task_id" "sub-attr0005"
+                        "command" "c" "exit_code" 0 "output" "o"})
+                      (str "Task: \"" (apply str (repeat 120 "g")) "\""))))
+  (testing "a goal is stripped; a missing goal or delegation_id drops just that clause"
+    (process/register-subagent-attribution!
+     {"subagent_id" "sub-attr0006" "goal" "  " "delegation_id" "deleg_attr_6"})
+    (is (str/includes? (process/format-completion-notification
+                       {"type" "completion" "session_id" "p3" "task_id" "sub-attr0006"
+                        "command" "c" "exit_code" 0 "output" "o"})
+                      "Started by subagent sub-attr0006 of delegation deleg_attr_6.\n"))
+    (process/register-subagent-attribution! {"subagent_id" "sub-attr0007" "goal" "a goal"})
+    (is (str/includes? (process/format-completion-notification
+                       {"type" "completion" "session_id" "p4" "task_id" "sub-attr0007"
+                        "command" "c" "exit_code" 0 "output" "o"})
+                      "Started by subagent sub-attr0007. Task: \"a goal\"")))
+  (testing "handoff_note overrides the delegation attribution"
+    (let [text (process/format-completion-notification
+                {"type" "completion" "session_id" "p5" "task_id" "sub-attr0003" "command" "c"
+                 "exit_code" 0 "output" "o" "handoff_note" "watch the build"})]
+      (is (str/includes? text "Handed off to you by a subagent before it finished. Purpose: watch the build"))
+      (is (not (str/includes? text "Started by subagent")))))
+  (testing "an aged-out registry still attributes generically, never anonymously"
+    (reset! process/active-subagents {})
+    (reset! process/recent-subagents [])
+    (is (str/includes? (process/format-completion-notification
+                       {"type" "completion" "session_id" "p6" "task_id" "sub-aged01"
+                        "command" "c" "exit_code" 0 "output" "o"})
+                      "Started by subagent sub-aged01 (delegate_task)."))))

@@ -598,6 +598,71 @@
               (catch :default e (h/json-str {"status" "error" "error" (.-message e)})))))
         :else (h/json-str {"error" (str "unknown process action: " action)})))))
 
+;; ---- subagent attribution (Hermes tools/delegate_tool_registry) ----
+
+(def recent-subagents-cap
+  "Hermes `tools/delegate_tool_registry._RECENT_SUBAGENTS_CAP`, verbatim."
+  200)
+
+(def active-subagents
+  "subagent_id -> the child's registry record (Hermes
+  `tools/delegate_tool_registry._active_subagents`), written by
+  `delegated-tasks` around each child run. Read only through
+  `get-subagent-attribution`."
+  (atom {}))
+
+(def recent-subagents
+  "Ordered [subagent_id stub] entries kept AFTER the child finishes (Hermes
+  `_recent_subagents`, bounded FIFO): child-started background processes
+  routinely outlive the child and their completion notifications still need
+  delegation attribution. A stub keeps `goal` and `delegation_id` (Hermes also
+  keeps `owner_agent_session_id`, which Kotoba's handoff gate sources from the
+  process record instead)."
+  (atom []))
+
+(defn register-subagent-attribution!
+  "Hermes `_register_subagent`: keep the record under its `subagent_id`."
+  [record]
+  (let [sid (get record "subagent_id")]
+    (when (and (some? sid) (not= "" sid))
+      (swap! active-subagents assoc sid record))))
+
+(defn unregister-subagent-attribution!
+  "Hermes `_unregister_subagent`: drop the live record and keep the bounded
+  attribution stub in the recent FIFO. A recycled id's stub is replaced IN
+  PLACE (Python dict assignment semantics): the FIFO slot is the first
+  insertion, never the latest."
+  [subagent-id]
+  (when-let [record (get @active-subagents subagent-id)]
+    (swap! active-subagents dissoc subagent-id)
+    (let [sid (get record "subagent_id")]
+      (when (and (some? sid) (not= "" sid))
+        (swap! recent-subagents
+               (fn [entries]
+                 (let [stub {"goal" (get record "goal")
+                             "delegation_id" (get record "delegation_id")}
+                       slot (first (keep-indexed (fn [i [id _]] (when (= id sid) i)) entries))
+                       entries (if (some? slot)
+                                 (assoc entries slot [sid stub])
+                                 (conj (vec entries) [sid stub]))]
+                   (if (> (count entries) recent-subagents-cap)
+                     (subvec entries 1)
+                     entries))))))))
+
+(defn get-subagent-attribution
+  "Hermes `tools/delegate_tool_registry.get_subagent_attribution`, verbatim
+  projection: `{subagent_id goal delegation_id}` for a process task_id that
+  belongs to a live or recently-finished child (children run their terminal
+  sessions under `task_id == subagent_id`), else nil."
+  [task-id]
+  (when (and (string? task-id) (not= "" task-id))
+    (when-let [record (or (get @active-subagents task-id)
+                          (some (fn [[id stub]] (when (= id task-id) stub))
+                                @recent-subagents))]
+      {"subagent_id" task-id
+       "goal" (get record "goal")
+       "delegation_id" (get record "delegation_id")})))
+
 ;; ---- completion-notice routing (Hermes drain_notifications + format_process_notification) ----
 
 (defn is-completion-consumed?
@@ -628,6 +693,24 @@
       (= 0 (get evt "exit_code" "?")) "completed normally"
       :else "exited")))
 
+(defn- delegation-attribution-line
+  "Hermes `process_registry_notifications._delegation_attribution_line`,
+  verbatim (Kotoba subagent ids are `sub-…`, Hermes' `sa-…`): the
+  `get-subagent-attribution` lookup fills the delegation and the goal, and an
+  aged-out registry entry still attributes generically, never anonymously."
+  [evt]
+  (let [raw-owner (str (or (get evt "owner_task_id") (get evt "task_id") ""))]
+    (when (child-notification? evt)
+      (if-let [info (get-subagent-attribution raw-owner)]
+        (let [goal (str/trim (str (or (get info "goal") "")))
+              goal (if (> (count goal) 120) (str (subs goal 0 117) "...") goal)
+              deleg (get info "delegation_id")]
+          (str "Started by subagent " raw-owner
+               (when (and (some? deleg) (not= deleg "")) (str " of delegation " deleg))
+               "."
+               (when-not (= goal "") (str " Task: \"" goal "\""))))
+        (str "Started by subagent " raw-owner " (delegate_task).")))))
+
 (defn format-completion-notification
   "Hermes `process_registry_notifications.format_process_notification` — the
   completion branch, verbatim (heartbeats and watch matches have no Kotoba
@@ -636,14 +719,10 @@
   [evt]
   (let [sid (get evt "session_id" "unknown")
         cmd (get evt "command" "unknown")
-        raw-owner (str (or (get evt "owner_task_id") (get evt "task_id") ""))
         attribution (if (get evt "handoff_note")
                       (str "Handed off to you by a subagent before it finished. Purpose: "
                            (get evt "handoff_note"))
-                      (when (child-notification? evt)
-                        ;; Hermes `_delegation_attribution_line`'s no-registry
-                        ;; fallback (the delegation goal lookup is not wired).
-                        (str "Started by subagent " raw-owner " (delegate_task).")))
+                      (delegation-attribution-line evt))
         exit (get evt "exit_code" "?")
         out (get evt "output" "")
         signal (if (contains? #{-15 143 "-15" "143"} exit) ", SIGTERM" "")

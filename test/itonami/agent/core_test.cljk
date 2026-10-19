@@ -5,6 +5,7 @@
             [itonami.agent.host :as h]
             [itonami.agent.profile :as profile]
             [itonami.agent.loop :as agent-loop]
+            [itonami.agent.process :as process]
             [itonami.agent.manifest :as manifest]
             [itonami.agent.provider :as provider]
             [itonami.agent.cron :as cron]
@@ -1475,3 +1476,35 @@ plain: true
                          nil)
                        (p/catch (fn [e] (is (nil? e) (str "cloud session test crashed: " (.-message e)))))
                        (p/finally (fn [_ _] (.close srv) (done))))))))))
+
+(deftest delegate-spawn-wires-subagent-attribution
+  ;; Hermes tools/delegate_tool_registry._register_child / _unregister_subagent
+  ;; wired through delegate_task: every spawned child registers its
+  ;; process-notice attribution record with the batch's delegation id, and
+  ;; finishes into the bounded recent FIFO (its background processes outlive
+  ;; it). The child run fails at provider setup (no base_url), never touching
+  ;; the network.
+  (async done
+    (reset! process/active-subagents {})
+    (reset! process/recent-subagents [])
+    (let [home (h/join (h/tmp-dir) (str "itonami-deleg-attr-" (h/random-hex 4)))]
+      (h/mkdirs home)
+      (-> (agent-loop/delegated-tasks
+           {:config {} :home home :env {} :name "test"} ["terminal"] {:budget-s 0.5}
+           {"tasks" [{"goal" "goal one"} {"goal" "goal two"}]})
+          (p/then (fn [s]
+                    (let [results (get (h/json-parse s) "results")
+                          infos (mapv #(process/get-subagent-attribution (get % "subagent_id")) results)]
+                      (testing "both children's attribution resolves after they finished (recent FIFO)"
+                        (is (= 2 (count infos)))
+                        (is (= #{"goal one" "goal two"} (set (map #(get % "goal") infos)))))
+                      (testing "one delegation id per delegate_task batch, Hermes' id shape"
+                        (is (every? #(re-matches #"^deleg_[0-9a-f]{8}$" (str %))
+                                    (map #(get % "delegation_id") infos)))
+                        (is (apply = (map #(get % "delegation_id") infos))))
+                      (testing "the live registry is empty — the stubs are the bounded retention"
+                        (is (= {} @process/active-subagents))
+                        (is (= 2 (count @process/recent-subagents)))))
+                    (h/rm home)
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
