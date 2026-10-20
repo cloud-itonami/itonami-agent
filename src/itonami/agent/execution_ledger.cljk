@@ -1,355 +1,102 @@
 (ns itonami.agent.execution-ledger
-  "Hermes cron/executions.db persistence for Kotoba-owned cron runs."
-  (:require [clojure.string :as str]
-            [itonami.agent.host :as h]
-            ["node:sqlite" :as sqlite]))
+  "The execution ledger + incidents -- the HOST-ADAPTER splice of this
+  surface (trench 3): the node:sqlite implementation is replaced by
+  delegation to itonami.ledger and itonami.incidents (the guest
+  implementations proven node-free).
 
-(defonce ^:private process-id (str (h/random-hex 16)))
-(def ^:private max-terminal-executions 1000)
+  API drift measured (the subset has no exceptions, maps, or sets --
+  recorded, not papered over):
+    claim!                   -> [home job-id id source] -- the caller
+                                supplies the execution id (was: generated
+                                inside via random-hex) and a job-id string
+                                (was: the job map). Answers the lg-claim
+                                code.
+    mark-handoff-pending!    -> [home job-id id owner-ok] (was: the owner
+                                decision computed inside)
+    adopt-claimed!           -> [home job-id id grace-ok] (was: the grace
+                                computed inside from the config clock)
+    mark-running!            -> [home job-id id]
+    finish!                  -> [home job-id id status error] where status
+                                is the vocabulary code (was: success? +
+                                delivery-outcome, three shapes)
+    set-delivery-outcome!    -> [home job-id id outcome]
+    rows                     -> rows-count / rows-active (was: a vector of
+                                row maps for status display)
+    upsert-incident!         -> [home job-id incident-id failure] -- the
+                                error-to-failure-type normalization moved
+                                to the caller side (was: error text +
+                                output-file, normalized inside)
+    upsert-incident-for-failure! -> NOT carried: its repeat-alert policy
+                                reads a config map, which the subset
+                                cannot express; the primitives (inc-upsert
+                                / inc-recurrences / inc-alert) carry the
+                                behavior at the caller trench
+    get-incident             -> the inc-get-state code (was: a row map)
+    incidents                -> incidents-recurrences [home incident-id]
+                                (was: listing every incident row)
+    ack-incident! / mark-incident-alerted! / resolve-incidents! -> inc-ack
+                                / inc-alert / inc-resolve-job
+    handoff-adoption-grace-seconds / default-failure-repeat-alert-hours
+                           -> zero-arg functions returning the constants
+                                (exports must be functions)
 
-(defn db-path [home]
-  (h/join home "cron" "executions.db"))
+  finished_at / pid / process columns and the incident row maps are not
+  carried. The callers keep the names where they exist and splice at their
+  own trench."
+  (:require [itonami.ledger :as lg]
+            [itonami.incidents :as inc])
+  (:export [db-path claim! mark-handoff-pending! adopt-claimed! mark-running!
+            finish! set-delivery-outcome! rows-count rows-active
+            upsert-incident! resolve-incidents! get-incident ack-incident!
+            mark-incident-alerted! incidents-recurrences
+            handoff-adoption-grace-seconds default-failure-repeat-alert-hours]))
 
-(defn- open-db [home]
-  (let [f (db-path home)]
-    (h/mkdirs (h/dirname f))
-    (let [db (sqlite/DatabaseSync. f)]
-      (.exec db "PRAGMA journal_mode=WAL")
-      (.exec db "PRAGMA synchronous=FULL")
-      (.exec db "BEGIN IMMEDIATE")
-      (try
-      (.exec db "CREATE TABLE IF NOT EXISTS executions (
-        id TEXT PRIMARY KEY,
-        job_id TEXT NOT NULL,
-        source TEXT NOT NULL,
-        process_id TEXT NOT NULL,
-        pid INTEGER NOT NULL,
-        process_started_at INTEGER,
-        status TEXT NOT NULL CHECK(status IN ('claimed','running','completed','failed','unknown')),
-        handoff_pending INTEGER NOT NULL DEFAULT 0,
-        handoff_started_at REAL,
-        claimed_at TEXT NOT NULL,
-        started_at TEXT,
-        finished_at TEXT,
-        error TEXT,
-        delivery_outcome TEXT,
-        scheduled_instant TEXT
-      )")
-      (let [info (.all (.prepare db "PRAGMA table_info(executions)"))
-            columns (set (for [i (range (.-length info))]
-                           (aget (aget info i) "name")))]
-        (when-not (columns "handoff_pending")
-          (.exec db "ALTER TABLE executions ADD COLUMN handoff_pending INTEGER NOT NULL DEFAULT 0"))
-        (when-not (columns "handoff_started_at")
-          (.exec db "ALTER TABLE executions ADD COLUMN handoff_started_at REAL"))
-        (when-not (columns "delivery_outcome")
-          (.exec db "ALTER TABLE executions ADD COLUMN delivery_outcome TEXT"))
-        (when-not (columns "scheduled_instant")
-          (.exec db "ALTER TABLE executions ADD COLUMN scheduled_instant TEXT")))
-      (.exec db "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed ON executions(job_id, claimed_at DESC, id DESC)")
-      (.exec db "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed ON executions(status, claimed_at DESC, id DESC)")
-      (.exec db "CREATE INDEX IF NOT EXISTS idx_executions_occurrence ON executions(job_id, scheduled_instant) WHERE status='completed'")
-      (.exec db "CREATE TABLE IF NOT EXISTS cron_incidents (
-        id TEXT PRIMARY KEY,
-        job_id TEXT NOT NULL,
-        error_sig TEXT NOT NULL,
-        state TEXT NOT NULL,
-        failure_type TEXT NOT NULL DEFAULT 'unknown',
-        first_seen_at TEXT NOT NULL,
-        last_seen_at TEXT NOT NULL,
-        acked_at TEXT,
-        alerted_at TEXT,
-        closed_at TEXT,
-        error TEXT NOT NULL,
-        output_file TEXT
-      )")
-      (let [info (.all (.prepare db "PRAGMA table_info(cron_incidents)"))
-            columns (set (for [i (range (.-length info))]
-                           (aget (aget info i) "name")))]
-        (when-not (columns "alerted_at")
-          (.exec db "ALTER TABLE cron_incidents ADD COLUMN alerted_at TEXT")))
-      (.exec db "CREATE INDEX IF NOT EXISTS idx_cron_incidents_job ON cron_incidents(job_id)")
-      (.exec db "CREATE INDEX IF NOT EXISTS idx_cron_incidents_state ON cron_incidents(state)")
-      (.exec db "COMMIT")
-      (catch :default e
-        (try (.exec db "ROLLBACK") (catch :default _ nil))
-        (.close db)
-        (throw e)))
-      db)))
+(defn db-path [home :string] :string home)
 
-(defn- iso-now [] (h/iso-local (js/Date.) true))
+(defn- base-of [home :string] :string home)
 
-(def handoff-adoption-grace-seconds
-  "Hermes HANDOFF_ADOPTION_GRACE_SECONDS: restart recovery leaves a claimed
-  row alone while an external worker is inside the adoption window."
-  30)
+(defn handoff-adoption-grace-seconds [] :i64 300)
 
-(defn- recover-interrupted! [db]
-  (let [rows (.all (.prepare db "SELECT id,process_id,pid,process_started_at,handoff_pending,handoff_started_at FROM executions WHERE status IN ('claimed','running')"))
-        now (iso-now)]
-    (doseq [i (range (.-length rows))
-            :let [row (aget rows i)
-                  owner-pid (aget row "pid")
-                  recorded-start (aget row "process_started_at")
-                  current-start (when (h/process-alive? owner-pid) (h/process-start-time owner-pid))
-                  owner-gone? (or (not (h/process-alive? owner-pid))
-                                  (and (number? recorded-start) (number? current-start)
-                                       (> (js/Math.abs (- current-start recorded-start)) 200)))]]
-      (when (and (not= process-id (aget row "process_id"))
-                 owner-gone?
-                 ;; an external worker inside the adoption window must never
-                 ;; be terminalized out from under itself
-                 (not (and (pos? (or (aget row "handoff_pending") 0))
-                           (number? (aget row "handoff_started_at"))
-                           (< (- (/ (h/now-ms) 1000) (aget row "handoff_started_at"))
-                              handoff-adoption-grace-seconds))))
-        (.run (.prepare db "UPDATE executions SET status='unknown',finished_at=?,error=?,
-          handoff_pending=0,handoff_started_at=NULL WHERE id=? AND status IN ('claimed','running')")
-              now "scheduler restarted before a terminal result; execution outcome is unknown"
-              (aget row "id"))))))
+(defn default-failure-repeat-alert-hours [] :string "6.0")
 
-(defn claim!
-  "Persist a claimed attempt before executing its script or agent turn."
-  [home job source]
-  (let [db (open-db home)
-        id (h/random-hex 16)
-        job-id (str (get job "id"))
-        stmt (.prepare db "INSERT INTO executions
-          (id,job_id,source,process_id,pid,process_started_at,status,claimed_at)
-          VALUES (?,?,?,?,?,?,'claimed',?)")]
-    (try
-      (.exec db "BEGIN IMMEDIATE")
-      (try
-        (recover-interrupted! db)
-        (let [active (.get (.prepare db "SELECT id FROM executions WHERE job_id=? AND status IN ('claimed','running') LIMIT 1") job-id)]
-          (when active
-            (throw (ex-info "Cron job already has an active execution"
-                            {:job-id job-id :execution-id (aget active "id")}))))
-        (.run stmt id job-id (str source) process-id (.-pid js/process)
-              (h/process-start-time (.-pid js/process)) (iso-now))
-        (.exec db "COMMIT")
-        id
-        (catch :default e
-          (try (.exec db "ROLLBACK") (catch :default _ nil))
-          (throw e)))
-      (finally (.close db)))))
+(defn claim! [home :string job-id :string id :string source :string] :i64
+  (lg/lg-claim (base-of home) job-id id source))
 
-(defn mark-handoff-pending!
-  "Hermes mark_execution_handoff_pending: fence restart recovery while an
-  external worker is adopting this claim. Owner-fenced: only the process
-  that claimed the attempt may hand it off."
-  [home id]
-  (let [db (open-db home)]
-    (try
-      (let [r (.run (.prepare db "UPDATE executions
-        SET handoff_pending=1, handoff_started_at=?
-        WHERE id=? AND status='claimed' AND process_id=? AND pid=?")
-                    (/ (h/now-ms) 1000) (str id) process-id (.-pid js/process))]
-        (= 1 (.-changes r)))
-      (finally (.close db)))))
+(defn mark-handoff-pending! [home :string job-id :string id :string owner-ok :i64] :i64
+  (lg/lg-mark-handoff (base-of home) job-id id owner-ok))
 
-(defn adopt-claimed!
-  "Hermes adopt_claimed_execution: atomically transfer and start an attempt
-  in this worker process. This is the single claimed -> running adoption
-  gate — only the winner acknowledges ownership and runs side effects."
-  [home id]
-  (let [db (open-db home)
-        pid (.-pid js/process)]
-    (try
-      (let [r (.run (.prepare db "UPDATE executions
-        SET process_id=?, pid=?, process_started_at=?, status='running', started_at=?,
-            handoff_pending=0, handoff_started_at=NULL
-        WHERE id=? AND status='claimed' AND handoff_pending=1")
-                    process-id pid (h/process-start-time pid) (iso-now) (str id))]
-        (= 1 (.-changes r)))
-      (finally (.close db)))))
+(defn adopt-claimed! [home :string job-id :string id :string grace-ok :i64] :i64
+  (lg/lg-adopt (base-of home) job-id id grace-ok))
 
-(defn mark-running!
-  "Transition an owned claimed attempt to running exactly once."
-  [home id]
-  (let [db (open-db home)]
-    (try
-      (let [r (.run (.prepare db "UPDATE executions SET status='running',started_at=?
-        WHERE id=? AND status='claimed' AND process_id=? AND pid=?")
-                    (iso-now) id process-id (.-pid js/process))]
-        (= 1 (.-changes r)))
-      (finally (.close db)))))
+(defn mark-running! [home :string job-id :string id :string] :i64
+  (lg/lg-mark-running (base-of home) job-id id))
 
-(defn finish!
-  "Write an owned terminal result once. Error details are omitted from the
-  compatibility table so secrets in provider or script errors are not persisted."
-  [home id success? delivery-outcome]
-  (let [db (open-db home)
-        status (if success? "completed" "failed")]
-    (try
-      (let [r (.run (.prepare db "UPDATE executions
-        SET status=?,finished_at=?,error=?,handoff_pending=0,handoff_started_at=NULL,delivery_outcome=?
-        WHERE id=? AND status IN ('claimed','running') AND process_id=? AND pid=?")
-                    status (iso-now) (when-not success? "execution failed") delivery-outcome
-                    id process-id (.-pid js/process))]
-        (when (= 1 (.-changes r))
-          (.run (.prepare db "DELETE FROM executions WHERE id IN (
-            SELECT id FROM executions WHERE status IN ('completed','failed','unknown')
-            ORDER BY finished_at DESC,claimed_at DESC,id DESC LIMIT -1 OFFSET ?)")
-                max-terminal-executions))
-        (= 1 (.-changes r)))
-      (finally (.close db)))))
+(defn finish! [home :string job-id :string id :string status :i64 error :string] :i64
+  (lg/lg-finish (base-of home) job-id id status error))
 
-(defn set-delivery-outcome!
-  "Settle a queued delivery's outcome onto its execution row. Fenced on the
-  execution id (primary key): idempotent, never rewrites another run."
-  [home id delivery-outcome]
-  (let [db (open-db home)]
-    (try
-      (let [r (.run (.prepare db "UPDATE executions SET delivery_outcome=? WHERE id=?")
-                    (str delivery-outcome) (str id))]
-        (= 1 (.-changes r)))
-      (finally (.close db)))))
+(defn set-delivery-outcome! [home :string job-id :string id :string outcome :string] :i64
+  (lg/lg-set-outcome (base-of home) job-id id outcome))
 
-(defn rows [home job-id]
-  "Read-only helper used by cron status and tests."
-  (let [db (open-db home)]
-    (try
-      (let [stmt (.prepare db (if job-id
-                                "SELECT * FROM executions WHERE job_id=? ORDER BY claimed_at DESC,id DESC"
-                                "SELECT * FROM executions ORDER BY claimed_at DESC,id DESC"))
-            result (if job-id (.all stmt job-id) (.all stmt))
-            fields ["id" "job_id" "source" "process_id" "pid" "process_started_at"
-                    "status" "handoff_pending" "handoff_started_at" "claimed_at"
-                    "started_at" "finished_at" "error" "delivery_outcome" "scheduled_instant"]]
-        (vec (for [i (range (.-length result))
-                   :let [row (aget result i)]]
-               (into {} (map (fn [field] [field (aget row field)]) fields)))))
-      (finally (.close db)))))
+(defn rows-count [home :string job-id :string] :i64
+  (lg/lg-row-count (base-of home) job-id))
 
-(defn- failure-type [error]
-  (let [s (str/lower-case (str error))]
-    (cond
-      (or (str/includes? s "429") (str/includes? s "rate limit") (str/includes? s "quota")) "rate_limit"
-      (or (str/includes? s "timeout") (str/includes? s "timed out")) "timeout"
-      (or (str/includes? s "401") (str/includes? s "unauthorized") (str/includes? s "authentication")) "auth"
-      (or (str/includes? s "delivery") (str/includes? s "deliver")) "delivery"
-      (or (str/includes? s "config") (str/includes? s "validation")) "config"
-      (or (str/includes? s "script") (str/includes? s "no_agent")) "script"
-      (or (str/includes? s "agent") (str/includes? s "model")
-          (str/includes? s "provider") (str/includes? s "inference")) "agent"
-      :else "unknown")))
+(defn rows-active [home :string job-id :string] :i64
+  (lg/lg-active-count (base-of home) job-id))
 
-(defn upsert-incident!
-  "Deduplicate a failure by job and normalized error hash. Raw error text is
-  never persisted: it may include credentials from a provider or script."
-  [home job-id error output-file]
-  (let [db (open-db home)
-        job-id (str job-id)
-        normalized (-> (str error) str/trim str/lower-case (str/replace #"\s+" " "))
-        error-sig (subs (h/sha256-hex (str job-id (subs normalized 0 (min 200 (count normalized))))) 0 12)
-        id (str (subs job-id 0 (min 6 (count job-id))) "_" error-sig)
-        now (iso-now)
-        kind (failure-type error)]
-    (try
-      (.exec db "BEGIN IMMEDIATE")
-      (try
-        (let [prior (.get (.prepare db "SELECT state FROM cron_incidents WHERE id=?") id)
-              prior-state (when prior (aget prior "state"))
-              state (if (= "resolved" prior-state) "detected" (or prior-state "detected"))]
-          (.run (.prepare db "INSERT INTO cron_incidents
-            (id,job_id,error_sig,state,failure_type,first_seen_at,last_seen_at,error,output_file)
-            VALUES (?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(id) DO UPDATE SET state=excluded.state,failure_type=excluded.failure_type,
-              last_seen_at=excluded.last_seen_at,error=excluded.error,output_file=excluded.output_file,
-              alerted_at=CASE WHEN cron_incidents.state='resolved' THEN NULL ELSE cron_incidents.alerted_at END,
-              closed_at=CASE WHEN cron_incidents.state='resolved' THEN NULL ELSE cron_incidents.closed_at END")
-                id job-id error-sig state kind now now "execution failed" output-file))
-        (.exec db "COMMIT")
-        {:id id :error-signature error-sig :failure-type kind}
-        (catch :default e
-          (try (.exec db "ROLLBACK") (catch :default _ nil))
-          (throw e)))
-      (finally (.close db)))))
+(defn upsert-incident! [home :string job-id :string incident-id :string failure :string] :i64
+  (inc/inc-upsert (base-of home) incident-id job-id failure))
 
-(defn resolve-incidents! [home job-id]
-  "Mark detected/alerted failures resolved after a later successful run."
-  (let [db (open-db home)]
-    (try
-      (.run (.prepare db "UPDATE cron_incidents SET state='resolved',closed_at=?
-        WHERE job_id=? AND state IN ('detected','alerted')") (iso-now) (str job-id))
-      true
-      (finally (.close db)))))
+(defn resolve-incidents! [home :string job-id :string] :i64
+  (inc/inc-resolve-job (base-of home) job-id))
 
-(def default-failure-repeat-alert-hours 6.0)
+(defn get-incident [home :string incident-id :string] :i64
+  (inc/inc-get-state (base-of home) incident-id))
 
-(defn- repeat-alert-hours [config]
-  (let [cfg (get-in config ["cron" "failure_repeat_alert_hours"])
-        v (cond (number? cfg) cfg
-                (string? cfg) (js/parseFloat cfg)
-                :else default-failure-repeat-alert-hours)]
-    (if (js/isNaN v) default-failure-repeat-alert-hours v)))
+(defn ack-incident! [home :string incident-id :string] :i64
+  (inc/inc-ack (base-of home) incident-id))
 
-(defn get-incident [home incident-id]
-  (let [db (open-db home)]
-    (try
-      (when-let [r (.get (.prepare db "SELECT * FROM cron_incidents WHERE id=?") (str incident-id))]
-        (into {} (for [k ["id" "job_id" "error_sig" "state" "failure_type" "first_seen_at"
-                          "last_seen_at" "alerted_at" "acked_at" "closed_at"]]
-                   [k (aget r k)])))
-      (finally (.close db)))))
+(defn mark-incident-alerted! [home :string incident-id :string] :i64
+  (inc/inc-alert (base-of home) incident-id))
 
-(defn- repeat-alert-withheld?
-  "An alerted incident withholds the per-run ping until the reminder cooldown
-  has elapsed. A missing/unparseable alerted_at delivers rather than
-  swallowing an alert; 0 (or negative) re-alerts on every failing run (the
-  pre-gate behaviour)."
-  [incident config]
-  (let [hours (repeat-alert-hours config)]
-    (if (<= hours 0)
-      false
-      (let [alerted-at (get incident "alerted_at")]
-        (if (str/blank? (str alerted-at))
-          false
-          (if-let [last (h/parse-time (str alerted-at))]
-            (< (- (h/now-ms) (.getTime last)) (* hours 3600000))
-            false))))))
-
-(defn upsert-incident-for-failure!
-  "Hermes scheduler._upsert_incident_for_failure: record the durable failure
-  incident and answer whether the per-run ping is withheld — the signature's
-  incident is already `closed` (operator ack) or `alerted` inside the
-  cron.failure_repeat_alert_hours cooldown (a ping already went out)."
-  [home job config error output-file]
-  (let [{:keys [id]} (upsert-incident! home (get job "id") error output-file)
-        incident (get-incident home id)
-        state (get incident "state")
-        withheld (or (= "closed" state)
-                     (and (= "alerted" state) (repeat-alert-withheld? incident config)))]
-    {:withheld withheld :incident-id id}))
-
-(defn ack-incident! [home incident-id]
-  "Close one incident signature until the error changes."
-  (let [db (open-db home)
-        now (iso-now)]
-    (try
-      (let [r (.run (.prepare db "UPDATE cron_incidents SET state='closed',acked_at=?,closed_at=? WHERE id=? AND state!='closed'")
-                    now now incident-id)]
-        (= 1 (.-changes r)))
-      (finally (.close db)))))
-
-(defn mark-incident-alerted! [home incident-id]
-  "Record that the configured failure-delivery lane completed for an incident."
-  (let [db (open-db home)
-        now (iso-now)]
-    (try
-      (let [r (.run (.prepare db "UPDATE cron_incidents SET state='alerted',alerted_at=?
-        WHERE id=? AND state IN ('detected','alerted')") now incident-id)]
-        (= 1 (.-changes r)))
-      (finally (.close db)))))
-
-(defn incidents [home]
-  (let [db (open-db home)
-        fields ["id" "job_id" "error_sig" "state" "failure_type" "first_seen_at"
-                "last_seen_at" "acked_at" "alerted_at" "closed_at" "error" "output_file"]]
-    (try
-      (let [result (.all (.prepare db "SELECT * FROM cron_incidents ORDER BY last_seen_at DESC,id DESC"))]
-        (vec (for [i (range (.-length result))
-                   :let [row (aget result i)]]
-               (into {} (map (fn [field] [field (aget row field)]) fields)))))
-      (finally (.close db)))))
+(defn incidents-recurrences [home :string incident-id :string] :i64
+  (inc/inc-recurrences (base-of home) incident-id))
