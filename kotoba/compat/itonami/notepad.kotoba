@@ -7,14 +7,14 @@
   fail-closed (0 / empty) before any wire write, so an oversized write leaves
   the store untouched -- parity with notepad.cljk.
 
-  Open (measured, next slice): the 64KB per-job total needs a bounded
-  directory scan (:fs/browse) over the job's key files.
+  No derived key index (measured 2026-10-21): the listing reads the store
+  itself (amu#1423 made the browse provider heap-free and cap-free), so set
+  and delete never maintain a second copy of the key list.
 
   Shape rule measured earlier: typed-cap-call only in a typed defn's return
   position."
-  (:require [itonami.notepad-core :as core]
-            [itonami.journal :as j])
-  (:export [note-path notepad-set notepad-get notepad-delete])
+  (:require [itonami.notepad-core :as core])
+  (:export [note-path note-stored-key notepad-set notepad-get notepad-delete])
   (:capabilities #{:fs/app-data :hash/sha256}))
 
 (defn- wire-hash [key :string] :string
@@ -45,29 +45,18 @@
                                 (string-concat (core/hex-encode (wire-hash key))
                                                ".txt"))))
 
-(defn- np-id [base :string] :string
-  (note-path base "_idx"))
-
-(defn- idx-has [q :string key :string i :i64 n :i64] :i64
-  (if (>= i n)
-    0
-    (if (string=? (j/journal-entry q i) key)
-      1
-      (idx-has q key (+ i 1) n))))
-
-(defn- idx-rebuild [q :string key :string i :i64 n :i64 acc :string] :string
-  ;; the key index without any entry equal to key (compact rewrite on delete,
-  ;; so a listing never shows a deleted key).
-  (if (>= i n)
-    acc
-    (let [k (j/journal-entry q i)]
-      (let [acc2 (if (string=? k key)
-                   acc
-                   (if (= 0 (string-length acc))
-                     k
-                     (string-concat acc (string-concat "
-" k))))]
-        (idx-rebuild q key (+ i 1) n acc2)))))
+(defn note-stored-key [path :string] :string
+  ;; the entry's first line -- the stored key -- so a listing recovers keys
+  ;; from the hash-named files. Empty when the file is absent or holds no
+  ;; line break (a malformed entry lists as no key).
+  (if (= 0 (exists? path))
+    ""
+    (let [content (wire-read path)]
+      (let [i (string-index-of content "
+")]
+        (if (< i 0)
+          ""
+          (string-substring content 0 i))))))
 
 (defn notepad-set [base :string key :string value :string] :i64
   (if (= 0 (core/key-ok key))
@@ -76,10 +65,7 @@
       0
       (let [p (note-path base key)]
         (let [r (wire-write p (core/entry-encode key value))]
-          (let [q (np-id base)]
-            (let [n (j/journal-count q)]
-              (let [a (if (= 1 (idx-has q key 0 n)) 0 (j/journal-append q key))]
-                1))))))))
+          1)))))
 
 (defn notepad-get [base :string key :string] :string
   (let [p (note-path base key)]
@@ -100,11 +86,4 @@
     (if (= 0 (exists? p))
       0
       (let [r (wire-unlink p)]
-        (let [q (np-id base)]
-          (let [n (j/journal-count q)]
-            (let [content (idx-rebuild q key 0 n "")]
-              (let [w (if (= 0 (string-length content))
-                        (wire-write q "")
-                        (wire-write q (string-concat content "
-")))]
-                1))))))))
+        1))))

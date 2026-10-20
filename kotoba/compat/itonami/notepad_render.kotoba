@@ -1,10 +1,16 @@
 (ns itonami.notepad-render
   "The notepad listing + prompt-section port (ledger 8 design A: the
   list-notes / render-notepad-section surface of notepad.cljk). The SQLite
-  list is ORDER BY key -- the guest sorts the browse listing with an
-  insertion sort over string-compare, then renders the byte-exact prompt
-  section (empty notepad answers the empty string, keeping prompts
-  byte-identical for jobs that never touch the notepad).
+  list is ORDER BY key -- the guest sorts the keys with an insertion sort
+  over string-compare, then renders the byte-exact prompt section (empty
+  notepad answers the empty string, keeping prompts byte-identical for jobs
+  that never touch the notepad).
+
+  The listing reads the store itself (amu#1423: the browse provider is
+  heap-free and cap-free, measured boot100 with 13000 entries): the job's
+  key files are hash-named, so each listed file is read and its stored key
+  (the entry's first line) extracted. The files are the source of truth --
+  no derived key index exists to drift (it was removed with this slice).
 
   Boundaries measured: the loader's browse answer is NAME<TAB>flag lines, so
   a key carrying a tab is refused at the writer side (key-ok in
@@ -14,7 +20,6 @@
   Shape rule measured earlier: typed-cap-call only in a typed defn's return
   position."
   (:require [itonami.notepad :as np]
-            [itonami.journal :as j]
             [itonami.journal-core :as jc])
   (:export [browse-entries note-keys note-key-at render-notes])
   (:capabilities #{:fs/browse}))
@@ -27,6 +32,19 @@
 
 (defn- entry-name [line :string] :string
   (jc/piece line "	" 0))
+
+(defn- note-file? [name :string] :i64
+  ;; the store's key files only: n<hash>.txt -- a leftover _idx or any
+  ;; other file in the directory is not a note.
+  (if (= 0 (string-length name))
+    0
+    (if (not (= 110 (string-code-point-at name 0)))
+      0
+      (if (< (string-length name) 5)
+        0
+        (if (string=? (string-substring name (- (string-length name) 4) (string-length name)) ".txt")
+          1
+          0)))))
 
 (defn- sort-insert [sorted :string name :string] :string
   (if (= 0 (string-length sorted))
@@ -49,28 +67,26 @@
                              (string-concat name (string-substring sorted i (string-length sorted)))))
             (sort-insert-run sorted name (+ i len 1))))))))
 
-(defn- sort-index [base :string i :i64 n :i64 acc :string] :string
-  (if (>= i n)
-    acc
-    (sort-index base (+ i 1) n
-                (sort-insert acc (j/journal-entry (np/note-path base "_idx") i)))))
-
-(defn- sort-run [listing :string i :i64 n :i64 acc :string] :string
+(defn- keys-run [base :string listing :string i :i64 n :i64 acc :string] :string
   (if (>= i n)
     acc
     (let [line (jc/piece listing "
 " i)]
-      (sort-run listing (+ i 1) n (sort-insert acc (entry-name line))))))
+      (let [name (entry-name line)]
+        (let [k (if (= 1 (note-file? name))
+                  (np/note-stored-key (string-concat base (string-concat "/" name)))
+                  "")]
+          (let [acc2 (if (= 0 (string-length k)) acc (sort-insert acc k))]
+            (keys-run base listing (+ i 1) n acc2)))))))
 
 (defn note-keys [base :string] :string
-  ;; the sorted key listing (index order -> ORDER BY key), newline-joined.
-  ;; The source is the store's key INDEX journal (browse-free: the loader's
-  ;; browse provider mallocs and hits the same seccomp wall as the old read
-  ;; provider, measured boot88 -- an amu fix candidate).
-  (let [listing (j/journal-count (np/note-path base "_idx"))]
-    (if (= 0 listing)
+  ;; the sorted key listing (browse names -> each file's stored key ->
+  ;; ORDER BY key), newline-joined. The store itself is the index.
+  (let [listing (wire-browse base)]
+    (if (= 0 (string-length listing))
       ""
-      (sort-index base 0 listing ""))))
+      (keys-run base listing 0 (jc/count-pieces listing "
+") ""))))
 
 (defn note-key-at [keys :string i :i64] :string
   (jc/piece keys "
