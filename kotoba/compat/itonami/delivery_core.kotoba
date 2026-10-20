@@ -1,0 +1,65 @@
+(ns itonami.delivery-core
+  "The pure half of the delivery queue port (ledger 8 design A, consumer 2:
+  delivery_queue.cljk's 18 SQL). Queue semantics kept: enqueue is INSERT OR
+  IGNORE (first wins), claim flips pending -> delivering exactly once, finish
+  records a terminal status + error, claim-next takes the FIRST pending in
+  enqueue order. The order comes from an append-only journal; the per-id
+  state lives in one file per execution id (notepad's hashed naming).
+
+  Status is one of 0 pending / 1 delivering / 2 terminal. State file content
+  is the status digit, a newline, then the error text. Self-contained: only
+  native-qualified ops."
+  (:export [id-ok state-encode state-status state-error
+            test-id-ok test-state]))
+
+(defn- token-in [s :string token :string] :bool
+  (>= (string-index-of s token) 0))
+
+(defn- blank-run [s :string i :i64 n :i64] :i64
+  (if (>= i n)
+    n
+    (let [c (string-code-point-at s i)]
+      (if (or (= c 32) (or (= c 9) (or (= c 10) (or (= c 11) (or (= c 12) (= c 13))))))
+        (blank-run s (+ i 1) n)
+        i))))
+
+(defn id-ok [id :string] :i64
+  ;; parity: non-empty execution id; narrowed: no newline (journal line).
+  (if (= (blank-run id 0 (string-length id)) (string-length id))
+    0
+    (if (token-in id "
+") 0 1)))
+
+(defn state-encode [status :i64 error :string] :string
+  (string-concat (string-substring "012" status (+ status 1))
+                 (string-concat "
+" error)))
+
+(defn state-status [content :string] :i64
+  (if (= 0 (string-length content))
+    -1
+    (- (string-code-point-at content 0) 48)))
+
+(defn state-error [content :string] :string
+  (let [i (string-index-of content "
+")]
+    (if (< i 0) "" (string-substring content (+ i 1) (string-length content)))))
+
+(defn test-id-ok [] :bool
+  (and (= 1 (id-ok "exec-1"))
+       (= 0 (id-ok ""))
+       (= 0 (id-ok "   "))
+       (= 0 (id-ok "a
+b"))))
+
+(defn test-state [] :bool
+  (and (string=? "0
+" (state-encode 0 ""))
+       (string=? "2
+boom" (state-encode 2 "boom"))
+       (= 0 (state-status (state-encode 0 "")))
+       (= 1 (state-status (state-encode 1 "x")))
+       (= 2 (state-status (state-encode 2 "boom")))
+       (= -1 (state-status ""))
+       (string=? "boom" (state-error (state-encode 2 "boom")))
+       (string=? "" (state-error (state-encode 0 "")))))

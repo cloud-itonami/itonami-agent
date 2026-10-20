@@ -402,3 +402,29 @@ KV store に載せ替え、guest VM で完走実証:
 2. **KEXE_PAIRS の予算**: hex の再帰 concat が pair を消費（256 不足で
    :budget/cells trap）。65536 で解消。運用目安:
    KEXE_PAIRS=65536 KEXE_STRING_POOL=65536。
+
+## 計測 12: delivery queue port — node 無しで完走（2026-10-21、boot80.log）
+
+node:sqlite port consumer 2（delivery_queue.cljk の 18 SQL）。journal
+（enqueue 順序）+ per-id state ファイル（notepad の hashed 命名を再利用）の
+合成設計:
+
+- `delivery_core.kotoba`（pure 6/6 緑: id 検証・state codec・status 0/1/2）+
+  `delivery.kotoba`（effect: enqueue=INSERT OR IGNORE / claim-row は
+  pending→delivering の一回きり flip / finish=terminal+error /
+  claim-next=journal 順の最初の pending を claim）。
+- guest 実行（node 無し）: enqueue ex1×2（2 回目は 0）/ ex2 / ex3 →
+  claim-next **ex1** → **ex2** → finish ex1 terminal("boom") → status 2 /
+  error "boom" → claim-next **ex3**（delivering の ex2 を飛ばす）→
+  claim-next "" → claim-row(ex2) 0 → `DQRESULT:ex1:ex3:boom` /
+  `:ok :result 1`。journal に enqueue 順 `ex1 ex2 ex3` が残る。
+- 5-module graph（delivery+journal+notepad+cores）が aarch64-linux に
+  native compile 成功。
+
+parity notes（台帳記載）: terminal row の prune なし（re-enqueue は 0、
+SQLite は tombstone 参照）/ get-status の tombstone fallback なし（-1）/
+finished_at のみ省略。
+
+運用値の追加実測: **KEXE_STRING_POOL は intern の蓄積で尽きる**
+（65536 不足 → :budget/bytes trap、1MB で完走）。queue 系は
+KEXE_STRING_POOL=1048576 が目安。

@@ -1,0 +1,29 @@
+(ns delivery-probe
+  "Guest evidence for the delivery queue port: enqueue order, INSERT OR
+  IGNORE, claim-next FIFO, claim-once, finish terminal, error round-trip."
+  (:require [itonami.delivery :as d])
+  (:export [delivery-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn delivery-probe [] :i64
+  (let [e1 (d/dq-enqueue "/data/dq" "ex1")
+        e1b (d/dq-enqueue "/data/dq" "ex1")
+        e2 (d/dq-enqueue "/data/dq" "ex2")
+        e3 (d/dq-enqueue "/data/dq" "ex3")
+        c1 (d/dq-claim-next "/data/dq")
+        c2 (d/dq-claim-next "/data/dq")
+        f1 (d/dq-finish "/data/dq" "ex1" 2 "boom")
+        s1 (d/dq-status "/data/dq" "ex1")
+        er1 (d/dq-error "/data/dq" "ex1")
+        c3 (d/dq-claim-next "/data/dq")
+        c4 (d/dq-claim-next "/data/dq")
+        cr (d/dq-claim-row "/data/dq" "ex2")
+        say (wire-say (string-concat "DQRESULT:" (string-concat c1 (string-concat ":" (string-concat c3 (string-concat ":" er1))))))]
+    (if (and (= 1 e1) (= 0 e1b) (= 1 e2) (= 1 e3)
+             (string=? "ex1" c1) (string=? "ex2" c2)
+             (= 1 f1) (= 2 s1) (string=? "boom" er1)
+             (string=? "ex3" c3) (= 0 (string-length c4)) (= 0 cr))
+      1 0)))
