@@ -1,0 +1,393 @@
+(ns itonami.agent.gateway-admission-test
+  "The live `:enqueue!` / `:admission-recheck` admission bindings of the
+  messaging-gateway surface (Hermes gateway/run_notifications.py
+  `GatewayRunner._enqueue_process_completion_notification` /
+  `_flush_process_completion_batch` / `_format_coalesced_process_completions` /
+  `_cancel_process_completion_batch_tasks` /
+  `_completion_delivery_identity` / `_event_route_key`, and
+  gateway/session_automation.py `completion_admission` / `producer_identity`,
+  with `tools/process_registry_notifications.process_completion_display_text`),
+  and their wiring into `itonami.agent.watcher/run-process-watcher!`."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.gateway :as g]
+            [itonami.agent.process :as process]
+            [itonami.agent.watcher :as watcher]))
+
+(defn- fake-session
+  [id {:keys [exit-code output started-at]}]
+  {:id id
+   :state (atom :running)
+   :exit-code (atom exit-code)
+   :output (atom (or output ""))
+   :command "echo hi"
+   :started-at started-at
+   :owner-task-id (atom "")
+   :task-id (atom "task-a")
+   :completion-reason (atom "exited")
+   :termination-source (atom "")
+   :parent-session-id (atom "")})
+
+(defn- desc
+  [id]
+  {"session_id" id
+   "check_interval" 5
+   "session_key" "s1"
+   "platform" "telegram"
+   "chat_id" "c1"
+   "thread_id" "t1"
+   "user_id" "u1"
+   "user_name" "n1"
+   "message_id" "m1"
+   "notify_on_complete" true})
+
+;; ---- identity / producer identity ----
+
+(deftest completion-delivery-identity-contract
+  (testing "a process completion carries the spawn epoch; without `started_at` it is undeduplicated"
+    (is (= ["completion" "proc_a" 1712345678]
+           (g/completion-delivery-identity {"type" "completion" "session_id" "proc_a"
+                                            "started_at" 1712345678})))
+    (is (nil? (g/completion-delivery-identity {"type" "completion" "session_id" "proc_a"})))
+    (is (nil? (g/completion-delivery-identity {"type" "completion" "started_at" 1}))))
+  (testing "delegation UUIDs identify one producer; an interim task failure is its own event"
+    (is (= ["async_delegation" "d1" ""]
+           (g/completion-delivery-identity {"type" "async_delegation" "delegation_id" "d1"})))
+    (is (= ["async_delegation" "d1" "task_failure:3"]
+           (g/completion-delivery-identity {"type" "async_delegation" "delegation_id" "d1"
+                                            "task_failure_notice" true
+                                            "results" [{"task_index" 3}]})))
+    (is (nil? (g/completion-delivery-identity {"type" "async_delegation"}))))
+  (testing "watch events ride their event_id"
+    (is (= ["heartbeat" "proc_a" "e1"]
+           (g/completion-delivery-identity {"type" "heartbeat" "session_id" "proc_a"
+                                            "event_id" "e1"})))
+    (is (nil? (g/completion-delivery-identity {"type" "heartbeat" "session_id" "proc_a"}))))
+  (is (nil? (g/completion-delivery-identity {"type" "other"}))))
+
+(deftest producer-identity-compact-json
+  (testing "Hermes `json.dumps(identity, separators=(',', ':'))`"
+    (is (= "[\"completion\",\"proc_a\",1712345678]"
+           (g/producer-identity {"type" "completion" "session_id" "proc_a"
+                                 "started_at" 1712345678}))))
+  (testing "`invalid_params` when the event carries no identity"
+    (is (thrown? js/Error (g/producer-identity {"type" "completion"})))))
+
+;; ---- admission lookup ----
+
+(deftest completion-admission-contract
+  (let [evt {"type" "completion" "session_id" "proc_a" "started_at" 1712345678
+             "session_key" "s1"}
+        identity (g/producer-identity evt)
+        surface (fn [rows]
+                  {:session-authority {:db "db"}
+                   :lookup-session (fn [key] (when (= key "s1") {:session_id "owner-1"}))
+                   :route-owner (fn [authority entry]
+                                  (is (= {:db "db"} authority))
+                                  (is (= {:session_id "owner-1"} entry))
+                                  "owner-1")
+                   :list-admissions (fn [authority session-id]
+                                      (is (= {:db "db"} authority))
+                                      (is (= "owner-1" session-id))
+                                      rows)})]
+    (testing "no session authority, no session entry: no admission row"
+      (is (nil? (g/completion-admission {} evt)))
+      (is (nil? (g/completion-admission {:session-authority {}
+                                         :lookup-session (constantly nil)
+                                         :route-owner (fn [_ _] "x")
+                                         :list-admissions (fn [_ _] [])}
+                                        evt))))
+    (testing "the descriptor's `identities` list carries the producer identity"
+      (let [row {"payload" {"local_automation_v1" {"identities" [identity]}}}]
+        (is (= row (g/completion-admission (surface [row]) evt)))))
+    (testing "a single `identity` matches when `identities` is absent"
+      (let [row {"payload" {"local_automation_v1" {"identity" identity}}}]
+        (is (= row (g/completion-admission (surface [row]) evt)))))
+    (testing "`native_text_v1.automation` is the fallback descriptor"
+      (let [row {"payload" {"native_text_v1" {"automation" {"identities" [identity]}}}}]
+        (is (= row (g/completion-admission (surface [row]) evt)))))
+    (testing "another producer's row never commits this turn"
+      (let [row {"payload" {"local_automation_v1" {"identities" ["[\"completion\",\"proc_b\",1]"]}}}]
+        (is (nil? (g/completion-admission (surface [row]) evt)))
+        (is (nil? (g/completion-admission (surface []) evt)))))))
+
+(deftest admission-recheck-hook-authority-gate
+  (is (nil? (g/admission-recheck-hook {}))
+      "absent = no session authority, as Hermes' guard")
+  (let [evt {"type" "completion" "session_id" "proc_a" "started_at" 1712345678}
+        hook (g/admission-recheck-hook
+              {:session-authority {}
+               :lookup-session (constantly {:session_id "owner-1"})
+               :route-owner (fn [_ _] "owner-1")
+               :list-admissions (fn [_ _]
+                                  [{"payload" {"local_automation_v1"
+                                               {"identities" [(g/producer-identity evt)]}}}])})]
+    (is (fn? hook))
+    (is (some? (hook evt)) "truthy = the turn is committed")
+    (is (nil? (hook (assoc evt "session_id" "proc_b"))) "a miss is not committed")))
+
+;; ---- display text (process_registry_notifications) ----
+
+(deftest process-completion-display-text-contract
+  (is (= "Background Process Finished: echo hi"
+         (process/process-completion-display-text
+          [{"completion_reason" "exited" "exit_code" 0 "command" "echo hi"}])))
+  (is (= "Background Process Failed (exit 1): echo hi"
+         (process/process-completion-display-text
+          [{"completion_reason" "exited" "exit_code" 1 "command" "echo hi"}])))
+  (is (= "Background Process Terminated: echo hi"
+         (process/process-completion-display-text
+          [{"completion_reason" "killed" "exit_code" 1 "command" "echo hi"}])))
+  (is (= "Background Process Lost: echo hi"
+         (process/process-completion-display-text
+          [{"completion_reason" "lost" "exit_code" "?" "command" "echo hi"}])))
+  (is (= "Background Process Failed to Start"
+         (process/process-completion-display-text
+          [{"completion_reason" "failed_start" "exit_code" "?" "command" ""}])))
+  (is (= "Background Process Finished"
+         (process/process-completion-display-text [{"exit_code" 0}])))
+  (is (= "2 Background Processes Finished"
+         (process/process-completion-display-text [{"exit_code" 0} {"exit_code" 0}])))
+  (testing "`_short_command` collapses whitespace and caps at 80"
+    (is (= "a b" (process/short-command "  a   b  ")))
+    (is (= 80 (count (process/short-command (apply str (repeat 90 "x"))))))))
+
+;; ---- coalescing text ----
+
+(deftest format-coalesced-process-completions-contract
+  (let [text (g/format-coalesced-process-completions
+              str
+              [["t" {"session_id" "proc_a" "exit_code" 0 "completion_reason" "exited"
+                     "output" "out-a"} nil]
+               ["t" {"session_id" "proc_b" "exit_code" nil "output" "out-b"} nil]])]
+    (is (= (str "[IMPORTANT: 2 background processes completed for this session.\n"
+                "Treat these results as one completion batch and send at most one "
+                "consolidated user-facing response.\n"
+                "\n- proc_a: exit_code=0, reason=exited\n"
+                "out-a\n"
+                "\n- proc_b: exit_code=None, reason=exited\n"
+                "out-b\n"
+                "If a result does not change the current conclusion, absorb it silently.]")
+           text)))
+  (testing "the output tail is cut to the newest 800 chars AFTER redaction"
+    (let [long-out (apply str (repeat 900 "x"))
+          text (g/format-coalesced-process-completions
+                str [["t" {"session_id" "p" "exit_code" 0 "output" long-out} nil]])]
+      (is (str/includes? text (str "[… truncated …]\n" (subs long-out 100)))))))
+
+;; ---- the fan-in ----
+
+(deftest enqueue-coalesces-same-route-key
+  (async done
+    (let [deliveries (atom [])
+          records (atom [])
+          surface {:deliver! (fn [synth evt] (swap! deliveries conj [synth evt]) true)
+                   :record-coalesced-siblings! (fn [evts] (swap! records conj evts))
+                   :batch-window 0.02}
+          fan-in (g/completion-fan-in surface)
+          enq (g/enqueue-hook fan-in)
+          evt-a {"type" "completion" "session_id" "proc_a" "started_at" 1
+                 "session_key" "s1" "platform" "telegram" "chat_type" ""
+                 "chat_id" "c1" "thread_id" "t1" "user_id" "u1"
+                 "parent_session_id" "" "origin_session_id" ""}
+          evt-b (assoc evt-a "session_id" "proc_b" "started_at" 2)]
+      (let [wa (enq "text-a" evt-a)
+            wb (enq "text-b" evt-b)]
+        (-> (p/let [ra wa rb wb]
+              (testing "one batch, one coalesced delivery, both waiters settle alike"
+                (is (= true ra))
+                (is (= true rb))
+                (is (= 1 (count @deliveries)))
+                (let [[synth candidate] (first @deliveries)]
+                  (is (str/starts-with? synth
+                      "[IMPORTANT: 2 background processes completed for this session."))
+                  (is (str/includes? synth "- proc_a: exit_code="))
+                  (is (str/includes? synth "- proc_b: exit_code="))
+                  (is (= "2 Background Processes Finished" (get candidate "_display_text")))))
+              (testing "`_record_coalesced_completion_siblings` covers every batched event"
+                (is (= [evt-a evt-b] (first @records))))
+              (done))
+            (p/catch (fn [e] (is (nil? e) (str e)) (done))))))))
+
+(deftest enqueue-keeps-route-pins-apart
+  (async done
+    (let [deliveries (atom [])
+          fan-in (g/completion-fan-in
+                  {:deliver! (fn [synth _evt] (swap! deliveries conj synth) true)
+                   :batch-window 0.02})
+          enq (g/enqueue-hook fan-in)
+          base {"type" "completion" "session_id" "proc_a" "started_at" 1
+                "session_key" "s1" "platform" "telegram" "chat_type" ""
+                "chat_id" "c1" "thread_id" "t1" "user_id" "u1"
+                "parent_session_id" "p1" "origin_session_id" ""}]
+      (let [wa (enq "text-a" base)
+            wb (enq "text-b" (assoc base "parent_session_id" "p2"))]
+        (-> (p/let [ra wa rb wb]
+              (testing "never settle one pin on another pin's acceptance"
+                (is (= true ra))
+                (is (= true rb))
+                (is (= 2 (count @deliveries)))
+                (is (= ["text-a" "text-b"] @deliveries)))
+              (done))
+            (p/catch (fn [e] (is (nil? e) (str e)) (done))))))))
+
+(deftest enqueue-delivery-outcomes-settle-the-waiters
+  (async done
+    (let [fan-in (g/completion-fan-in
+                  {:deliver! (fn [_synth _evt] false)
+                   :batch-window 0.01})
+          enq (g/enqueue-hook fan-in)
+          evt {"type" "completion" "session_id" "proc_a" "started_at" 1
+               "session_key" "s1"}]
+      (-> (p/let [r (enq "t" evt)]
+            (testing "a refusal settles False — the watcher's retry path"
+              (is (false? r)))
+            (let [fan-in-2 (g/completion-fan-in
+                            {:deliver! (fn [_synth _evt] nil)
+                             :batch-window 0.01})]
+              (p/let [r2 ((g/enqueue-hook fan-in-2) "t" evt)]
+                (testing "a dedupe/terminal result settles nil (delivered is not False)"
+                  (is (nil? r2)))
+                (done))))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest enqueue-drops-suppressed-and-refuses-while-stopping
+  (async done
+    (let [deliveries (atom [])
+          fan-in (g/completion-fan-in
+                  {:deliver! (fn [_synth _evt] (swap! deliveries conj 1) true)
+                   :batch-window 0.01})
+          enq (g/enqueue-hook fan-in)]
+      (-> (p/let [r1 (enq "t" {"type" "completion" "session_id" "p"
+                               "started_at" 1 "owner_task_id" "sub-child"})
+                  _ (g/cancel-completion-batches! fan-in)
+                  r2 (enq "t" {"type" "completion" "session_id" "p" "started_at" 2})]
+            (testing "raw child noise is dropped (None) when the profile does not opt in"
+              (is (nil? r1)))
+            (testing "a stopping fan-in refuses (False)"
+              (is (false? r2)))
+            (is (= [] @deliveries))
+            (done))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest cancel-settles-queued-waiters-retryable
+  (async done
+    (let [fan-in (g/completion-fan-in
+                  {:deliver! (fn [_synth _evt] true)
+                   :batch-window 0.5})
+          wa ((g/enqueue-hook fan-in) "t"
+              {"type" "completion" "session_id" "p" "started_at" 1})]
+      (g/cancel-completion-batches! fan-in)
+      (-> (p/let [ra wa]
+            (testing "shutdown cancellation: every waiter settles as retryable"
+              (is (false? ra)))
+            (done))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest flush-skips-already-admitted-entries
+  (async done
+    (let [deliveries (atom [])
+          evt-a {"type" "completion" "session_id" "proc_a" "started_at" 1 "exit_code" 0
+                 "session_key" "s1" "platform" "telegram" "chat_type" ""
+                 "chat_id" "c1" "thread_id" "t1" "user_id" "u1"
+                 "parent_session_id" "" "origin_session_id" ""}
+          evt-b (assoc evt-a "session_id" "proc_b" "started_at" 2)
+          admitted-row {"payload" {"local_automation_v1"
+                                   {"identities" [(g/producer-identity evt-a)]}}}
+          surface {:deliver! (fn [synth evt] (swap! deliveries conj [synth evt]) true)
+                   :session-authority {}
+                   :lookup-session (constantly {:session_id "owner-1"})
+                   :route-owner (fn [_ _] "owner-1")
+                   :list-admissions (fn [_ _] [admitted-row])
+                   :batch-window 0.02}
+          fan-in (g/completion-fan-in surface)
+          enq (g/enqueue-hook fan-in)]
+      (let [wa (enq "text-a" evt-a)
+            wb (enq "text-b" evt-b)]
+        (-> (p/let [ra wa rb wb]
+              (testing "an admitted event settles True without re-delivery"
+                (is (= true ra))
+                (is (= true rb))
+                (is (= 1 (count @deliveries)))
+                (is (= "text-b" (ffirst @deliveries)))
+                (is (= "Background Process Finished"
+                       (get (second (first @deliveries)) "_display_text"))))
+              (done))
+            (p/catch (fn [e] (is (nil? e) (str e)) (done))))))))
+
+;; ---- the live wiring into the watcher loop ----
+
+(deftest admission-hooks-drive-the-watcher-recheck
+  (async done
+    (let [attempts (atom [])
+          warns (atom [])
+          sends (atom [])
+          s (fake-session "proc_adm_a" {:exit-code 0 :output "" :started-at 1712345678000})
+          admission-calls (atom 0)
+          surface {:deliver! (fn [synth evt] (swap! attempts conj [synth evt]) false)
+                   :session-authority {}
+                   :lookup-session (constantly {:session_id "owner-1"})
+                   :route-owner (fn [_ _] "owner-1")
+                   ;; A lost ACK: the row is absent while the injection is refused
+                   ;; (calls 1-8, the flush filter) and committed at the recheck (call 9).
+                   :list-admissions (fn [_ _]
+                                      (if (> (swap! admission-calls inc) 8)
+                                        [{"payload"
+                                          {"local_automation_v1"
+                                           {"identities"
+                                            [(g/producer-identity
+                                              {"type" "completion" "session_id" "proc_adm_a"
+                                               "started_at" 1712345678})]}}}]
+                                        []))
+                   :batch-window 0.001}
+          fan-in (g/completion-fan-in surface)]
+      (-> (watcher/run-process-watcher!
+           (desc "proc_adm_a")
+           {:config {"display" {"background_process_notifications" "concise"}}
+            :session-fn (fn [_] s)
+            :send! (fn [& args] (swap! sends conj args))
+            :enqueue! (g/enqueue-hook fan-in)
+            :admission-recheck (g/admission-recheck-hook surface)
+            :warn-fn (fn [& xs] (swap! warns conj xs))
+            :sleep-fn (fn [_] (reset! (:state s) :exited) (p/resolved nil))})
+          (p/then (fn [_]
+                    (testing "8 refusals, then `completion_admission` commits: no fall-back notice"
+                      (is (= 8 (count @attempts)))
+                      (is (= [] @warns))
+                      (is (= [] @sends)))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest admission-hooks-fall-back-when-not-committed
+  (async done
+    (let [attempts (atom [])
+          warns (atom [])
+          sends (atom [])
+          s (fake-session "proc_adm_b" {:exit-code 0 :output "" :started-at 1712345678000})
+          surface {:deliver! (fn [_synth _evt] (swap! attempts conj 1) false)
+                   :session-authority {}
+                   :lookup-session (constantly {:session_id "owner-1"})
+                   :route-owner (fn [_ _] "owner-1")
+                   :list-admissions (fn [_ _] [])
+                   :batch-window 0.001}
+          fan-in (g/completion-fan-in surface)]
+      (-> (watcher/run-process-watcher!
+           (desc "proc_adm_b")
+           {:config {"display" {"background_process_notifications" "concise"}}
+            :session-fn (fn [_] s)
+            :send! (fn [& args] (swap! sends conj args))
+            :enqueue! (g/enqueue-hook fan-in)
+            :admission-recheck (g/admission-recheck-hook surface)
+            :warn-fn (fn [& xs] (swap! warns conj xs))
+            :sleep-fn (fn [_] (reset! (:state s) :exited) (p/resolved nil))})
+          (p/then (fn [_]
+                    (testing "no admission row: the fall-back notice fires"
+                      (is (= 8 (count @attempts)))
+                      (is (= [["Process watcher: completion for proc_adm_b was refused 8 times; falling back to the notify_mode=concise notice"]]
+                             @warns))
+                      (is (= 1 (count @sends)))
+                      (is (str/starts-with? (nth (first @sends) 3)
+                                            "✅ Background task finished — `echo hi`")))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))

@@ -138,8 +138,20 @@ gate defaults False), `gateway/platforms/base.py`'s send surface (`send` /
 the `_non_conversational_metadata` merge — `non_conversational` on Discord
 only — and `Watcher delivery error: %s` suppression) and `run.py
 _gateway_platform_value` / `_non_conversational_metadata`, bound as the
-loop's `:send!` by `gateway/send-hook`; wiring a live messaging gateway to
-the `:enqueue!` / `:admission-recheck` admission hooks remains. Kotoba `execute_code` runs one confined, stateless Python source string and does not expose `hermes_tools` RPC. Kotoba `session_search` reads only the current profile's local `state.db` and supports bounded browse, FTS discovery, read, and scroll; cross-profile lookup and Hermes adaptive detail are not implemented. `hermes-cli`/`hermes-cron` retain Hermes' full core inventory and refuse to start when any selected tool is unsupported, rather than silently presenting a reduced bundle |
+loop's `:send!` by `gateway/send-hook`; the loop's `:enqueue!` /
+`:admission-recheck` are bound live by `gateway/enqueue-hook` /
+`gateway/admission-recheck-hook` over the same surface — the admission fan-in
+is `_enqueue_process_completion_notification` /
+`_flush_process_completion_batch` verbatim (the `should_surface_notification`
+drop, the route-key batching over `_COMPLETION_BATCH_KEY_FIELDS` +
+`parent_session_id` / `origin_session_id`, the 0.1 s coalescing window,
+`_format_coalesced_process_completions`, `process_completion_display_text`'s
+`_display_text`, the `_automation_identities` merge, the already-admitted
+skip, `_record_coalesced_completion_siblings`, and waiter settlement — True /
+None / False, `_cancel_process_completion_batch_tasks` settles retryable),
+with `completion_admission` / `producer_identity` matching the admission rows
+(`local_automation_v1` / `native_text_v1.automation`) of the entry's route
+owner and the lost-ACK `committed` break. Kotoba `execute_code` runs one confined, stateless Python source string and does not expose `hermes_tools` RPC. Kotoba `session_search` reads only the current profile's local `state.db` and supports bounded browse, FTS discovery, read, and scroll; cross-profile lookup and Hermes adaptive detail are not implemented. `hermes-cli`/`hermes-cron` retain Hermes' full core inventory and refuse to start when any selected tool is unsupported, rather than silently presenting a reduced bundle |
 | `cron/jobs.json` (including `monitor_script` / `monitor_url`), 5-field cron / interval / once schedules | read and written in Hermes' format; Kotoba can create, list, and update monitor jobs, then evaluates the monitor before the agent turn |
 | Pre-run script extensions `.sh`/`.bash`, `.cljk`, `.js`/`.mjs`, `.py`, `.hy` | extension dispatch; `.hy` runs through `hy.cmdline.hy_main` with the job/config-selected Python, which must have Hy installed |
 | cron prompt: `_CRON_HINT`, `## Script Output` / `## Script Error` block, empty stdout and `{"wakeAgent": false}` skip, `[SILENT]`, `[CRON_FAILURE]` | identical text and semantics |

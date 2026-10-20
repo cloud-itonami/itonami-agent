@@ -1257,6 +1257,40 @@
       (= 0 (get evt "exit_code" "?")) "completed normally"
       :else "exited")))
 
+(defn short-command
+  "Hermes `process_registry_notifications._short_command`, verbatim: the
+  command collapsed onto one line, `...` appended when over 80 chars."
+  [command]
+  (let [cmd (str/join " " (remove str/blank? (str/split (str (or command "")) #"\s+")))]
+    (if (> (count cmd) 80)
+      (str (subs cmd 0 77) "...")
+      cmd)))
+
+(defn process-completion-display-text
+  "Hermes `process_registry_notifications.process_completion_display_text`,
+  verbatim: the compact UI title for one or more process completions; the
+  model text keeps the full output."
+  [events]
+  (if (not= 1 (count events))
+    (str (count events) " Background Processes Finished")
+    (let [evt (first events)
+          reason (or (get evt "completion_reason") "exited")
+          exit-code (get evt "exit_code" "?")
+          clean? (and (number? exit-code) (zero? exit-code))
+          outcome (cond
+                    (= reason "killed") "Terminated"
+                    (contains? reason-status reason) (if (= reason "lost") "Lost" "Failed to Start")
+                    :else (if clean? "Finished" "Failed"))
+          cmd (short-command (get evt "command"))
+          detail (if (and (not= reason "killed")
+                          (not (contains? reason-status reason))
+                          (not clean?))
+                   (str " (exit " (if (nil? exit-code) "None" exit-code) ")")
+                   "")]
+      (if (and cmd (not= cmd ""))
+        (str "Background Process " outcome detail ": " cmd)
+        (str "Background Process " outcome detail)))))
+
 (defn- delegation-attribution-line
   "Hermes `process_registry_notifications._delegation_attribution_line`,
   verbatim (Kotoba subagent ids are `sub-…`, Hermes' `sa-…`): the
