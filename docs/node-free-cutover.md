@@ -531,3 +531,25 @@ node:sqlite port 最後の consumer（tools、121 SQL）の査定。正体は
 parity notes: claim_expires / heartbeat / block_kind（時計・再発）は
 open。row のフィールドに改行は入れない（journal_core piece 列のため —
 改行を含む result は events の length-prefix codec 側で扱う）。
+
+## 計測 17: task_links グラフ port — node 無しで完走（2026-10-21、boot84.log）
+
+計測 14 設計第 3 スライス（tools の task_links、14 SQL）— 査定で
+「唯一の新設計面」としたグラフ系。**忠実な UNION 去重を実現**:
+
+- 設計: parent ごとの journal（child id の行）+ DFS の visited に
+  **:string-index**（string-index-new/assoc/contains/count）。実測:
+  string-index 群は **3 target で runtime 可・native compile 可**。
+- `WITH RECURSIVE descendants ... UNION` の意味（重複 1 回）を
+  DFS + visited で完全再現。相互再帰（dfs ↔ dfs-children）は
+  subset で許容。
+- guest 実行（node 無し）: diamond a→b, a→c, b→d, c→d の
+  link-add 4 + 重複 add 0 → children 2 / child-at 1 = "c" /
+  has(a,b) 1 / has(a,d) 0（直接辺なし）→
+  **descendants(a) = 3（d を 1 回のみ）** / descendants(b) = 1 →
+  `LKRESULT:3:1` / `:ok :result 1`。
+- 9-module graph の native compile 成功。
+
+これで node:sqlite port（計測 8）の store 面は **全テーブルの設計・実装・
+guest 実証が揃った**（残: task_runs / messages = 既存パターンの薄い面と
+incidents、および .cljk 側の呼び出し差し替え）。

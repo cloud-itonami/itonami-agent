@@ -1,0 +1,83 @@
+(ns itonami.links
+  "The task_links graph port (ledger 8 design A, consumer 4 slice 3): one
+  journal per parent id holding child ids (notepad's hashed naming). The
+  SQLite shapes: INSERT OR IGNORE (link-add dedupes by scan),
+  SELECT child_id WHERE parent_id (link-child-at / link-count / link-has),
+  and WITH RECURSIVE ... UNION descendants -- reproduced EXACTLY by a
+  depth-first walk carrying a :string-index visited set (measured: the
+  string-index builtins run on jvm-kir/js/wasm AND compile native), so the
+  diamond graph counts each node once.
+
+  Shape rule measured earlier: typed-cap-call only in a typed defn's return
+  position."
+  (:require [itonami.journal :as j]
+            [itonami.notepad :as np])
+  (:export [link-add link-count link-child-at link-has link-descendants])
+  (:capabilities #{:fs/app-data}))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- exists? [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn- ppath [base :string parent :string] :string
+  (np/note-path base (string-concat "p" parent)))
+
+(defn- has-run [q :string child :string i :i64 n :i64] :i64
+  (if (>= i n)
+    0
+    (if (string=? (j/journal-entry q i) child)
+      1
+      (has-run q child (+ i 1) n))))
+
+(defn link-add [base :string parent :string child :string] :i64
+  (if (= 0 (string-length parent))
+    0
+    (if (= 0 (string-length child))
+      0
+      (let [q (ppath base parent)]
+        (let [n (j/journal-count q)]
+          (if (= 1 (has-run q child 0 n))
+            0
+            (let [a (j/journal-append q child)]
+              1)))))))
+
+(defn link-count [base :string parent :string] :i64
+  (let [q (ppath base parent)]
+    (if (= 0 (exists? q))
+      0
+      (j/journal-count q))))
+
+(defn link-child-at [base :string parent :string i :i64] :string
+  (let [q (ppath base parent)]
+    (if (= 0 (exists? q))
+      ""
+      (j/journal-entry q i))))
+
+(defn link-has [base :string parent :string child :string] :i64
+  (let [q (ppath base parent)]
+    (if (= 0 (exists? q))
+      0
+      (has-run q child 0 (j/journal-count q)))))
+
+(defn- dfs-children [base :string node :string visited :string-index i :i64 n :i64] :string-index
+  (if (>= i n)
+    visited
+    (dfs-children base node (dfs base (link-child-at base node i) visited)
+                  (+ i 1) n)))
+
+(defn- dfs [base :string node :string visited :string-index] :string-index
+  (if (string-index-contains visited node)
+    visited
+    (let [v (string-index-assoc visited node 1)]
+      (dfs-children base node v 0 (link-count base node)))))
+
+(defn link-descendants [base :string root :string] :i64
+  ;; distinct descendants, exactly the WITH RECURSIVE ... UNION semantics
+  ;; (the root itself is visited for cycle safety and subtracted).
+  (let [v (dfs base root (string-index-new))]
+    (- (string-index-count v) 1)))

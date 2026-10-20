@@ -1,0 +1,28 @@
+(ns links-probe
+  "Guest evidence for the task_links graph port: INSERT OR IGNORE dedupe,
+  children walks, and WITH RECURSIVE ... UNION descendants -- the diamond
+  a->b, a->c, b->d, c->d must count d exactly once."
+  (:require [itonami.links :as g])
+  (:export [links-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn links-probe [] :i64
+  (let [a1 (g/link-add "/data/lk" "a" "b")
+        a2 (g/link-add "/data/lk" "a" "c")
+        a3 (g/link-add "/data/lk" "b" "d")
+        a4 (g/link-add "/data/lk" "c" "d")
+        dup (g/link-add "/data/lk" "a" "b")
+        cnt (g/link-count "/data/lk" "a")
+        kid (g/link-child-at "/data/lk" "a" 1)
+        has (g/link-has "/data/lk" "a" "b")
+        nodirect (g/link-has "/data/lk" "a" "d")
+        desc (g/link-descendants "/data/lk" "a")
+        descb (g/link-descendants "/data/lk" "b")
+        say (wire-say (string-concat "LKRESULT:" (string-concat (string-from-i64 desc) (string-concat ":" (string-from-i64 descb)))))]
+    (if (and (= 1 a1) (= 1 a2) (= 1 a3) (= 1 a4) (= 0 dup)
+             (= 2 cnt) (string=? "c" kid) (= 1 has) (= 0 nodirect)
+             (= 3 desc) (= 1 descb))
+      1 0)))
