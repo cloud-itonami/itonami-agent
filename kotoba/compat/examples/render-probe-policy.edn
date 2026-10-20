@@ -1,0 +1,1 @@
+{:allow #{[:cap/call :fs/app-data] [:cap/call :fs/browse] [:cap/call :hash/sha256] [:cap/call :io/write]}}
