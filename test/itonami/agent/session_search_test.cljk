@@ -1,0 +1,151 @@
+(ns itonami.agent.session-search-test
+  "Hermes `tools/session_search_tool.py` cross-profile lookup
+  (`_resolve_profile_db` + `hermes_cli/profiles.py` name gates) and the
+  discovery `detail` modes (`_hydrate_hit` adaptive/full hydration)."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [itonami.agent.host :as h]
+            [itonami.agent.tools :as tools]
+            ["node:sqlite" :as sqlite]))
+
+(defn- make-state-db!
+  "A minimal Hermes-shaped state.db: `sessions`, `messages`, `messages_fts`
+  (FTS5 rowid = messages.id, as the discover SQL joins them)."
+  [path sessions messages]
+  (h/mkdirs (h/dirname path))
+  (let [db (sqlite/DatabaseSync. path)]
+    (.exec db (str "CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, started_at INTEGER, "
+                   "message_count INTEGER, source TEXT, hidden INTEGER, last_activity_at INTEGER, "
+                   "parent_session_id TEXT, end_reason TEXT, model TEXT)"))
+    (.exec db (str "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, "
+                   "content TEXT, timestamp INTEGER, active INTEGER, compacted INTEGER)"))
+    (.exec db "CREATE VIRTUAL TABLE messages_fts USING fts5(content)")
+    (doseq [s sessions]
+      (let [st (.prepare db (str "INSERT INTO sessions (id, title, started_at, message_count, "
+                                 "source, hidden, last_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?)"))]
+        (js/Reflect.apply (.-run st) st
+          (clj->js [(str (:id s)) (:title s) (:started s)
+                    (count (filter #(= (:id s) (:session %)) messages))
+                    (or (:source s) "chat") (if (:hidden s) 1 0) (:started s)]))))
+    (doseq [m messages]
+      (let [st (.prepare db (str "INSERT INTO messages (id, session_id, role, content, timestamp, "
+                                 "active, compacted) VALUES (?, ?, ?, ?, ?, 1, 0)"))
+            st2 (.prepare db "INSERT INTO messages_fts (rowid, content) VALUES (?, ?)")]
+        (js/Reflect.apply (.-run st) st
+          (clj->js [(:id m) (str (:session m)) (:role m) (:content m) (or (:timestamp m) 1000)]))
+        (js/Reflect.apply (.-run st2) st2 (clj->js [(:id m) (:content m)]))))
+    (.close db)))
+
+(defn- call [ctx args] (h/json-parse (tools/session-search ctx args)))
+
+(deftest cross-profile-lookup
+  ;; Hermes session_search_tool.session_search: the `profile` argument and a raw
+  ;; `@session:<profile>/<id>` link as session_id swap in the named profile's
+  ;; state.db (read-only) for every shape; a bare id never scans other profiles
+  ;; (_read_scoped's miss hint).
+  (let [root (h/join (h/tmp-dir) (str "itonami-session-search-" (h/random-hex 4)))
+        work (h/join root "profiles" "work")
+        other (h/join root "profiles" "other")]
+    (make-state-db! (h/join work "state.db")
+                    [{:id "w1" :title "work" :started 100}]
+                    [{:id 1 :session "w1" :role "user" :content "work only"}])
+    (make-state-db! (h/join other "state.db")
+                    [{:id "o1" :title "other" :started 200}]
+                    [{:id 1 :session "o1" :role "user" :content "cross profile needle"}
+                     {:id 2 :session "o1" :role "assistant" :content "answer"}])
+    (let [ctx {:home work :cwd work}]
+      (testing "profile= swaps in the named profile's state.db for every shape"
+        (let [res (call ctx {"session_id" "o1" "profile" "other"})]
+          (is (= "read" (get res "mode")))
+          (is (= ["cross profile needle" "answer"]
+                 (mapv #(get % "content") (get res "results"))))))
+      (testing "a raw @session:<profile>/<id> link splits on '/' at the name gate (Hermes source: no prefix strip)"
+        (let [res (call ctx {"session_id" "@session:other/o1"})]
+          (is (str/includes? (str (get res "error")) "'@session:other' is not a valid profile name"))))
+      (testing "the <profile>/<id> form resolves (ids never contain '/')"
+        (let [res (call ctx {"session_id" "other/o1"})]
+          (is (= "read" (get res "mode")))
+          (is (= ["cross profile needle" "answer"]
+                 (mapv #(get % "content") (get res "results"))))))
+      (testing "an explicit profile= wins over the link's embedded profile"
+        (let [res (call ctx {"session_id" "other/o1" "profile" "other"})]
+          (is (= "read" (get res "mode")))
+          (is (= 2 (count (get res "results"))))))
+      (testing "unknown profile: Hermes' verbatim wrapper over the existence gate"
+        (let [res (call ctx {"session_id" "x" "profile" "nope"})]
+          (is (= "profile 'nope': profile 'nope' does not exist" (get res "error")))))
+      (testing "invalid profile names fail at normalize/validate (reserved, grammar)"
+        (let [res (call ctx {"session_id" "x" "profile" "@session:foo"})]
+          (is (str/includes? (str (get res "error")) "is not a valid profile name")))
+        (let [res (call ctx {"session_id" "x" "profile" "root"})]
+          (is (str/includes? (str (get res "error")) "is reserved"))))
+      (testing "a bare id misses with _read_scoped's hint (no cross-profile scan)"
+        (let [res (call ctx {"session_id" "o1"})]
+          (is (str/includes? (str (get res "error")) "session_id not found in this profile: o1"))
+          (is (str/includes? (str (get res "error")) "pass profile=<name>"))))
+      (testing "default resolves to the store root (hermes_cli.profiles.get_profile_dir)"
+        (let [res (call ctx {"session_id" "w1" "profile" "default"})]
+          ;; the store root exists but holds no state.db: the existence gate
+          ;; passes and the read-only open fails, wrapped exactly as Hermes
+          ;; wraps _resolve_profile_db errors (upstream's SessionDB open-error
+          ;; text is not pinned here).
+          (is (str/includes? (str (get res "error")) "profile 'default':")))
+        (is (not (h/file? (h/join root "state.db"))))))
+    (h/rm root)))
+
+(deftest discovery-adaptive-detail
+  ;; Hermes `_hydrate_hit`: adaptive fully hydrates only the top-ranked hit
+  ;; (anchored window + bookends, detail "full"); lower hits carry just the
+  ;; anchor message (detail "compact"). `detail: "full"` hydrates every hit.
+  (let [root (h/join (h/tmp-dir) (str "itonami-session-search-" (h/random-hex 4)))
+        work (h/join root "profiles" "work")
+        s1-msgs (vec (for [i (range 1 21)]
+                       {:id i :session "s1" :role (if (odd? i) "user" "assistant")
+                        :content (if (= i 10) "the needle one" (str "filler " i))}))
+        s2-msgs (vec (for [i (range 21 29)]
+                       {:id i :session "s2" :role (if (odd? i) "user" "assistant")
+                        :content (if (= i 24) "the needle two" (str "filler " i))}))]
+    (make-state-db! (h/join work "state.db")
+                    [{:id "s1" :title "alpha" :started 100}
+                     {:id "s2" :title "beta" :started 200}]
+                    (into s1-msgs s2-msgs))
+    (let [ctx {:home work :cwd work}
+          by-sid (fn [res] (into {} (map (juxt #(get % "session_id") identity) (get res "results"))))]
+      (testing "adaptive (default): top hit full, the rest compact"
+        (let [res (call ctx {"query" "needle"})]
+          (is (= "discover" (get res "mode")))
+          (is (= "adaptive" (get res "detail")))
+          (is (= 2 (get res "count")))
+          (is (= "full" (get-in res ["results" 0 "detail"])))
+          (is (< 1 (count (get-in res ["results" 0 "messages"]))))
+          (is (true? (some #(get % "anchor") (get-in res ["results" 0 "messages"]))))
+          (let [compact (get-in res ["results" 1])]
+            (is (= "compact" (get compact "detail")))
+            (is (= 1 (count (get compact "messages"))))
+            (is (true? (get (first (get compact "messages")) "anchor")))
+            (is (= [] (get compact "bookend_start")))
+            (is (= [] (get compact "bookend_end"))))))
+      (testing "full: every hit hydrated with window + bookends (case-insensitive)"
+        (let [res (call ctx {"query" "needle" "detail" "FULL"})
+              m (by-sid res)]
+          (is (= "full" (get res "detail")))
+          (is (every? #(= "full" (get % "detail")) (get res "results")))
+          (let [e (get m "s1")]
+            ;; anchor id 10 of 20: window rn 5..15 (11 rows), bookends 3 + 3,
+            ;; 4 rows before / 5 after the window.
+            (is (= 11 (count (get e "messages"))))
+            (is (= 4 (get e "messages_before")))
+            (is (= 5 (get e "messages_after")))
+            (is (= ["filler 1" "filler 2" "filler 3"]
+                   (mapv #(get % "content") (get e "bookend_start"))))
+            (is (= ["filler 18" "filler 19" "filler 20"]
+                   (mapv #(get % "content") (get e "bookend_end"))))
+            (is (true? (some #(get % "anchor") (get e "messages")))))
+          (let [e (get m "s2")]
+            ;; anchor id 24 of 8 rows: the whole session is the window.
+            (is (= 8 (count (get e "messages"))))
+            (is (= 0 (get e "messages_before")))
+            (is (= 0 (get e "messages_after")))
+            (is (= [] (get e "bookend_start")))
+            (is (= [] (get e "bookend_end")))))))
+    (h/rm root)))
