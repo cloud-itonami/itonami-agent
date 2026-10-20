@@ -847,7 +847,7 @@
                                  ;; `arm_heartbeat`'s floor-clamped return value
                                  (pos? hb-armed) (assoc "heartbeat_seconds" hb-armed)
                                  ;; Hermes: only an armed (post-conflict) list is echoed
-                                 (seq (:watch-patterns disp)) (assoc "watch_patterns" (vec (:watch-patterns disp)))))))))))))
+                                 (seq (:watch-patterns disp)) (assoc "watch_patterns" (vec (:watch-patterns disp))))))))))))
 
 (defn- resolve-session [ctx requested]
   (let [matches (filter (fn [[id s]] (and (= (:home ctx) (:home s))
