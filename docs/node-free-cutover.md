@@ -672,3 +672,25 @@ amu の修正候補として記録（gap 1 と同じ runbook）。
 実装罠（テストが捕捉）: row-handoff のフィールド index が 1 つずれ
 （5 フィールド codec で 4 が正）。加えて edit の anchor 不一致・export
 漏れは link エラーになる運用教訓を再確認。
+
+## 計測 23: tasks の module parity 面 — node 無しで完走（2026-10-21、boot94.log）
+
+.cljk 差し替え consumer 4（tools.cljk の tasks 面の残 parity）:
+
+- **block の measured 条件を忠実に実装**: `SET block_kind=?, block_recurrences=1
+  WHERE id=? AND status='blocked' AND block_kind IS NULL AND
+  current_run_id IS NULL` — 3 条件すべて from-conditional flip で検査。
+  block 列の消去（unblock 側）と current_run_id の set/clear
+  （`SET current_run_id=NULL WHERE id=?`）も measured form どおり。
+- row codec を 7 列（status/assignee/lock/run/result/block_kind/
+  block_recurrences）に拡張（row-encode7、既存呼び出し互換）。
+- guest 実行（node 無し）: create → set-run("r9") → **run 設定中の
+  set-block → 0**（current_run_id IS NULL 条件）→ clear-run →
+  transition→blocked → **set-block → 1** → 再 set-block → 0 ×2 →
+  block_recurrences "1" → clear-block → block_kind "" → unblock 遷移 →
+  `TS2RESULT:r9:1` / `:ok :result 1`。
+- tasks_state 9/9 緑、native compile 成功。
+
+実装罠（probe が捕捉）: 初回 set-block の期待値を 0 と書いていたが
+measured 条件を満たせば 1 が正 → probe 修正と同時に「run 設定中は拒否」の
+負ケースを追加して両方向を pin。

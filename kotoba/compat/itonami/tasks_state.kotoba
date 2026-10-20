@@ -10,8 +10,9 @@
   when the row is in the expected status. Self-contained: native-qualified
   ops."
   (:require [itonami.journal-core :as jc])
-  (:export [status-code status-name row-encode row-status row-field
-            test-status test-row]))
+  (:export [status-code status-name row-encode row-encode7 row-status row-field
+            row-block-kind row-block-rec
+            test-status test-row test-block-fields]))
 
 (defn status-code [name :string] :i64
   ;; todo ready claimed running blocked review done -> 0..6; else -1.
@@ -57,12 +58,35 @@
     (jc/piece content "
 " n)))
 
+(defn row-encode7 [status :i64 assignee :string lock :string run :string result :string
+                    block-kind :string block-rec :string] :string
+  ;; seven columns: status / assignee / lock / run / result / block_kind /
+  ;; block_recurrences (the measured tasks-table columns this slice owns).
+  (string-concat (row-encode status assignee lock run result)
+                 (string-concat "
+" (string-concat block-kind (string-concat "
+" block-rec)))))
+
+(defn row-block-kind [content :string] :string
+  (row-field content 5))
+
+(defn row-block-rec [content :string] :string
+  (row-field content 6))
+
 (defn test-status [] :bool
   (and (= 0 (status-code "todo"))
        (= 6 (status-code "done"))
        (= -1 (status-code "nope"))
        (string=? "running" (status-name 3))
        (string=? "" (status-name 9))))
+
+(defn test-block-fields [] :bool
+  (let [c (row-encode7 4 "alice" "L" "r9" "" "oom" "1")]
+    (and (string=? "oom" (row-block-kind c))
+         (string=? "1" (row-block-rec c))
+         (= 4 (row-status c))
+         (string=? "r9" (row-field c 3))
+         (string=? "" (row-block-kind (row-encode 0 "a" "" "" ""))))))
 
 (defn test-row [] :bool
   (and (= 2 (row-status (row-encode 2 "alice" "L1" "r1" "")))

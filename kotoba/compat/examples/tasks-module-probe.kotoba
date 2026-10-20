@@ -1,0 +1,32 @@
+(ns tasks-module-probe
+  "Guest evidence for the tasks module parity surface: the measured block
+  conditions (status='blocked' AND block_kind IS NULL AND run IS NULL),
+  block column clearing, and run id set/clear."
+  (:require [itonami.tasks :as t])
+  (:export [tasks-module-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn tasks-module-probe [] :i64
+  (let [c (t/task-create "/data/ts2" "t1" 1)
+        sr (t/task-set-run "/data/ts2" "t1" "r9")
+        run1 (t/task-get-field "/data/ts2" "t1" 3)
+        br0 (t/task-set-block "/data/ts2" "t1" "oom")
+        cr (t/task-clear-run "/data/ts2" "t1")
+        run2 (t/task-get-field "/data/ts2" "t1" 3)
+        tb (t/task-transition "/data/ts2" "t1" 1 4)
+        blk0 (t/task-set-block "/data/ts2" "t1" "oom")
+        blk1 (t/task-set-block "/data/ts2" "t1" "oom")
+        blk2 (t/task-set-block "/data/ts2" "t1" "oom")
+        rec (t/task-block-rec "/data/ts2" "t1")
+        cb (t/task-clear-block "/data/ts2" "t1")
+        kind (t/task-get-field "/data/ts2" "t1" 5)
+        ub (t/task-transition "/data/ts2" "t1" 4 1)
+        say (wire-say (string-concat "TS2RESULT:" (string-concat run1 (string-concat ":" rec))))]
+    (if (and (= 1 c) (= 1 sr) (string=? "r9" run1) (= 0 br0)
+             (= 1 cr) (= 0 (string-length run2))
+             (= 1 tb) (= 1 blk0) (= 0 blk1) (= 0 blk2) (string=? "1" rec)
+             (= 1 cb) (= 0 (string-length kind)) (= 1 ub))
+      1 0)))
