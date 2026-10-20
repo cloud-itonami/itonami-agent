@@ -1,0 +1,15 @@
+(ns probe-store
+  (:export [store-probe])
+  (:capabilities #{:fs/app-data :io/write}))
+(defn store-probe [] :i64
+  (let [m0 (typed-cap-call :io/write :string :string "PHASE:EXISTS1:")
+        e1 (typed-cap-call :fs/app-data :string :string "/data/store-probe.txtEXISTS_SEP")
+        m1 (typed-cap-call :io/write :string :string (string-concat "ANS1:" e1))
+        m2 (typed-cap-call :io/write :string :string "PHASE:WRITE:")
+        w (typed-cap-call :fs/app-data :string :string "/data/store-probe.txtWRITE_SEPAAA")
+        m3 (typed-cap-call :io/write :string :string "PHASE:APPEND:")
+        a (typed-cap-call :fs/app-data :string :string "/data/store-probe.txtAPPEND_SEPBB")
+        m4 (typed-cap-call :io/write :string :string "PHASE:READ:")
+        r (typed-cap-call :fs/app-data :string :string "/data/store-probe.txt")
+        m5 (typed-cap-call :io/write :string :string (string-concat "STORE_READ:" r))]
+    (if (string=? r "AAABB") 1 0)))
