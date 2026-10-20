@@ -1,0 +1,68 @@
+(ns itonami.runs
+  "The task_runs port (ledger 8 design A, consumer 4 slice 4): per-run state
+  files (notepad's hashed naming) reusing the tasks-state codec. Field
+  mapping (measured table shape): 0 status digit / 1 profile / 2 task id /
+  3 outcome. The SQLite UPDATE ... WHERE id forms reduce to the same
+  from-conditional flip as the tasks table.
+
+  Parity notes: timestamps columns folded out (clock wiring)."
+  (:require [itonami.tasks-state :as ts]
+            [itonami.notepad :as np])
+  (:export [run-create run-status run-set run-get-field])
+  (:capabilities #{:fs/app-data}))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- exists? [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn- rpath [base :string run :string] :string
+  (np/note-path base (string-concat "r" run)))
+
+(defn run-create [base :string run :string task :string profile :string] :i64
+  (if (= 0 (string-length run))
+    0
+    (let [p (rpath base run)]
+      (if (= 1 (exists? p))
+        0
+        (let [w (wire-write p (ts/row-encode 0 profile task "" ""))]
+          1)))))
+
+(defn run-status [base :string run :string] :i64
+  (let [p (rpath base run)]
+    (if (= 0 (exists? p))
+      -1
+      (let [content (wire-read p)]
+        (ts/row-status content)))))
+
+(defn run-get-field [base :string run :string n :i64] :string
+  (let [p (rpath base run)]
+    (if (= 0 (exists? p))
+      ""
+      (let [content (wire-read p)]
+        (ts/row-field content n)))))
+
+(defn run-set [base :string run :string from :i64 to :i64 outcome :string] :i64
+  (if (or (< to 0) (> to 6))
+    0
+    (let [p (rpath base run)]
+      (if (= 0 (exists? p))
+        0
+        (let [content (wire-read p)]
+          (if (= from (ts/row-status content))
+            (let [w (wire-write p (ts/row-encode to (ts/row-field content 1)
+                                                  (ts/row-field content 2)
+                                                  outcome ""))]
+              1)
+            0))))))
