@@ -7,15 +7,25 @@
   fail-closed (0 / empty) before any wire write, so an oversized write leaves
   the store untouched -- parity with notepad.cljk.
 
-  No derived key index (measured 2026-10-21): the listing reads the store
-  itself (amu#1423 made the browse provider heap-free and cap-free), so set
-  and delete never maintain a second copy of the key list.
+  The documented caps are complete here (measured 2026-10-21): key <= 128
+  characters, value <= 16KB (notepad-core), and the 64KB per-job total is
+  enforced before every write by summing the store (browse over the job's
+  key files + each entry's content length) -- the bounded directory scan the
+  old note called open until amu#1423 made browse production-usable. The new
+  entry's bytes count too, and the target key's old file is excluded (an
+  upsert accounts correctly).
+
+  No derived key index: the listing reads the store itself, so set and
+  delete never maintain a second copy of the key list.
 
   Shape rule measured earlier: typed-cap-call only in a typed defn's return
   position."
-  (:require [itonami.notepad-core :as core])
+  (:require [itonami.notepad-core :as core]
+            [itonami.journal-core :as jc])
   (:export [note-path note-stored-key notepad-set notepad-get notepad-delete])
-  (:capabilities #{:fs/app-data :hash/sha256}))
+  (:capabilities #{:fs/app-data :hash/sha256 :fs/browse}))
+
+(def max-job-total-bytes 65536)
 
 (defn- wire-hash [key :string] :string
   (typed-cap-call :hash/sha256 :string :string key))
@@ -32,6 +42,9 @@
 
 (defn- wire-unlink [path :string] :string
   (typed-cap-call :fs/app-data :string :string (string-concat path "UNLINK_SEP")))
+
+(defn- wire-browse [dir :string] :string
+  (typed-cap-call :fs/browse :string :string dir))
 
 (defn- exists? [path :string] :i64
   (let [a (wire-exists path)]
@@ -58,14 +71,55 @@
           ""
           (string-substring content 0 i))))))
 
+(defn- entry-name [line :string] :string
+  (jc/piece line "	" 0))
+
+(defn- note-file? [name :string] :i64
+  (if (= 0 (string-length name))
+    0
+    (if (not (= 110 (string-code-point-at name 0)))
+      0
+      (if (< (string-length name) 5)
+        0
+        (if (string=? (string-substring name (- (string-length name) 4) (string-length name)) ".txt")
+          1
+          0)))))
+
+(defn- other-bytes-run [base :string skip :string listing :string i :i64 n :i64 acc :i64] :i64
+  ;; the store's bytes excluding the upsert target's file -- the SQL
+  ;; SUM(LENGTH(key)+LENGTH(value)) WHERE key<>? shape over file contents.
+  (if (>= i n)
+    acc
+    (let [name (entry-name (jc/piece listing "
+" i))]
+      (let [acc2 (if (= 1 (note-file? name))
+                   (if (string=? name skip)
+                     acc
+                     (let [c (wire-read (string-concat base (string-concat "/" name)))]
+                       (+ acc (string-length c))))
+                   acc)]
+        (other-bytes-run base skip listing (+ i 1) n acc2)))))
+
+(defn- other-bytes [base :string skip :string] :i64
+  (let [listing (wire-browse base)]
+    (if (= 0 (string-length listing))
+      0
+      (other-bytes-run base skip listing 0 (jc/count-pieces listing "
+") 0))))
+
 (defn notepad-set [base :string key :string value :string] :i64
   (if (= 0 (core/key-ok key))
     0
     (if (= 0 (core/value-ok value))
       0
       (let [p (note-path base key)]
-        (let [r (wire-write p (core/entry-encode key value))]
-          1)))))
+        (let [skip (string-concat "n" (string-concat (core/hex-encode (wire-hash key)) ".txt"))
+              entry (+ (string-length key) (string-length value))
+              others (other-bytes base skip)]
+          (if (> (+ others entry) max-job-total-bytes)
+            0
+            (let [r (wire-write p (core/entry-encode key value))]
+              1)))))))
 
 (defn notepad-get [base :string key :string] :string
   (let [p (note-path base key)]
