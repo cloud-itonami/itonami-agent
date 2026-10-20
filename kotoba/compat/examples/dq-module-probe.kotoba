@@ -1,0 +1,32 @@
+(ns dq-module-probe
+  "Guest evidence for the delivery module parity surface: the full terminal
+  vocabulary, fenced finish, recover-to-unknown, and the ledger-outcome map
+  where unknown surfaces as FAILED."
+  (:require [itonami.delivery :as d])
+  (:export [dq-module-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn dq-module-probe [] :i64
+  (let [e1 (d/dq-enqueue "/data/dq2" "x1")
+        c1 (d/dq-claim-next "/data/dq2")
+        f1 (d/dq-finish "/data/dq2" "x1" 2 "")
+        fence (d/dq-finish "/data/dq2" "x1" 3 "no")
+        o1 (d/dq-outcome "/data/dq2" "x1")
+        e2 (d/dq-enqueue "/data/dq2" "x2")
+        c2 (d/dq-claim-next "/data/dq2")
+        rec (d/dq-recover "/data/dq2" "x2")
+        rec2 (d/dq-recover "/data/dq2" "x2")
+        o2 (d/dq-outcome "/data/dq2" "x2")
+        e3 (d/dq-enqueue "/data/dq2" "x3")
+        c3 (d/dq-claim-next "/data/dq2")
+        f3 (d/dq-finish "/data/dq2" "x3" 5 "")
+        o3 (d/dq-outcome "/data/dq2" "x3")
+        say (wire-say (string-concat "DQ2RESULT:" (string-concat o1 (string-concat ":" (string-concat o2 (string-concat ":" o3))))))]
+    (if (and (= 1 e1) (string=? "x1" c1) (= 1 f1) (= 0 fence)
+             (string=? "delivered" o1) (= 1 e2) (string=? "x2" c2)
+             (= 1 rec) (= 0 rec2) (string=? "failed" o2)
+             (= 1 e3) (string=? "x3" c3) (= 1 f3) (string=? "suppressed" o3))
+      1 0)))

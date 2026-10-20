@@ -626,3 +626,26 @@ amu の修正候補として記録（gap 1 と同じ runbook）。
 
 実装罠（検証が捕捉）: render のヘッダ末尾の改行が 1 つ不足（316 vs 317）
 → probe の byte 一致 assert が検出し、修正で全緑。
+
+## 計測 21: delivery の module parity 面 — node 無しで完走（2026-10-21、boot91.log）
+
+.cljk 差し替え consumer 2（delivery_queue.cljk の残 parity 面）:
+
+- 6 status 語彙（0 pending / 1 delivering / 2 delivered / 3 failed /
+  4 unknown / 5 suppressed）に拡張。**fenced finish**（`WHERE status IN
+  ('pending','delivering')` — terminal は二度と書換えない）と
+  **recover-abandoned!**（delivering → unknown、再送しない安全側）を
+  from-conditional flip で再現。
+- **ledger-outcome の設計マッピングを parity**: delivered→delivered /
+  suppressed→suppressed / failed→failed / **unknown→failed**（送達結果を
+  伝えられない喪失は失敗として扱う、という意図的な非対称）。
+- guest 実行（node 無し）: x1 delivered → outcome "delivered" /
+  **fenced な再 finish → 0** / x2 claim → recover → unknown → outcome
+  **"failed"** / 再 recover → 0 / x3 suppressed → "suppressed" →
+  `DQ2RESULT:delivered:failed:suppressed` / `:ok :result 1`。
+- delivery_core 9/9 緑（terminal/finish-from/outcome のテスト追加）、
+  native compile 成功。
+
+実装罠（この run で 2 回）: export ベクタの更新漏れ（fn 未定義エラーに
+化ける）と、置換 anchor の不一致で edit が黙って適用されないケース →
+**edit 後は必ず check で再読**する運用が効いた。

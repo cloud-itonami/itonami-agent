@@ -16,7 +16,8 @@
   (:require [itonami.delivery-core :as core]
             [itonami.journal :as j]
             [itonami.notepad :as np])
-  (:export [dq-enqueue dq-status dq-error dq-claim-row dq-finish dq-claim-next])
+  (:export [dq-enqueue dq-status dq-error dq-claim-row dq-finish dq-claim-next
+            dq-recover dq-outcome])
   (:capabilities #{:fs/app-data}))
 
 (defn- wire-exists [path :string] :string
@@ -73,18 +74,43 @@
           0)))))
 
 (defn dq-finish [base :string id :string status :i64 error :string] :i64
+  ;; fenced like the SQLite finish!: WHERE status IN ('pending','delivering')
+  ;; -- a terminal row is never rewritten. Status is one of the four
+  ;; terminal values (2 delivered / 3 failed / 4 unknown / 5 suppressed).
   (if (= 0 (core/id-ok id))
     0
-    (if (> status 2)
+    (if (= 0 (core/terminal-ok status))
       0
       (let [p (np/note-path base id)]
         (if (= 0 (exists? p))
           0
           (let [content (wire-read p)]
-            (if (= 1 (core/state-status content))
+            (if (= 1 (core/finish-from-ok (core/state-status content)))
               (let [w (wire-write p (core/state-encode status error))]
                 1)
               0)))))))
+
+(defn dq-recover [base :string id :string] :i64
+  ;; recover-abandoned!: a delivering row whose owner is gone is fenced
+  ;; 'unknown' and never retried (the pid check is the host's; the guest
+  ;; does the fenced flip).
+  (let [p (np/note-path base id)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (if (= 1 (core/state-status content))
+          (let [w (wire-write p (core/state-encode 4 "owner gone"))]
+            1)
+          0)))))
+
+(defn dq-outcome [base :string id :string] :string
+  ;; the ledger delivery_outcome for this row (unknown -> failed).
+  (let [p (np/note-path base id)]
+    (if (= 0 (exists? p))
+      ""
+      (let [content (wire-read p)]
+        (let [st (core/state-status content)]
+          (core/ledger-outcome (core/status-name st)))))))
 
 (defn- claim-scan [base :string q :string i :i64 n :i64] :string
   (if (>= i n)

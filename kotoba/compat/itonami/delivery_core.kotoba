@@ -10,7 +10,8 @@
   is the status digit, a newline, then the error text. Self-contained: only
   native-qualified ops."
   (:export [id-ok state-encode state-status state-error
-            test-id-ok test-state]))
+            terminal-ok finish-from-ok ledger-outcome status-name
+            test-id-ok test-state test-terminal]))
 
 (defn- token-in [s :string token :string] :bool
   (>= (string-index-of s token) 0))
@@ -31,7 +32,7 @@
 ") 0 1)))
 
 (defn state-encode [status :i64 error :string] :string
-  (string-concat (string-substring "012" status (+ status 1))
+  (string-concat (string-substring "012345" status (+ status 1))
                  (string-concat "
 " error)))
 
@@ -45,12 +46,50 @@
 ")]
     (if (< i 0) "" (string-substring content (+ i 1) (string-length content)))))
 
+
+
+(defn status-name [code :i64] :string
+  (if (= code 0) "pending"
+    (if (= code 1) "delivering"
+      (if (= code 2) "delivered"
+        (if (= code 3) "failed"
+          (if (= code 4) "unknown"
+            (if (= code 5) "suppressed" "")))))))
+
+(defn terminal-ok [status :i64] :i64
+  ;; terminal-statuses: delivered(2) failed(3) unknown(4) suppressed(5).
+  (if (and (>= status 2) (<= status 5)) 1 0))
+
+(defn finish-from-ok [status :i64] :i64
+  ;; finish! is fenced: WHERE status IN ('pending','delivering').
+  (if (or (= status 0) (= status 1)) 1 0))
+
+(defn ledger-outcome [status :string] :string
+  ;; the measured map: delivered->delivered, suppressed->suppressed,
+  ;; failed->failed, unknown->FAILED (a lost send surfaces as failure --
+  ;; the user cannot be told the result arrived).
+  (if (string=? status "unknown") "failed" status))
+
 (defn test-id-ok [] :bool
   (and (= 1 (id-ok "exec-1"))
        (= 0 (id-ok ""))
        (= 0 (id-ok "   "))
        (= 0 (id-ok "a
 b"))))
+
+(defn test-terminal [] :bool
+  (and (= 1 (terminal-ok 2))
+       (= 1 (terminal-ok 5))
+       (= 0 (terminal-ok 0))
+       (= 0 (terminal-ok 1))
+       (= 0 (terminal-ok 6))
+       (= 1 (finish-from-ok 0))
+       (= 1 (finish-from-ok 1))
+       (= 0 (finish-from-ok 2))
+       (string=? "delivered" (ledger-outcome "delivered"))
+       (string=? "suppressed" (ledger-outcome "suppressed"))
+       (string=? "failed" (ledger-outcome "unknown"))
+       (string=? "failed" (ledger-outcome "failed"))))
 
 (defn test-state [] :bool
   (and (string=? "0
