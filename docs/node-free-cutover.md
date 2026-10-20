@@ -378,3 +378,27 @@ AAABB 着地）。verify-loader-fuzz: PASS_LOADER_SOURCE_BOUND_FUZZ
    → journal_core は自己完結（count を string-index-of 再帰に）。
    clojure.string compat の split-count/split-lines は native 経路では
    使えない（wasm/js では可）。
+
+## 計測 11: KV notepad port — node 無しで完走（2026-10-21、boot78.log）
+
+node:sqlite port consumer 1（notepad.cljk の 8 SQL）を per-key ファイルの
+KV store に載せ替え、guest VM で完走実証:
+
+- `kotoba/compat/itonami/notepad_core.kotoba`（pure 12/12 緑: key/value 検証・
+  entry codec・hex2 エンコード）+ `notepad.kotoba`（effect: key の sha256 を
+  名にした per-key ファイル、set=WRITE upsert / get=READ+key 検証 /
+  delete=UNLINK_SEP）。
+- guest 実行（node 無し）: set v1 → upsert v2 → get = **v2** → missing = ""
+  → 改行入り key 拒否 → delete → get = "" → `NRESULT:v2:1` /
+  `:ok :result 1`。parity: upsert last-wins・cap 拒否は store 不変・
+  fail-closed。**64KB/job total のみ open**（:fs/browse の有界スキャン要）。
+
+実測した罠 2 件（boot77 triage で分離）:
+
+1. **filename は NAME_MAX(255) 制約**: hash 答え（小文字 hex 64 文字、実測）を
+   4 桁 hex で二重エンコードすると 270 文字になり、**WRITE が
+   unhandled-child-signal で kill**（open の ENAMETOOLONG が trap に化ける）。
+   hex2（2 桁/byte）で 133 文字に。
+2. **KEXE_PAIRS の予算**: hex の再帰 concat が pair を消費（256 不足で
+   :budget/cells trap）。65536 で解消。運用目安:
+   KEXE_PAIRS=65536 KEXE_STRING_POOL=65536。

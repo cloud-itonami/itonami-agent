@@ -1,0 +1,91 @@
+(ns itonami.notepad-core
+  "The pure half of the per-job KV notepad port (ledger 8 design A, consumer
+  1: notepad.cljk's 8 SQL). Parity with the SQLite store: upsert semantics
+  (last write wins), 128 characters per key, 16KB per value, fail-closed
+  refusals that leave the store untouched. The 64KB per-job total needs a
+  bounded directory scan and stays open (measured, next slice).
+
+  Entry content is key + newline + value; a key carrying a newline is refused
+  (the SQLite store allowed it -- a documented narrowing, matching the journal
+  line discipline). Self-contained: only native-qualified ops
+  (string-length / byte-length / substring / concat / code-point-at / =)."
+  (:export [key-ok value-ok entry-encode entry-value entry-bytes hex2 hex-encode
+            test-key-ok test-value-ok test-entry test-hex]))
+
+(defn- token-in [s :string token :string] :bool
+  (>= (string-index-of s token) 0))
+
+(defn- blank-run [s :string i :i64 n :i64] :i64
+  (if (>= i n)
+    n
+    (let [c (string-code-point-at s i)]
+      (if (or (= c 32) (or (= c 9) (or (= c 10) (or (= c 11) (or (= c 12) (= c 13))))))
+        (blank-run s (+ i 1) n)
+        i))))
+
+(defn key-ok [key :string] :i64
+  ;; parity: non-blank, <= 128 characters; narrowed: no newline.
+  (if (= (blank-run key 0 (string-length key)) (string-length key))
+    0
+    (if (> (string-length key) 128)
+      0
+      (if (token-in key "
+") 0 1))))
+
+(defn value-ok [value :string] :i64
+  (if (> (string-byte-length value) 16384) 0 1))
+
+(defn entry-encode [key :string value :string] :string
+  (string-concat key (string-concat "
+" value)))
+
+(defn entry-value [entry :string] :string
+  (let [i (string-index-of entry "
+")]
+    (if (< i 0) "" (string-substring entry (+ i 1) (string-length entry)))))
+
+(defn entry-bytes [key :string value :string] :i64
+  (+ (string-byte-length key) (string-byte-length value)))
+
+(defn- hex-digit [d :i64] :string
+  (string-substring "0123456789abcdef" d (+ d 1)))
+
+(defn hex2 [c :i64] :string
+  ;; two hex digits per code point (0..255): a 64-char digest becomes a
+  ;; 128-char filename segment -- the 4-digit form measured 270 chars and
+  ;; crossed NAME_MAX (255), which killed the writer (boot77 triage).
+  (string-concat (hex-digit (quot c 16))
+                 (hex-digit (- c (* (quot c 16) 16)))))
+
+(defn hex-encode [s :string] :string
+  (if (= 0 (string-length s))
+    ""
+    (string-concat (hex2 (string-code-point-at s 0))
+                   (hex-encode (string-substring s 1 (string-length s))))))
+
+(defn test-key-ok [] :bool
+  (and (= 1 (key-ok "cursor"))
+       (= 0 (key-ok ""))
+       (= 0 (key-ok "   "))
+       (= 0 (key-ok "a
+b"))))
+
+(defn- double-bytes [s :string n :i64] :string
+  (if (= n 0) s (double-bytes (string-concat s s) (- n 1))))
+
+(defn test-value-ok [] :bool
+  (and (= 1 (value-ok ""))
+       (= 1 (value-ok "x"))
+       (= 1 (value-ok (double-bytes "x" 13)))
+       (= 0 (value-ok (double-bytes "x" 15)))))
+
+(defn test-entry [] :bool
+  (and (string=? "k
+v" (entry-encode "k" "v"))
+       (string=? "v" (entry-value (entry-encode "k" "v")))
+       (string=? "" (entry-value "no-newline"))))
+
+(defn test-hex [] :bool
+  (and (string=? "41" (hex2 65))
+       (string=? "6162" (hex-encode "ab"))
+       (string=? "" (hex-encode ""))))

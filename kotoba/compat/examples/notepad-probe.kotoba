@@ -1,0 +1,23 @@
+(ns notepad-probe
+  "Guest evidence for the KV notepad port: set, upsert, get, absent,
+  fail-closed refusals, delete."
+  (:require [itonami.notepad :as n])
+  (:export [notepad-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn notepad-probe [] :i64
+  (let [s1 (n/notepad-set "/data/np" "cursor" "v1")
+        s2 (n/notepad-set "/data/np" "cursor" "v2")
+        g1 (n/notepad-get "/data/np" "cursor")
+        g2 (n/notepad-get "/data/np" "missing")
+        bad (n/notepad-set "/data/np" "
+bad" "x")
+        del (n/notepad-delete "/data/np" "cursor")
+        g3 (n/notepad-get "/data/np" "cursor")
+        say (wire-say (string-concat "NRESULT:" (string-concat g1 (string-concat ":" (string-from-i64 del)))))]
+    (if (and (= 1 s1) (= 1 s2) (string=? "v2" g1) (= 0 (string-length g2))
+             (= 0 bad) (= 1 del) (= 0 (string-length g3)))
+      1 0)))
