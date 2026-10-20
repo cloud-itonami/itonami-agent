@@ -1,0 +1,96 @@
+(ns itonami.task-comments
+  "The kanban comments store (ledger measurement 34, slice 2): the
+  task_comments surface of the kanban tool family over a per-task comments
+  journal, reusing the tasks-core length-prefix codec (the entry fields are
+  (run=empty, author, body) so both carry newlines). A comment also appends
+  a task_events row, matching the tool's double insert (the event kind is
+  comment and its payload is the body).
+
+  Naming follows notepad: one journal per task, the file named by the
+  hex-encoded sha256 of the task id. The created_at column is dropped (the
+  guest has no clock wiring).
+
+  Shape rule measured earlier: typed-cap-call only in a typed defn's return
+  position."
+  (:require [itonami.tasks-core :as tc]
+            [itonami.tasks-events :as te]
+            [itonami.notepad-core :as nc])
+  (:export [cm-add cm-count cm-author-at cm-body-at])
+  (:capabilities #{:fs/app-data :hash/sha256}))
+
+(defn- wire-hash [s :string] :string
+  (typed-cap-call :hash/sha256 :string :string s))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- wire-append [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "APPEND_SEP" content))))
+
+(defn- exists? [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn- cpath [base :string task :string] :string
+  (string-concat base
+                 (string-concat "/cm"
+                                (string-concat (nc/hex-encode (wire-hash task))
+                                               ".journal"))))
+
+(defn cm-add [base :string task :string run :string author :string body :string] :i64
+  (if (= 0 (string-length task))
+    0
+    (let [p (cpath base task)]
+      (let [e (tc/event-encode "" author body)]
+        (let [w (if (= 1 (exists? p))
+                  (wire-append p e)
+                  (wire-write p e))]
+          (let [ev (te/ev-append base task run "comment" body)]
+            1))))))
+
+(defn- walk-at [content :string i :i64 k :i64 n :i64] :string
+  (if (>= i (string-length content))
+    ""
+    (let [rest (string-substring content i (string-length content))]
+      (let [len (tc/event-len rest)]
+        (let [entry (string-substring rest 0 len)]
+          (if (= k n)
+            entry
+            (walk-at content (+ i len) (+ k 1) n)))))))
+
+(defn- entry-of [base :string task :string k :i64] :string
+  (let [p (cpath base task)]
+    (if (= 0 (exists? p))
+      ""
+      (let [content (wire-read p)]
+        (walk-at content 0 0 k)))))
+
+(defn- walk-count [content :string i :i64 acc :i64] :i64
+  (if (>= i (string-length content))
+    acc
+    (let [rest (string-substring content i (string-length content))]
+      (let [len (tc/event-len rest)]
+        (walk-count content (+ i len) (+ acc 1))))))
+
+(defn cm-count [base :string task :string] :i64
+  (let [p (cpath base task)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (walk-count content 0 0)))))
+
+(defn cm-author-at [base :string task :string k :i64] :string
+  (tc/event-kind (entry-of base task k)))
+
+(defn cm-body-at [base :string task :string k :i64] :string
+  (tc/event-payload (entry-of base task k)))
