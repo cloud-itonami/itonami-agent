@@ -279,3 +279,42 @@ guest で store 最小 primitive（WRITE→APPEND→READ、policy で
 - 次の一手: kexe_loader の seccomp filter の fs syscall 集合を実測照合し、
   不足 syscall の追加（amu repo への PR）か、実機（x86_64-linux の
   adopted loader）での再現確認。
+
+## 計測 9: kexe_loader の seccomp fs syscall 監査（2026-10-20、boot65-67.log）
+
+計測 8 の SIGSYS を 4 変数の guest 実行で切り分けた（store-probe.raw、
+allow-csv 35,37、KEXE_STRUCTURED_REPORT 付き）:
+
+| scope grant | 結果 |
+|---|---|
+| `/data`（ディレクトリ = descendant grant） | 最初の fs call（EXISTS）で SIGSYS |
+| `/` | fs 系は通るが exit で unhandled-child-signal（exit 123） |
+| `KEXE_CAP_RESOURCES_34` のみ（fs_reads は true） | 同上（exit 123） |
+| **`/data/store-probe.txt`（exact-file grant）** | **EXISTS → 1 / WRITE / APPEND まで成功**（guest の実 fs に `AAABB` が着地）。READ で SIGSYS |
+
+### 特定した 2 つの gap（amu/tools/kexe_loader.c）
+
+1. **`__NR_mmap` が seccomp allowlist に無い**（`__NR_munmap` と `__NR_brk` は
+   ある）。fs READ provider は内容バッファを `malloc` するため、brk 領域を
+   超えると musl が mmap を使い SIGSYS。exact grant で READ だけ落ち、
+   WRITE/APPEND/EXISTS（malloc なし）が通ったのが一致する。
+2. **descendant（ディレクトリ grant）の open 分支**（`open(O_PATH|O_DIRECTORY|
+   O_NOFOLLOW)` + `openat2(dirfd, rest, RESOLVE_BENEATH)`）が最初の使用で
+   SIGSYS。exact 分支（`openat2(AT_FDCWD, ...)`）は通る。filter は
+   open/openat/openat2 を通しているので、分支内の別 syscall（containment
+   証明の path 解決系）か、filter の arch/nr 突合の取りこぼし。
+   （`/` grant で exit 123 の unhandled signal もこの系の残骸と推定。）
+
+### 修復の選択肢（セキュリティ判断つき）
+
+- A. allowlist に `mmap` を追加 — 1 行だが PROT_EXEC の mapping を guest に
+  開く。BPF で引数制限（PROT_EXEC 除外）は可能だが複雑。
+- B. **provider 側をヒープ不要に**（READ を static バッファ + pread の
+  チャンク処理に、`kexe_append_buffer` と同じ形）— 「C を減らす」原則に沿い、
+  sandbox を広げない。推奨。
+- descendant 分支は open フラグ/containment の実測で syscall を特定してから
+  同様に最小修復。
+
+guest 証跡の状態: **WRITE/APPEND/EXISTS は node 無しで動くことが実証済み**
+（exact grant、boot67、ファイル内容 `AAABB` を guest 自身の fs で確認）。
+READ とディレクトリ grant は上記 gap 解消待ち。
