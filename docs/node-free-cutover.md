@@ -224,3 +224,58 @@ gateway homeassistant loop process provider quiet watcher）:
 結論: promesa 壁の正体は「guest に非同期基盤が無い」ことではなく
 「**非同期は host の責務**」という分担の明示。9 モジュールの port では
 逐次 110 が直線コードに、orchestration 31 が host loop に移って壁が消える。
+
+## 計測 8: node:sqlite の port 方針（2026-10-20）
+
+### 使う面（実測）
+
+node:sqlite は **リレーショナル store として運用されている**: WAL +
+BEGIN IMMEDIATE/COMMIT/ROLLBACK、CREATE/ALTER（migration）、CREATE INDEX、
+WHERE/ORDER BY/LIMIT の SQL。SQL 文字列の数: execution_ledger 32 /
+delivery_queue 18 / notepad 8 / tools 121 = **計 179**。
+
+### :fs/app-data の request プロトコル（seed/02-io.kotoba の実装から確定）
+
+- EXISTS: `path + "EXISTS_SEP"` → 先頭バイト '1' で存在
+- READ: `path` → ファイル内容
+- RANGE: `path + "RANGE_SEP" + off + ":" + len`
+- WRITE: `path + "WRITE_SEP" + content`（content に自 token を含む write は
+  SIGILL で拒否。APPEND は `APPEND_SEP` 同様）
+- バイト安全版: `:fs/app-data-bytes`（wire 35 kind 8、:bytes request）
+- scope: `KEXE_CAP_RESOURCES_35=<colon 区切り path 群>`（loader が realpath
+  で解決、解決できない entry は drop）。範囲外 path は **trap ではなく absent
+  で返る**（confinement 契約、catalog 記載）。
+
+### port 方針（2 つの生きた設計）
+
+- **A. guest 側 journal store**: テーブルを append-only journal（WRITE/APPEND
+  + RANGE 読取）に落とし、クエリは invocation ごとの有界スキャンへ。
+  「1 invocation = 1 有界ステップ」原則に合う。179 SQL がスキャン/リプレイ
+  コードに変わる（機械的だが大きい）。transaction は append + compaction
+  （single-writer 前提）。
+- **B. store サービス**: net broker（wire 43/45）越しに kotoba 製 store
+  daemon へ RPC。transaction 語義は温存、C を増やさない。
+  host=状態 / guest=計算という promesa 設計（計測 7）と同じ分担。
+- 推奨: B を正とし A を小規模（notepad 8 文）で先行。tools の 121 文は
+  クエリ帳が大きすぎるので置換ではなく縮小対象。
+
+### 実測した open item: fs wire が aarch64 loader で SIGSYS（boot63/64.log）
+
+guest で store 最小 primitive（WRITE→APPEND→READ、policy で
+:fs/app-data/:io/write 付与、allow-csv `35,37`、
+`KEXE_CAP_RESOURCES_35=/data`）を実行した結果:
+
+    STORE_PROBE: PHASE:EXISTS1:KEXE_TRAP {:kind :signal :signal :SIGSYS}
+    STORE_PROBE_DENIED (wire 35 なし): PHASE:EXISTS1:…SIGTRAP
+
+- io 系（wire 37/38）は同じ guest で正常（CAP_WRITE_OK）。wire 35 は
+  granted（ungranted は SIGTRAP で別症状）なのに、**:fs/app-data の最初の
+  request で SIGSYS**（seccomp filter の syscall 不許可）。
+- EXISTS という最小 op でも落ちるので、request path の解決
+  （realpath / readlinkat / statx 系が filter 外と推定）が原因候補。
+  confinement 契約は「範囲外は absent、trap しない」なので scope 拒否ではない。
+- 影響: store 系 port の **guest VM 証跡**はこの loader gap の解消待ち。
+  check/compile は緑（例: kotoba/compat/examples/store-probe.kotoba）。
+- 次の一手: kexe_loader の seccomp filter の fs syscall 集合を実測照合し、
+  不足 syscall の追加（amu repo への PR）か、実機（x86_64-linux の
+  adopted loader）での再現確認。
