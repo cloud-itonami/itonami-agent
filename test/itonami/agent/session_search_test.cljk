@@ -22,11 +22,11 @@
     (.exec db "CREATE VIRTUAL TABLE messages_fts USING fts5(content)")
     (doseq [s sessions]
       (let [st (.prepare db (str "INSERT INTO sessions (id, title, started_at, message_count, "
-                                 "source, hidden, last_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?)"))]
+                                 "source, hidden, last_activity_at, parent_session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"))]
         (js/Reflect.apply (.-run st) st
           (clj->js [(str (:id s)) (:title s) (:started s)
                     (count (filter #(= (:id s) (:session %)) messages))
-                    (or (:source s) "chat") (if (:hidden s) 1 0) (:started s)]))))
+                    (or (:source s) "chat") (if (:hidden s) 1 0) (:started s) (:parent s)]))))
     (doseq [m messages]
       (let [st (.prepare db (str "INSERT INTO messages (id, session_id, role, content, timestamp, "
                                  "active, compacted) VALUES (?, ?, ?, ?, ?, 1, 0)"))
@@ -148,4 +148,143 @@
             (is (= 0 (get e "messages_after")))
             (is (= [] (get e "bookend_start")))
             (is (= [] (get e "bookend_end")))))))
+    (h/rm root)))
+
+(deftest parse-bound
+  ;; Hermes tests/tools/test_session_search.py TestDiscoveryTemporalNarrowing.test_parse_bound
+  (let [p tools/session-parse-iso-bound
+        now (js/Math.floor (/ (.now js/Date) 1000))
+        unix (fn [y mo d] (js/Math.floor (/ (js/Date.UTC y (dec mo) d) 1000)))]
+    (is (nil? (p nil)))
+    (is (nil? (p "")))
+    (doseq [[value expected] [["24h" 86400] ["1d" 86400] ["2w" (* 2 604800)]
+                              ["7D" (* 7 86400)] [" 3 d " (* 3 86400)]]]
+      (is (< (js/Math.abs (- (- now (p value)) expected)) 5) value))
+    (is (= (unix 2026 6 1) (p "2026-06-01")))
+    (is (= (+ (unix 2026 6 1) 43200) (p "2026-06-01T12:00:00Z")))
+    (doseq [bad ["7x" "not-a-date"]]
+      (let [e (try (p bad) nil (catch :default e e))]
+        (is (instance? js/Error e) bad)
+        (is (= (str "invalid time bound: '" bad "' (expected ISO date/datetime like 2026-07-01, "
+                    "or a relative duration like 7d, 24h, 2w)")
+               (.-message e)) bad)))))
+
+(deftest exclude-id-normalization
+  ;; `_normalize_exclude_session_ids`: deduped, stripped ids from a string or
+  ;; list, capped at `_EXCLUDE_SESSION_IDS_CAP` (20).
+  (is (= ["a"] (tools/session-normalize-exclude-ids " a ")))
+  (is (= ["a" "b"] (tools/session-normalize-exclude-ids ["a" " a " "b" 7 nil])))
+  (is (= 20 (count (tools/session-normalize-exclude-ids (mapv #(str "id-" %) (range 30))))))
+  (is (= [] (tools/session-normalize-exclude-ids {"not" "a list"}))))
+
+(deftest discovery-time-bounds-in-sql
+  ;; Hermes test_iso_window_is_applied_in_sql_not_as_a_post_filter: the bound is
+  ;; `s.started_at >= ?` / `s.started_at < ?` inside the query (`_search_filter_clauses`)
+  ;; so LIMIT cannot be filled by out-of-window hits; an invalid bound is a tool
+  ;; error (`_dispatch` surfaces `str(e)`), not a silent unbounded search.
+  (let [root (h/join (h/tmp-dir) (str "itonami-session-search-" (h/random-hex 4)))
+        work (h/join root "profiles" "work")
+        epoch (fn [y mo d] (js/Math.floor (/ (js/Date.UTC y (dec mo) d) 1000)))
+        aug-sessions (mapv (fn [i] {:id (str "s_aug_" i) :title "aug" :started (epoch 2026 8 10)})
+                           (range 4))
+        aug-msgs (vec (mapcat (fn [i]
+                                [{:id (inc (* 2 i)) :session (str "s_aug_" i) :role "user"
+                                  :content "modpack modpack modpack modpack"}
+                                 {:id (+ 2 (* 2 i)) :session (str "s_aug_" i) :role "assistant"
+                                  :content "modpack details"}])
+                              (range 4)))]
+    (make-state-db! (h/join work "state.db")
+                    (conj aug-sessions {:id "s_june" :title "june" :started (epoch 2026 6 15)})
+                    (conj aug-msgs
+                          {:id 100 :session "s_june" :role "user" :content "modpack"}
+                          {:id 101 :session "s_june" :role "assistant" :content "ok"}))
+    (let [ctx {:home work :cwd work}]
+      (testing "the window is SQL-side: limit 2 cannot be filled by out-of-window rows"
+        (let [res (call ctx {"query" "modpack" "limit" 2 "after" "2026-01-01" "before" "2026-07-01"})]
+          (is (= "discover" (get res "mode")))
+          (is (= 1 (get res "count")))
+          (is (= ["s_june"] (distinct (mapv #(get % "session_id") (get res "results")))))))
+      (testing "an invalid bound is a tool error, not a silent unbounded search"
+        (let [res (call ctx {"query" "modpack" "after" "not-a-date"})]
+          (is (= (str "invalid time bound: 'not-a-date' (expected ISO date/datetime like 2026-07-01, "
+                      "or a relative duration like 7d, 24h, 2w)")
+                 (get res "error"))))))
+    (h/rm root)))
+
+(deftest discovery-relative-bounds-and-exclusion
+  ;; Hermes test_relative_bounds_reach_the_tool_through_the_inline_executor:
+  ;; after="7d" keeps the last week, before="7d" keeps everything older,
+  ;; exclude_session_ids omits the named hits.
+  (let [root (h/join (h/tmp-dir) (str "itonami-session-search-" (h/random-hex 4)))
+        work (h/join root "profiles" "work")
+        now (js/Math.floor (/ (.now js/Date) 1000))
+        day 86400]
+    (make-state-db! (h/join work "state.db")
+                    [{:id "s_newest" :title "newest" :started (- now (* 2 day))}
+                     {:id "s_middle" :title "middle" :started (- now (* 30 day))}
+                     {:id "s_oldest" :title "oldest" :started (- now (* 60 day))}]
+                    [{:id 1 :session "s_newest" :role "user" :content "modpack newest"}
+                     {:id 2 :session "s_newest" :role "assistant" :content "modpack answer"}
+                     {:id 3 :session "s_middle" :role "user" :content "modpack middle"}
+                     {:id 4 :session "s_middle" :role "assistant" :content "modpack answer"}
+                     {:id 5 :session "s_oldest" :role "user" :content "modpack oldest"}
+                     {:id 6 :session "s_oldest" :role "assistant" :content "modpack answer"}])
+    (let [ctx {:home work :cwd work}
+          sids (fn [res] (set (mapv #(get % "session_id") (get res "results"))))]
+      (testing "after=\"7d\" keeps the last week"
+        (is (= #{"s_newest"} (sids (call ctx {"query" "modpack" "limit" 5 "after" "7d"})))))
+      (testing "before=\"7d\" keeps everything older"
+        (is (= #{"s_middle" "s_oldest"} (sids (call ctx {"query" "modpack" "limit" 5 "before" "7d"})))))
+      (testing "exclude_session_ids omits the named session"
+        (is (= #{"s_middle" "s_oldest"}
+               (sids (call ctx {"query" "modpack" "limit" 5 "exclude_session_ids" ["s_newest"]}))))))
+    (h/rm root)))
+
+(deftest exclusion-drops-whole-lineage
+  ;; Hermes test_exclude_session_ids_drops_whole_lineage (`_excluded_lineage_roots`):
+  ;; a child id also hides its parent chain, and the exclusion backfills from the
+  ;; scan instead of starving the limit.
+  (let [root (h/join (h/tmp-dir) (str "itonami-session-search-" (h/random-hex 4)))
+        work (h/join root "profiles" "work")]
+    (make-state-db! (h/join work "state.db")
+                    [{:id "s_root" :title "root" :started 100}
+                     {:id "s_child" :title "child" :started 200 :parent "s_root"}]
+                    [{:id 1 :session "s_root" :role "user" :content "unique lineage token alpha"}
+                     {:id 2 :session "s_root" :role "assistant" :content "noted unique lineage token alpha"}
+                     {:id 3 :session "s_child" :role "user" :content "follow-up unique lineage token alpha"}
+                     {:id 4 :session "s_child" :role "assistant" :content "child unique lineage token alpha"}])
+    (let [ctx {:home work :cwd work}
+          sids (fn [res] (set (mapv #(get % "session_id") (get res "results"))))]
+      (testing "without exclusion both the parent and the child hit"
+        (is (= #{"s_root" "s_child"}
+               (sids (call ctx {"query" "unique lineage token alpha" "limit" 5})))))
+      (testing "excluding the child drops the child AND its parent chain"
+        (is (= #{} (sids (call ctx {"query" "unique lineage token alpha" "limit" 5
+                                    "exclude_session_ids" ["s_child"]})))))
+      (testing "excluding the parent drops the whole lineage (a bare string is one id)"
+        (is (= #{} (sids (call ctx {"query" "unique lineage token alpha" "limit" 5
+                                    "exclude_session_ids" "s_root"}))))))
+    (h/rm root)))
+
+(deftest discovery-sort-temporal-bias
+  ;; hermes_state_search.py `_FTS_ORDER_BY`: "newest" = `ORDER BY m.timestamp DESC,
+  ;; rank`, "oldest" = `ORDER BY m.timestamp ASC, rank`; an unknown sort value is
+  ;; rank-only (session_search_tool._dispatch passes None through).
+  (let [root (h/join (h/tmp-dir) (str "itonami-session-search-" (h/random-hex 4)))
+        work (h/join root "profiles" "work")]
+    (make-state-db! (h/join work "state.db")
+                    [{:id "s_a" :title "a" :started 100}
+                     {:id "s_b" :title "b" :started 200}
+                     {:id "s_c" :title "c" :started 300}]
+                    [{:id 1 :session "s_a" :role "user" :content "needle alpha" :timestamp 30}
+                     {:id 2 :session "s_b" :role "user" :content "needle beta" :timestamp 20}
+                     {:id 3 :session "s_c" :role "user" :content "needle gamma" :timestamp 10}])
+    (let [ctx {:home work :cwd work}
+          first-sid (fn [res] (get (first (get res "results")) "session_id"))]
+      (testing "newest: the most recent matching message first"
+        (is (= "s_a" (first-sid (call ctx {"query" "needle" "sort" "newest"})))))
+      (testing "oldest: the oldest matching message first"
+        (is (= "s_c" (first-sid (call ctx {"query" "needle" "sort" "oldest"})))))
+      (testing "an unknown sort value is rank-only"
+        (is (= 3 (get (call ctx {"query" "needle" "sort" "bogus"}) "count")))))
     (h/rm root)))
