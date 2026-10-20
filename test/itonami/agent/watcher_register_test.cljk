@@ -1,0 +1,226 @@
+(ns itonami.agent.watcher-register-test
+  "Hermes gateway completion watchers: the registration contract of
+  `tools/terminal_tool_background._register_completion_watcher` ->
+  `gateway/run_notifications.arm_process_watcher`, the
+  `ProcessRegistry.pending_watchers` side-channel, and the
+  `tools/process_registry_checkpoint.py` watcher re-enqueue."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.process :as process]))
+
+(defn- parse-json [s] (js->clj (js/JSON.parse s)))
+
+(defn- fresh-home [tag]
+  (let [home (h/join (h/tmp-dir) (str "test-watcher-" tag "-" (.-pid js/process) "-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    home))
+
+(defn- fresh-session
+  "A minimal session carrying exactly the watcher/routing atoms spawn! and
+  adopt-entry! install."
+  [id]
+  {:id id
+   :watcher-platform (atom "")
+   :watcher-chat-id (atom "")
+   :watcher-user-id (atom "")
+   :watcher-user-name (atom "")
+   :watcher-thread-id (atom "")
+   :watcher-message-id (atom "")
+   :parent-session-id (atom "")
+   :watcher-interval (atom 0)})
+
+(defn- reset-watcher-state! []
+  (process/set-watcher-runner! nil)
+  (process/take-pending-watchers!))
+
+(defn- spawn-sh!
+  "Spawn a short-lived process; resolves when its on-exit hook fires. The
+  completion event (if any) is drained under the test's own session key so
+  the global queue stays clean."
+  [ctx opts script]
+  (let [resolve-exit (atom nil)
+        exited (js/Promise. (fn [res] (reset! resolve-exit res)))
+        res (parse-json (process/spawn! ctx (merge {:argv ["/bin/sh" "-c" script]
+                                                    :command script
+                                                    :env (h/process-env)
+                                                    :cwd (:home ctx)
+                                                    :on-exit (fn [_ _] (@resolve-exit true))}
+                                                   opts)))]
+    [res exited]))
+
+(deftest descriptor-shape-is-hermes-verbatim
+  (reset-watcher-state!)
+  (let [s (fresh-session "proc_a")]
+    (reset! (:watcher-platform s) "telegram")
+    (reset! (:watcher-chat-id s) "c1")
+    (reset! (:watcher-user-id s) "u1")
+    (reset! (:watcher-user-name s) "n1")
+    (reset! (:watcher-thread-id s) "t1")
+    (reset! (:watcher-message-id s) "m1")
+    (reset! (:parent-session-id s) "sess-9")
+    (let [w (process/register-completion-watcher! s "s1")]
+      (testing "_register_completion_watcher: watcher_interval = 5 and the descriptor, verbatim"
+        (is (= 5 @(:watcher-interval s)))
+        (is (= {"session_id" "proc_a"
+                "check_interval" 5
+                "session_key" "s1"
+                "platform" "telegram"
+                "chat_id" "c1"
+                "user_id" "u1"
+                "user_name" "n1"
+                "thread_id" "t1"
+                "message_id" "m1"
+                "notify_on_complete" true
+                "parent_session_id" "sess-9"}
+               w)))
+      (testing "no live gateway runner: the descriptor waits in pending_watchers"
+        (is (= [w] (process/take-pending-watchers!)))
+        (is (= [] (process/take-pending-watchers!)))))))
+
+(deftest arm-hook-arms-on-the-live-loop-or-parks
+  (reset-watcher-state!)
+  (let [s (fresh-session "proc_b")
+        received (atom nil)]
+    (testing "arm_process_watcher truthy: armed on the live loop, never parked"
+      (process/set-watcher-runner! (fn [w] (reset! received w) true))
+      (let [w (process/register-completion-watcher! s "s2")]
+        (is (= w @received))
+        (is (= [] (process/take-pending-watchers!)))))
+    (testing "arm_process_watcher False: gateway not serving, descriptor parked"
+      (process/set-watcher-runner! (fn [_] false))
+      (let [w (process/register-completion-watcher! s "s2")]
+        (is (= [w] (process/take-pending-watchers!)))))
+    (reset-watcher-state!)))
+
+(deftest take-pending-watchers-detaches-the-batch
+  (reset-watcher-state!)
+  (let [s1 (fresh-session "proc_c1")
+        s2 (fresh-session "proc_c2")]
+    (process/register-completion-watcher! s1 "s3")
+    (process/register-completion-watcher! s2 "s3")
+    (testing "the drain detaches the batch atomically (reassign, not clear)"
+      (is (= 2 (count (process/take-pending-watchers!))))
+      (is (= [] (process/take-pending-watchers!))))))
+
+(deftest spawn-stamps-routing-and-registers
+  (async done
+    (reset-watcher-state!)
+    (let [home (fresh-home "reg")
+          ctx {:home home :task-id "task-a" :session-key "watch-key-1"}
+          env (assoc (h/process-env)
+                     "HERMES_SESSION_PLATFORM" "telegram"
+                     "HERMES_SESSION_CHAT_ID" "c1"
+                     "HERMES_SESSION_USER_ID" "u1"
+                     "HERMES_SESSION_USER_NAME" "n1"
+                     "HERMES_SESSION_THREAD_ID" "t1"
+                     "HERMES_SESSION_MESSAGE_ID" "m1"
+                     "HERMES_SESSION_ID" "sess-9")
+          [res exited] (spawn-sh! ctx {:env env :notify-on-complete? true} "sleep 0.2")
+          id (get res "session_id")]
+      (is (true? (get res "notify_on_complete")))
+      (let [batch (process/take-pending-watchers!)]
+        (testing "a notify spawn with stamped routing registers the watcher"
+          (is (= 1 (count batch)))
+          (is (= {"session_id" id
+                  "check_interval" 5
+                  "session_key" "watch-key-1"
+                  "platform" "telegram"
+                  "chat_id" "c1"
+                  "user_id" "u1"
+                  "user_name" "n1"
+                  "thread_id" "t1"
+                  "message_id" "m1"
+                  "notify_on_complete" true
+                  "parent_session_id" "sess-9"}
+                 (first batch)))))
+      (testing "processes.json carries the watcher fields (Hermes checkpoint shape)"
+        (let [entries (parse-json (h/slurp (h/join home "processes.json")))
+              entry (first (filter #(= id (get % "session_id")) entries))]
+          (is (= "telegram" (get entry "watcher_platform")))
+          (is (= "c1" (get entry "watcher_chat_id")))
+          (is (= 5 (get entry "watcher_interval")))
+          (is (= "sess-9" (get entry "parent_session_id")))))
+      (-> exited
+          (p/then (fn [_]
+                    (process/drain-notifications! {:session-key "watch-key-1"})
+                    (done)))))))
+
+(deftest no-platform-stamps-nothing-and-arms-nothing
+  (async done
+    (reset-watcher-state!)
+    (let [home (fresh-home "noplatform")
+          ctx {:home home :task-id "task-a" :session-key "watch-key-2"}
+          [res exited] (spawn-sh! ctx {:notify-on-complete? true} "sleep 0.2")
+          id (get res "session_id")]
+      (is (true? (get res "notify_on_complete")))
+      (testing "no HERMES_SESSION_PLATFORM: no watcher registration"
+        (is (= [] (process/take-pending-watchers!))))
+      (testing "the checkpoint keeps the default watcher fields"
+        (let [entries (parse-json (h/slurp (h/join home "processes.json")))
+              entry (first (filter #(= id (get % "session_id")) entries))]
+          (is (= "" (get entry "watcher_platform")))
+          (is (= 0 (get entry "watcher_interval")))
+          (is (= "" (get entry "parent_session_id")))))
+      (-> exited
+          (p/then (fn [_]
+                    (process/drain-notifications! {:session-key "watch-key-2"})
+                    (done)))))))
+
+(deftest async-unsupported-turn-stamps-nothing
+  (async done
+    (reset-watcher-state!)
+    (let [home (fresh-home "nosupport")
+          ctx {:home home :task-id "task-a" :session-key "watch-key-3"
+               :async-delivery? false}
+          env (assoc (h/process-env) "HERMES_SESSION_PLATFORM" "telegram")
+          [res exited] (spawn-sh! ctx {:env env :notify-on-complete? true} "sleep 0.2")]
+      (testing "Hermes _apply_async_support: an async-unsupported turn drops notify/watch"
+        (is (false? (get res "notify_on_complete")))
+        (is (string? (get res "notify_unsupported"))))
+      (testing "no stamping, no watcher registration"
+        (is (= [] (process/take-pending-watchers!))))
+      (-> exited (p/then (fn [_] (done)))))))
+
+(deftest checkpoint-recovery-reenqueues-the-watcher
+  (async done
+    (reset-watcher-state!)
+    (let [home (fresh-home "recover")
+          ctx {:home home :task-id "task-a" :session-key "watch-key-4"}
+          env (assoc (h/process-env)
+                     "HERMES_SESSION_PLATFORM" "telegram"
+                     "HERMES_SESSION_CHAT_ID" "c1"
+                     "HERMES_SESSION_ID" "sess-9")
+          [res exited] (spawn-sh! ctx {:env env :notify-on-complete? true} "sleep 2")
+          id (get res "session_id")
+          ;; the launch itself registers a watcher (covered by its own test);
+          ;; drain it so the recovery batch below contains only proc_r
+          _ (process/take-pending-watchers!)
+          entries (parse-json (h/slurp (h/join home "processes.json")))
+          entry (first (filter #(= id (get % "session_id")) entries))
+          home2 (fresh-home "recover2")
+          _ (h/spit-atomic (h/join home2 "processes.json")
+                           (h/json-str [(assoc entry "session_id" "proc_r")]))
+          ;; the process is still running: copy its checkpoint entry under a
+          ;; fresh id into another home, exactly as a crashed runtime's
+          ;; processes.json looks to the next run
+          adopted (process/restore-checkpoint! home2)
+          batch (process/take-pending-watchers!)]
+      (is (= 1 adopted))
+      (testing "process_registry_checkpoint re-enqueues the descriptor"
+        (is (= [{"session_id" "proc_r"
+                 "check_interval" 5
+                 "session_key" "watch-key-4"
+                 "platform" "telegram"
+                 "chat_id" "c1"
+                 "user_id" ""
+                 "user_name" ""
+                 "thread_id" ""
+                 "message_id" ""
+                 "notify_on_complete" true
+                 "parent_session_id" "sess-9"}]
+               batch)))
+      (-> exited
+          (p/then (fn [_]
+                    (process/drain-notifications! {:session-key "watch-key-4"})
+                    (done)))))))
