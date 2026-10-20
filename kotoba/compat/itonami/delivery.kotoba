@@ -1,0 +1,101 @@
+(ns itonami.delivery
+  "The effect half of the delivery queue port: an append-only queue journal
+  (enqueue order) plus one state file per execution id (notepad's hashed
+  naming). Enqueue is INSERT OR IGNORE (first wins), claim-row flips
+  pending -> delivering exactly once, finish records a terminal status +
+  error, claim-next takes the first pending in enqueue order and claims it.
+
+  Parity notes vs delivery_queue.cljk (measured): terminal rows are NOT
+  pruned here, so a re-enqueue of a terminal id answers 0 where the SQLite
+  store consults the tombstone table; get-status answers -1 where the SQLite
+  store falls back to a tombstone. finished_at timestamps are dropped (the
+  guest has no clock wiring in this slice).
+
+  Shape rule measured earlier: typed-cap-call only in a typed defn's return
+  position."
+  (:require [itonami.delivery-core :as core]
+            [itonami.journal :as j]
+            [itonami.notepad :as np])
+  (:export [dq-enqueue dq-status dq-error dq-claim-row dq-finish dq-claim-next])
+  (:capabilities #{:fs/app-data}))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- exists? [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn- queue-path [base :string] :string
+  (string-concat base "/queue.journal"))
+
+(defn dq-enqueue [base :string id :string] :i64
+  (if (= 0 (core/id-ok id))
+    0
+    (let [p (np/note-path base id)]
+      (if (= 1 (exists? p))
+        0
+        (let [w (wire-write p (core/state-encode 0 ""))]
+          (let [a (j/journal-append (queue-path base) id)]
+            1))))))
+
+(defn dq-status [base :string id :string] :i64
+  (let [p (np/note-path base id)]
+    (if (= 0 (exists? p))
+      -1
+      (let [content (wire-read p)]
+        (core/state-status content)))))
+
+(defn dq-error [base :string id :string] :string
+  (let [p (np/note-path base id)]
+    (if (= 0 (exists? p))
+      ""
+      (let [content (wire-read p)]
+        (core/state-error content)))))
+
+(defn dq-claim-row [base :string id :string] :i64
+  (let [p (np/note-path base id)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (if (= 0 (core/state-status content))
+          (let [w (wire-write p (core/state-encode 1 ""))]
+            1)
+          0)))))
+
+(defn dq-finish [base :string id :string status :i64 error :string] :i64
+  (if (= 0 (core/id-ok id))
+    0
+    (if (> status 2)
+      0
+      (let [p (np/note-path base id)]
+        (if (= 0 (exists? p))
+          0
+          (let [content (wire-read p)]
+            (if (= 1 (core/state-status content))
+              (let [w (wire-write p (core/state-encode status error))]
+                1)
+              0)))))))
+
+(defn- claim-scan [base :string q :string i :i64 n :i64] :string
+  (if (>= i n)
+    ""
+    (let [id (j/journal-entry q i)]
+      (if (= 0 (dq-status base id))
+        (if (= 1 (dq-claim-row base id))
+          id
+          (claim-scan base q (+ i 1) n))
+        (claim-scan base q (+ i 1) n)))))
+
+(defn dq-claim-next [base :string] :string
+  (let [q (queue-path base)]
+    (claim-scan base q 0 (j/journal-count q))))
