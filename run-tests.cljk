@@ -8,9 +8,9 @@
 
 (aset (.-env js/process) "ITONAMI_DIR" (path/join (os/tmpdir) (str "itonami-agent-test-" (.-pid js/process))))
 
-(require 'itonami.agent.core-test 'itonami.agent.process-checkpoint-test 'itonami.agent.process-notice-test 'itonami.agent.process-watch-test 'itonami.agent.oneshot-linger-test 'itonami.agent.spawn-notes-test 'itonami.agent.watcher-register-test 'itonami.agent.watcher-delivery-test)
+(require 'itonami.agent.core-test 'itonami.agent.process-checkpoint-test 'itonami.agent.process-notice-test 'itonami.agent.process-watch-test 'itonami.agent.oneshot-linger-test 'itonami.agent.spawn-notes-test 'itonami.agent.watcher-register-test 'itonami.agent.watcher-delivery-test 'itonami.agent.gateway-test)
 
 (defmethod t/report [:cljs.test/default :end-run-tests] [m]
   (when-not (t/successful? m) (js/process.exit 1)))
 
-(t/run-tests 'itonami.agent.core-test 'itonami.agent.process-checkpoint-test 'itonami.agent.process-notice-test 'itonami.agent.process-watch-test 'itonami.agent.oneshot-linger-test 'itonami.agent.spawn-notes-test 'itonami.agent.watcher-register-test 'itonami.agent.watcher-delivery-test)
+(t/run-tests 'itonami.agent.core-test 'itonami.agent.process-checkpoint-test 'itonami.agent.process-notice-test 'itonami.agent.process-watch-test 'itonami.agent.oneshot-linger-test 'itonami.agent.spawn-notes-test 'itonami.agent.watcher-register-test 'itonami.agent.watcher-delivery-test 'itonami.agent.gateway-test)

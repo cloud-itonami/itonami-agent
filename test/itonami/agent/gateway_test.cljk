@@ -1,0 +1,187 @@
+(ns itonami.agent.gateway-test
+  "The live messaging-gateway adapter surface (Hermes gateway/delivery.py
+  `DeliveryTransport` / `resolve_delivery_transport`, gateway/run.py
+  `_gateway_platform_value` / `_non_conversational_metadata` and
+  gateway/run_notifications.py `GatewayRunner._send_watcher_message`): the
+  transport resolution rules, the send dispatch, and the live `:send!` hook
+  wiring into `itonami.agent.watcher/run-process-watcher!`."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [promesa.core :as p]
+            [itonami.agent.gateway :as g]
+            [itonami.agent.watcher :as watcher]))
+
+;; ---- platform values and metadata ----
+
+(deftest platform-value-normalization
+  (is (= "telegram" (g/platform-value " Telegram ")))
+  (is (= "discord" (g/platform-value {:value "Discord"})))
+  (is (= "" (g/platform-value nil)))
+  (is (= "" (g/platform-value ""))))
+
+(deftest non-conversational-metadata-contract
+  (testing "non-Discord platforms get their metadata back untouched"
+    (let [m {"thread_id" "t1"}]
+      (is (identical? m (g/non-conversational-metadata m "telegram")))
+      (is (nil? (g/non-conversational-metadata nil "telegram")))))
+  (testing "Discord merges non_conversational true into a copy"
+    (let [m {"thread_id" "t1"}
+          out (g/non-conversational-metadata m "discord")]
+      (is (= {"thread_id" "t1" "non_conversational" true} out))
+      (is (= {"thread_id" "t1"} m)))
+    (is (= {"non_conversational" true} (g/non-conversational-metadata nil "discord")))
+    (is (= {"non_conversational" true} (g/non-conversational-metadata nil {:value "Discord"})))))
+
+;; ---- resolve_delivery_transport ----
+
+(defn- native-adapter [id] {:id id :send (fn [& _] nil)})
+
+(defn- relay-adapter [id fronts]
+  {:id id
+   :send (fn [& _] nil)
+   :send-for-platform (fn [& _] nil)
+   :fronts-platform fronts})
+
+(deftest resolve-delivery-transport-rules
+  (let [native (native-adapter "native")
+        relay (relay-adapter "relay" (fn [_] true))]
+    (testing "a concrete native adapter always wins"
+      (let [t (g/resolve-delivery-transport "telegram" {} {"telegram" native "relay" relay})]
+        (is (= native (:adapter t)))
+        (is (= "telegram" (:transport-platform t)))
+        (is (not (g/relay? t))))
+      (is (= native (:adapter (g/resolve-delivery-transport "telegram" {"telegram" {:enabled true}}
+                                                           {"telegram" native})))))
+    (testing "a PlatformConfig block without :enabled disables (enabled defaults False)"
+      (is (nil? (g/resolve-delivery-transport "telegram" {"telegram" {}} {"telegram" native})))
+      (is (nil? (g/resolve-delivery-transport "telegram" {"telegram" {:enabled false}} {"telegram" native}))))
+    (testing "an explicitly disabled native adapter never shadows an enabled Relay transport"
+      (let [t (g/resolve-delivery-transport "telegram"
+                                           {"telegram" {:enabled false} "relay" {:enabled true}}
+                                           {"telegram" native "relay" relay})]
+        (is (= relay (:adapter t)))
+        (is (g/relay? t))))
+    (testing "Relay is eligible only when it fronts the logical platform"
+      (is (nil? (g/resolve-delivery-transport "telegram"
+                                             {"telegram" {:enabled false} "relay" {:enabled true}}
+                                             {"telegram" native
+                                              "relay" (relay-adapter "relay" (fn [_] false))})))
+      (is (nil? (g/resolve-delivery-transport "telegram"
+                                             {"telegram" {:enabled false} "relay" {:enabled true}}
+                                             {"telegram" native
+                                              "relay" (dissoc relay :fronts-platform)})))
+      (is (= relay (:adapter (g/resolve-delivery-transport "matrix" {"relay" {:enabled true}} {"relay" relay})))))
+    (testing "no adapter at all resolves to nil"
+      (is (nil? (g/resolve-delivery-transport "telegram" {} {}))))))
+
+(deftest send-transport-dispatch
+  (let [calls (atom [])
+        native {:send (fn [chat-id content metadata]
+                        (swap! calls conj [:native chat-id content metadata]) nil)}
+        relay {:send (fn [& _] (swap! calls conj [:relay-wrong]))
+               :send-for-platform (fn [platform chat-id content metadata]
+                                    (swap! calls conj [:relay platform chat-id content metadata]) nil)}]
+    (g/send-transport! (g/delivery-transport native nil "telegram") "telegram" "c1" "hi" {"thread_id" "t"})
+    (g/send-transport! (g/delivery-transport relay nil "relay") "matrix" "c2" "yo" nil)
+    (is (= [[:native "c1" "hi" {"thread_id" "t"}]
+            [:relay "matrix" "c2" "yo" nil]]
+           @calls))))
+
+(deftest resolve-injection-adapter-fallback-scan
+  (let [native (native-adapter "native")
+        stub (native-adapter "stub")]
+    (is (= native (g/resolve-injection-adapter {} {"telegram" native} "telegram")))
+    (testing "the literal platform-value scan runs when the resolver can't"
+      (is (= stub (g/resolve-injection-adapter {} {"exotic-platform" stub} "exotic-platform")))
+      (is (nil? (g/resolve-injection-adapter {} {"exotic-platform" stub} "Telegram"))))))
+
+;; ---- _send_watcher_message ----
+
+(deftest send-watcher-message-contract
+  (let [calls (atom [])
+        warns (atom [])
+        adapter {:send (fn [chat-id content metadata]
+                         (swap! calls conj [chat-id content metadata]) nil)}
+        surface {:adapters {"telegram" adapter} :platforms {} :warn-fn #(swap! warns conj %)}]
+    (testing "adapter + chat id sends with thread metadata"
+      (g/send-watcher-message! surface "telegram" "c1" "t9" "msg" {})
+      (is (= [["c1" "msg" {"thread_id" "t9"}]] @calls)))
+    (testing "a blank thread id sends nil metadata"
+      (g/send-watcher-message! surface "telegram" "c1" "" "msg2" {})
+      (is (= {"thread_id" "t9"} (get-in @calls [0 2])))
+      (is (nil? (get-in @calls [1 2]))))
+    (testing "a blank chat id sends nothing (if adapter and chat_id)"
+      (is (nil? (g/send-watcher-message! surface "telegram" "" "t9" "msg3" {})))
+      (is (nil? (g/send-watcher-message! surface "telegram" nil "t9" "msg3" {})))
+      (is (= 2 (count @calls))))
+    (testing "no adapter sends nothing"
+      (is (nil? (g/send-watcher-message! surface "slack" "c1" "t9" "msg4" {})))
+      (is (= 2 (count @calls))))
+    (testing "Discord sends carry non_conversational"
+      (let [d-adapter {:send (fn [chat-id content metadata]
+                               (swap! calls conj [chat-id content metadata]) nil)}
+            d-surface (assoc surface :adapters {"discord" d-adapter})]
+        (g/send-watcher-message! d-surface "discord" "c9" "t9" "msg5" {})
+        (is (= ["c9" "msg5" {"thread_id" "t9" "non_conversational" true}] (last @calls)))))))
+
+(deftest send-watcher-message-suppresses-errors
+  (testing "a rejected send is logged and suppressed"
+    (async done
+      (let [warns (atom [])
+            adapter {:send (fn [& _] (js/Promise.reject (js/Error. "boom")))}
+            surface {:adapters {"telegram" adapter} :platforms {} :warn-fn #(swap! warns conj %)}
+            res (g/send-watcher-message! surface "telegram" "c1" "" "msg" {})]
+        (-> (p/promise res)
+            (p/then (fn [_]
+                      (is (= ["Watcher delivery error: boom"] @warns))
+                      (done)))))))
+  (testing "a synchronously throwing send is logged and suppressed"
+    (let [warns (atom [])
+          adapter {:send (fn [& _] (throw (js/Error. "bang")))}
+          surface {:adapters {"telegram" adapter} :platforms {} :warn-fn #(swap! warns conj %)}
+          res (g/send-watcher-message! surface "telegram" "c1" "" "msg" {})]
+      (is (some? res))
+      (is (= ["Watcher delivery error: bang"] @warns)))))
+
+;; ---- the live :send! hook wired into the watcher loop ----
+
+(deftest send-hook-drives-the-watcher-push
+  (async done
+    (let [calls (atom [])
+          adapter {:send (fn [chat-id content metadata]
+                           (swap! calls conj [chat-id content metadata]) nil)}
+          surface {:adapters {"telegram" adapter} :platforms {}}
+          session {:id "proc_live"
+                   :state (atom :running)
+                   :exit-code (atom nil)
+                   :output (atom "")
+                   :command "echo hi"
+                   :started-at 0
+                   :owner-task-id (atom "")
+                   :task-id (atom "task-a")
+                   :completion-reason (atom "exited")
+                   :termination-source (atom "")
+                   :parent-session-id (atom "")}
+          ticks (atom 0)
+          session-fn (fn [_]
+                       (swap! ticks inc)
+                       (case @ticks
+                         1 session
+                         2 (do (reset! (:output session) "hi") session)
+                         (do (reset! (:state session) :exited)
+                             (reset! (:exit-code session) 0)
+                             session)))]
+      (-> (watcher/run-process-watcher!
+           {"session_id" "proc_live" "check_interval" 0 "session_key" "s1"
+            "platform" "telegram" "chat_id" "c1" "thread_id" "t1"
+            "user_id" "u1" "user_name" "n1" "message_id" "m1"
+            "notify_on_complete" false}
+           {:config {"display" {"background_process_notifications" "all"}}
+            :session-fn session-fn
+            :send! (g/send-hook surface)
+            :sleep-fn (fn [_] (p/resolved nil))})
+          (p/then (fn [_]
+                    ;; one running update (new output in `all` mode) and one final notice
+                    (is (= 2 (count @calls)))
+                    (is (every? #(= "c1" (first %)) @calls))
+                    (is (every? #(= {"thread_id" "t1"} (last %)) @calls))
+                    (done)))))))

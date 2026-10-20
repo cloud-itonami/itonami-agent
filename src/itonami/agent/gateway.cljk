@@ -1,0 +1,147 @@
+(ns itonami.agent.gateway
+  "The live messaging-gateway adapter surface the watcher's chat push rides.
+  Verbatim contracts: gateway/delivery.py `DeliveryTransport` /
+  `resolve_delivery_transport` (transport resolution and send dispatch), the
+  base adapter send surface (gateway/platforms/base.py `BaseAdapter.send` /
+  `send_for_platform` / `fronts_platform`), gateway/run_notifications.py
+  `GatewayRunner._send_watcher_message` and gateway/run.py
+  `_gateway_platform_value` / `_non_conversational_metadata`.
+
+  A messaging-gateway adapter is its send surface encoded as fns: `:send`
+  [chat-id content metadata], `:send-for-platform` [logical-platform chat-id
+  content metadata] (a Relay adapter fronting N logical platforms) and
+  `:fronts-platform` [platform] (relay eligibility). The adapters map is keyed
+  by the normalized platform value (`platform-value`); a platform config is
+  one `PlatformConfig` block (gateway/config.py — `enabled: bool = False`,
+  plus transport fields). `send-hook` is the live `:send!` binding for
+  `itonami.agent.watcher/run-process-watcher!`."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]))
+
+(def relay-platform "relay")
+
+(defn platform-value
+  "Hermes gateway/run.py `_gateway_platform_value`: a normalized gateway
+  platform value for enums or raw strings —
+  `str(getattr(platform, \"value\", platform) or \"\").strip().lower()`."
+  [platform]
+  (let [raw (if (map? platform) (or (:value platform) platform) platform)]
+    (str/lower-case (str/trim (str (or raw ""))))))
+
+(defn non-conversational-metadata
+  "Hermes gateway/run.py `_non_conversational_metadata`, verbatim: mark Discord
+  lifecycle/status sends without changing other platforms. Discord merges
+  `non_conversational` true into a copy — including out of nil; every other
+  platform gets its metadata back untouched."
+  [metadata platform]
+  (if (not= (platform-value platform) "discord")
+    metadata
+    (assoc (or metadata {}) "non_conversational" true)))
+
+;; ---------------------------------------------------------------- transport
+
+(defn delivery-transport
+  "Hermes gateway/delivery.py `DeliveryTransport`: the resolved live transport
+  for one logical delivery platform — `adapter`, `config`, and the normalized
+  `transport_platform` it actually rides."
+  [adapter config transport-platform]
+  {:adapter adapter
+   :config config
+   :transport-platform (platform-value transport-platform)})
+
+(defn relay?
+  "Hermes `DeliveryTransport.is_relay`: the transport platform is Relay."
+  [transport]
+  (= relay-platform (platform-value (:transport-platform transport))))
+
+(defn send-transport!
+  "Hermes `DeliveryTransport.send`: send through this transport while preserving
+  the logical platform — a relay dispatches `send_for_platform`, a native
+  adapter its own `send`."
+  [transport logical-platform chat-id content metadata]
+  (if (relay? transport)
+    ((:send-for-platform (:adapter transport)) logical-platform chat-id content metadata)
+    ((:send (:adapter transport)) chat-id content metadata)))
+
+(defn- platform-enabled?
+  "Hermes `config.platforms.get(platform)` gate `native_config is None or
+  native_config.enabled`. `PlatformConfig.enabled` defaults to False
+  (gateway/config.py), so a config block without `:enabled` disables the
+  platform; a missing block is no gate at all."
+  [config]
+  (or (nil? config) (boolean (:enabled config))))
+
+(defn resolve-delivery-transport
+  "Hermes gateway/delivery.py `resolve_delivery_transport`, verbatim rule: a
+  concrete native adapter always wins; Relay is eligible only when its
+  authenticated transport explicitly advertises that it fronts the logical
+  platform (`fronts_platform`), so restart-time delivery is independent of
+  per-chat caches without letting Relay hijack unrelated platform targets. An
+  explicitly disabled native adapter never shadows an enabled Relay transport.
+  `platforms` is `config.platforms` (the `PlatformConfig` blocks), `adapters`
+  the live adapter map keyed by platform value. Returns the
+  `DeliveryTransport` or nil."
+  [platform platforms adapters]
+  (let [p (platform-value platform)
+        native (get adapters p)
+        relay (get adapters relay-platform)
+        fronts (get relay :fronts-platform)]
+    (cond
+      (and (some? native) (platform-enabled? (get platforms p)))
+      (delivery-transport native (get platforms p) p)
+
+      (and (some? relay)
+           (platform-enabled? (get platforms relay-platform))
+           (fn? fronts)
+           (boolean (fronts platform)))
+      (delivery-transport relay (get platforms relay-platform) relay-platform)
+
+      :else nil)))
+
+(defn resolve-injection-adapter
+  "Hermes GatewayRunner._resolve_injection_adapter for a synthetic-event
+  platform: the alias-aware transport resolver first (one Relay adapter fronts
+  N logical platforms; native wins), the literal platform-value scan as
+  fallback when the resolver can't run (minimal runner stubs / exotic platform
+  strings). The routing-source layers (`_transport_owner`, the upstream-relay
+  shortcut and the per-profile adapter map) ride the Relay session
+  transport-owner surface; without one this reduces to the resolver plus the
+  literal scan."
+  [platforms adapters platform-name]
+  (or (:adapter (resolve-delivery-transport platform-name platforms adapters))
+      (get adapters platform-name)))
+
+;; ---------------------------------------------------------------- watcher send
+
+(defn- warn-delivery-error [warn-fn e]
+  (warn-fn (str "Watcher delivery error: " (or (ex-message e) (.-message e) (str e)))))
+
+(defn send-watcher-message!
+  "Hermes GatewayRunner._send_watcher_message, verbatim semantics: resolve the
+  platform's injection adapter and, `if adapter and chat_id`, send with
+  `_non_conversational_metadata` metadata — `send_meta = {\"thread_id\" thread_id}`
+  when the thread id is truthy, else nil. A missing adapter or a blank chat id
+  sends nothing. Delivery errors are suppressed and logged
+  `Watcher delivery error: %s` — the watcher's loop never sees the failure.
+  Returns the settled send promise, or nil when nothing was sent."
+  [{:keys [platforms adapters warn-fn]} platform-name chat-id thread-id message-text _watcher]
+  (let [adapter (resolve-injection-adapter platforms adapters platform-name)
+        warn (or warn-fn (fn [_]))]
+    (when (and (some? adapter) (not= "" (str chat-id)))
+      (let [send-meta (when-not (= "" (str thread-id)) {"thread_id" thread-id})
+            metadata (non-conversational-metadata send-meta platform-name)]
+        (try
+          (-> (p/promise ((:send adapter) chat-id message-text metadata))
+              (p/catch (fn [e] (warn-delivery-error warn e) nil)))
+          (catch :default e
+            (warn-delivery-error warn e)
+            (p/resolved nil)))))))
+
+(defn send-hook
+  "The live `:send!` binding for `itonami.agent.watcher/run-process-watcher!`
+  over this adapter surface (`{:adapters … :platforms … :warn-fn …}`): the
+  messaging gateway's `_send_watcher_message`, called with the hook's
+  `[platform chat-id thread-id message-text watcher]` shape."
+  [surface]
+  (fn [platform-name chat-id thread-id message-text watcher]
+    (send-watcher-message! surface platform-name chat-id thread-id message-text watcher)))
