@@ -25,6 +25,7 @@
             [itonami.agent.computer-use :as computer-use]
             [itonami.agent.yaml :as yaml]
             ["node:crypto" :as crypto]
+            ["node:fs" :as fs]
             ["node:sqlite" :as sqlite]))
 
 (defn- fn-schema [name desc props required]
@@ -233,12 +234,14 @@
                "timeout" {"type" "integer" "minimum" 1 "maximum" 300 "description" "Maximum runtime in seconds (default 300)."}}
               ["code"])
    "session_search"
-   (fn-schema "session_search" "Search and read this profile's local Hermes conversation history. Supports recent-session browsing, FTS discovery, reading the latest messages in a session, and scrolling around a message id. It is read-only and never searches another profile."
+   (fn-schema "session_search" "Search and read Hermes conversation history from this profile's state.db. Supports recent-session browsing, FTS discovery, reading the latest messages in a session, and scrolling around a message id. Cross-profile: pass profile=<name> (or the @session:<profile>/<id> link as session_id) to search another profile's state.db read-only. Discovery honours detail=adaptive (default: only the top-ranked hit is fully hydrated) / full. It is read-only."
               {"query" {"type" "string" "description" "Full-text search query; omit to browse recent sessions."}
                "limit" {"type" "integer" "minimum" 1 "maximum" 20 "description" "Maximum sessions or matching messages (default 5)."}
-               "session_id" {"type" "string" "description" "Read one session from this profile's history."}
+               "session_id" {"type" "string" "description" "Read one session; an @session:<profile>/<id> link resolves to that profile (or pass profile=)."}
                "around_message_id" {"type" "integer" "description" "Return a bounded window around this message id; requires session_id."}
                "window" {"type" "integer" "minimum" 1 "maximum" 20 "description" "Messages on each side of the anchor (default 5)."}
+               "profile" {"type" "string" "description" "Search another profile's history (read-only) instead of this one."}
+               "detail" {"type" "string" "enum" ["adaptive" "full"] "description" "Discovery shape only. adaptive (default) fully hydrates the top-ranked result and returns only the anchor message for lower-ranked results; full returns bookends and the complete anchored window for every result."}
                "role_filter" {"type" "string" "enum" ["user,assistant" "user,assistant,tool" "user" "assistant" "tool"]}}
               [])
    "kanban_show"
@@ -1458,14 +1461,177 @@
       (do (h/spit f (str/join "\n§\n" entries'))
           (ok {"entries" (count entries')})))))
 
-(defn- sqlite-records [db sql & params]
-  (let [stmt (.prepare db sql)]
-    (js->clj (js/Reflect.apply (.-all stmt) stmt (clj->js params)))))
+(defn- sqlite-records
+  "Statement rows as CLJS maps — this runtime's js->clj leaves node:sqlite row
+  objects opaque, which breaks map operations downstream."
+  [db sql & params]
+  (let [stmt (.prepare db sql)
+        rows (js->clj (js/Reflect.apply (.-all stmt) stmt (clj->js params)))]
+    (mapv (fn [r]
+            (if (map? r)
+              r
+              (into {} (map (fn [k] [k (js->clj (aget r k))])) (js->clj (js/Object.keys r)))))
+          rows)))
+
+;; ---- Hermes session_search cross-profile resolution and discovery detail
+;; (tools/session_search_tool.py `_resolve_profile_db` / `_hydrate_hit`,
+;; hermes_cli/profiles.py name gates, hermes_state_search.py get_anchored_view).
+
+(def ^:private session-profile-id-re #"^[a-z0-9][a-z0-9_-]{0,63}$")
+(def ^:private session-reserved-profile-names #{"hermes" "test" "tmp" "root" "sudo"})
+(def ^:private session-profile-name-rule
+  "Use lowercase letters, numbers, '-' or '_', starting with a letter or number, up to 64 characters")
+(def ^:private session-source-filter "COALESCE(s.source, '') NOT IN ('tool', 'delegate', 'kanban')")
+(def ^:private session-hidden-filter "COALESCE(s.hidden, 0) = 0")
+
+(defn- session-suggest-profile-name [nm]
+  (let [candidate (-> (str/lower-case (str/trim (str nm)))
+                      (str/replace #"[^a-z0-9_-]+" "-")
+                      (str/replace #"^[-_]+" "")
+                      (str/replace #"[-_]+$" ""))
+        candidate (subs candidate 0 (min 64 (count candidate)))]
+    (if (re-matches session-profile-id-re candidate) candidate "my-work")))
+
+(defn- session-arg-type [nm]
+  (cond (nil? nm) "nil" (number? nm) "number" (boolean? nm) "boolean"
+        (array? nm) "array" (map? nm) "object" :else "value"))
+
+(defn- session-normalize-profile-name [nm]
+  (cond
+    (not (string? nm))
+    (throw (js/Error. (str "profile name must be a string, got " (session-arg-type nm) ": " (pr-str nm))))
+    (str/blank? nm) (throw (js/Error. "profile name cannot be empty"))
+    (= "default" (str/lower-case (str/trim nm))) "default"
+    :else (str/lower-case (str/trim nm))))
+
+(defn- session-validate-profile-name [nm]
+  (when-not (= "default" nm)
+    (when-not (re-matches session-profile-id-re nm)
+      (throw (js/Error. (str "'" nm "' is not a valid profile name. " session-profile-name-rule
+                             " (for example: " (session-suggest-profile-name nm) "). "
+                             "Then run `hermes profile create " (session-suggest-profile-name nm) "`."))))
+    (when (contains? session-reserved-profile-names nm)
+      (throw (js/Error. (str "Profile name '" nm "' is reserved — it collides with either "
+                             "the Hermes installation itself or a common system binary.  "
+                             "Pick a different name."))))))
+
+(defn- session-profile-dir
+  "`hermes_cli.profiles.get_profile_dir` inside the store the current profile
+  lives in: `default` is the store root, named profiles are `<root>/profiles/<id>`."
+  [home canon]
+  (let [home (str home)
+        root (if-let [[_ root] (re-find #"^(.*)/profiles/[^/]+/?$" home)] root home)]
+    (if (= canon "default") root (h/join root "profiles" canon))))
+
+(defn- session-resolve-profile-db-path
+  "`session_search_tool._resolve_profile_db`: the named profile's state.db
+  (opened read-only by the caller), through Hermes' normalize/validate/existence
+  gates verbatim."
+  [home profile]
+  (let [canon (session-normalize-profile-name profile)]
+    (session-validate-profile-name canon)
+    (let [dir (session-profile-dir home canon)]
+      (when-not (try (.isDirectory (fs/statSync dir)) (catch :default _ false))
+        (throw (js/Error. (str "profile '" canon "' does not exist"))))
+      (h/join dir "state.db"))))
+
+(defn- session-shape-message
+  "Hermes `_shape_message`: slim row, `anchor` marks the anchor, content capped
+  with the `content_truncated` / `original_content_chars` bookkeeping."
+  [row anchor-id cap]
+  (let [content (str (get row "content"))
+        truncated? (> (count content) cap)]
+    (cond-> {"id" (get row "id") "role" (get row "role")
+             "content" (if truncated? (str (subs content 0 cap) "…") content)
+             "timestamp" (get row "timestamp")}
+      truncated? (assoc "content_truncated" true "original_content_chars" (count content))
+      (and (some? anchor-id) (= (get row "id") anchor-id)) (assoc "anchor" true))))
+
+(defn- session-compaction-summary? [content]
+  (let [c (str/triml (str content))]
+    (or (str/starts-with? c "[CONTEXT COMPACTION") (str/starts-with? c "[CONTEXT SUMMARY]:"))))
+
+(defn- session-anchored-view
+  "Hermes `SessionDB.get_anchored_view` (hermes_state_search.py) as bounded SQL:
+  the ±window rows around the anchor (user/assistant kept, the anchor always),
+  the row counts outside that window, and the first/last 3 non-empty
+  user/assistant bookend rows with ids strictly outside it."
+  [db session-id anchor-id window]
+  (let [base (str "FROM messages m JOIN sessions s ON s.id = m.session_id WHERE s.id = ? AND "
+                  session-hidden-filter " AND " session-source-filter)
+        numbered (str "WITH numbered AS (SELECT m.id, m.role, m.content, m.timestamp, "
+                      "ROW_NUMBER() OVER (ORDER BY m.id) AS rn " base ") ")
+        rows (vec (sqlite-records db
+                  (str numbered "SELECT id, role, content, timestamp, rn FROM numbered WHERE rn BETWEEN "
+                       "MAX(1, (SELECT rn FROM numbered WHERE id = ?) - ?) AND "
+                       "(SELECT rn FROM numbered WHERE id = ?) + ? "
+                       "AND (SELECT rn FROM numbered WHERE id = ?) IS NOT NULL ORDER BY rn")
+                  session-id anchor-id window anchor-id window anchor-id))]
+    (if (empty? rows)
+      {"window" [] "messages_before" 0 "messages_after" 0 "bookend_start" [] "bookend_end" []}
+      (let [total (get (first (sqlite-records db (str "SELECT COUNT(*) AS n " base) session-id)) "n")
+            window-rows (filterv #(or (#{"user" "assistant"} (get % "role"))
+                                      (= (get % "id") anchor-id)) rows)
+            bookend-sql (fn [op order]
+                          (str "SELECT m.id, m.role, m.content, m.timestamp FROM messages m "
+                               "JOIN sessions s ON s.id = m.session_id WHERE s.id = ? AND m.id " op " ? "
+                               "AND m.role IN ('user', 'assistant') AND length(m.content) > 0 AND "
+                               session-hidden-filter " AND " session-source-filter
+                               " ORDER BY m.id " order " LIMIT 3"))
+            bookend-shape (fn [rs] (->> rs
+                                        (remove #(session-compaction-summary? (get % "content")))
+                                        (mapv #(session-shape-message % nil 1200))))]
+        {"window" (mapv #(session-shape-message % anchor-id 4000) window-rows)
+         "messages_before" (dec (get (first rows) "rn"))
+         "messages_after" (- total (get (last rows) "rn"))
+         "bookend_start" (bookend-shape
+                          (sqlite-records db (bookend-sql "<" "ASC") session-id (get (first rows) "id")))
+         "bookend_end" (bookend-shape
+                        (reverse (sqlite-records db (bookend-sql ">" "DESC") session-id (get (last rows) "id"))))}))))
+
+(defn- session-hydrate-discover-row
+  "Hermes `_hydrate_hit` on a discovery row: `full` = bookends + the complete
+  anchored window, `compact` = just the anchor message; `detail` records which."
+  [db row detail-level]
+  (let [view (session-anchored-view db (get row "session_id") (get row "match_message_id") 5)
+        full? (= detail-level "full")
+        window (get view "window")]
+    {"bookend_start" (if full? (get view "bookend_start") [])
+     "messages" (if full? window (filterv #(get % "anchor") window))
+     "bookend_end" (if full? (get view "bookend_end") [])
+     "messages_before" (get view "messages_before")
+     "messages_after" (get view "messages_after")
+     "detail" detail-level}))
 
 (defn session-search
-  "Read-only local-profile history search. Cross-profile lookup and Hermes' adaptive detail mode are intentionally unavailable."
-  [ctx {:strs [query limit session_id around_message_id window role_filter]}]
-  (let [db-path (h/join (:home ctx) "state.db")
+  "Read-only session history search. Cross-profile lookup follows Hermes
+  `session_search_tool._resolve_profile_db`: the `profile` argument and a raw
+  `@session:<profile>/<id>` link as session_id open a named sibling profile's
+  state.db read-only for every shape (a bare id never scans other profiles —
+  `_read_scoped`'s miss hint). Discovery honours Hermes' `detail` modes
+  (`_hydrate_hit`: `adaptive` fully hydrates only the top-ranked hit, `full`
+  hydrates every hit)."
+  [ctx {:strs [query limit session_id around_message_id window role_filter profile detail]}]
+  (let [;; Hermes session_search_tool.session_search: ids never contain "/", so a
+        ;; "/" splits session_id into profile + id; the embedded profile is
+        ;; adopted only when none was passed.
+        [session-id profile] (if (and (string? session_id) (str/includes? session_id "/"))
+                               (let [i (str/index-of session_id "/")
+                                     emb (subs session_id 0 i)
+                                     emb-id (subs session_id (inc i))]
+                                 (if (seq emb-id)
+                                   [emb-id (if (and (seq emb) (str/blank? (str (or profile "")))) emb profile)]
+                                   [session_id profile]))
+                               [session_id profile])
+        session_id session-id ;; queries and messages use Hermes' post-split session_id
+        profile-target? (and (some? profile) (not (str/blank? (str profile))))
+        detail-mode (if (and (string? detail) (= "full" (str/lower-case (str/trim detail))))
+                      "full" "adaptive")
+        resolved (try
+                   {:db-path (if profile-target?
+                               (session-resolve-profile-db-path (:home ctx) profile)
+                               (h/join (:home ctx) "state.db"))}
+                   (catch :default e {:failure (str "profile '" profile "': " (.-message e))}))
         limit (if (number? limit) (max 1 (min 20 (int limit))) 5)
         window (if (number? window) (max 1 (min 20 (int window))) 5)
         role-filter (or role_filter "user,assistant")
@@ -1477,63 +1643,91 @@
                 "tool" ["tool"]
                 nil)]
     (cond
+      (:failure resolved) (err (:failure resolved))
       (not roles) (err "session_search role_filter must be one of the advertised values")
       (and around_message_id (not session_id)) (err "session_search around_message_id requires session_id")
-      (not (h/file? db-path)) (err "session_search requires this profile's state.db")
-      (not (readable? ctx "session_search" db-path)) (err "session_search denied by this run's read policy")
+      (and (not profile-target?) (not (h/file? (:db-path resolved))))
+      (err "session_search requires this profile's state.db")
+      (not (readable? ctx "session_search" (:db-path resolved)))
+      (err "session_search denied by this run's read policy")
       :else
-      (let [db (sqlite/DatabaseSync. db-path #js {:readOnly true})]
-        (try
-          (.exec db "PRAGMA query_only = ON")
-          (let [source-filter "COALESCE(s.source, '') NOT IN ('tool', 'delegate', 'kanban')"
-                hidden-filter "COALESCE(s.hidden, 0) = 0"
-                role-sql (str/join "," (map #(str "'" % "'") roles))
-                result
-                (cond
-                  session_id
-                  (if around_message_id
-                    (sqlite-records db
-                      (str "WITH numbered AS (SELECT m.id, m.role, m.content, m.timestamp, "
-                           "ROW_NUMBER() OVER (ORDER BY m.id) AS rn FROM messages m "
-                           "JOIN sessions s ON s.id = m.session_id WHERE s.id = ? AND " hidden-filter " AND " source-filter ") "
-                           "SELECT id, role, content, timestamp FROM numbered WHERE rn BETWEEN "
-                           "MAX(1, (SELECT rn FROM numbered WHERE id = ?) - ?) AND "
-                           "(SELECT rn FROM numbered WHERE id = ?) + ? "
-                           "AND (SELECT rn FROM numbered WHERE id = ?) IS NOT NULL ORDER BY rn")
-                      session_id around_message_id window around_message_id window around_message_id)
-                    (sqlite-records db
-                      (str "SELECT m.id, m.role, m.content, m.timestamp FROM messages m "
-                           "JOIN sessions s ON s.id = m.session_id WHERE s.id = ? AND " hidden-filter " AND " source-filter " "
-                           "ORDER BY m.id DESC LIMIT ?")
-                      session_id limit))
+      (let [opened (try {:db (sqlite/DatabaseSync. (:db-path resolved) #js {:readOnly true})}
+                        (catch :default e
+                          {:failure (if profile-target?
+                                      (str "profile '" profile "': " (.-message e))
+                                      (str "session_search requires this profile's state.db: " (.-message e)))}))]
+        (if-let [failure (:failure opened)]
+          (err failure)
+          (let [db (:db opened)]
+            (try
+              (.exec db "PRAGMA query_only = ON")
+              (let [source-filter session-source-filter
+                    hidden-filter session-hidden-filter
+                    role-sql (str/join "," (map #(str "'" % "'") roles))
+                    read-miss (when (and session_id (not around_message_id)
+                                         (empty? (sqlite-records db "SELECT id FROM sessions WHERE id = ?" session_id)))
+                                (if profile-target?
+                                  (str "session_id not found: " session_id)
+                                  (str "session_id not found in this profile: " session_id
+                                       ". If it belongs to another profile, pass profile=<name> (or the @session:<profile>/<id> link).")))]
+                (if read-miss
+                  (err read-miss)
+                  (let [result
+                        (cond
+                          session_id
+                          (if around_message_id
+                            (sqlite-records db
+                              (str "WITH numbered AS (SELECT m.id, m.role, m.content, m.timestamp, "
+                                   "ROW_NUMBER() OVER (ORDER BY m.id) AS rn FROM messages m "
+                                   "JOIN sessions s ON s.id = m.session_id WHERE s.id = ? AND " hidden-filter " AND " source-filter ") "
+                                   "SELECT id, role, content, timestamp FROM numbered WHERE rn BETWEEN "
+                                   "MAX(1, (SELECT rn FROM numbered WHERE id = ?) - ?) AND "
+                                   "(SELECT rn FROM numbered WHERE id = ?) + ? "
+                                   "AND (SELECT rn FROM numbered WHERE id = ?) IS NOT NULL ORDER BY rn")
+                              session_id around_message_id window around_message_id window around_message_id)
+                            (sqlite-records db
+                              (str "SELECT m.id, m.role, m.content, m.timestamp FROM messages m "
+                                   "JOIN sessions s ON s.id = m.session_id WHERE s.id = ? AND " hidden-filter " AND " source-filter " "
+                                   "ORDER BY m.id DESC LIMIT ?")
+                              session_id limit))
 
-                  (not (str/blank? (or query "")))
-                  (sqlite-records db
-                    (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count, "
-                         "m.id AS match_message_id, m.role, m.content, m.timestamp, "
-                         "snippet(messages_fts, 0, '[', ']', ' … ', 16) AS snippet "
-                         "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
-                         "JOIN sessions s ON s.id = m.session_id WHERE messages_fts MATCH ? AND "
-                         hidden-filter " AND " source-filter " AND m.role IN (" role-sql ") "
-                         "ORDER BY bm25(messages_fts), m.id DESC LIMIT ?")
-                    query limit)
+                          (not (str/blank? (or query "")))
+                          (sqlite-records db
+                            (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count, "
+                                 "m.id AS match_message_id, m.role, m.content, m.timestamp, "
+                                 "snippet(messages_fts, 0, '[', ']', ' … ', 16) AS snippet "
+                                 "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
+                                 "JOIN sessions s ON s.id = m.session_id WHERE messages_fts MATCH ? AND "
+                                 hidden-filter " AND " source-filter " AND m.role IN (" role-sql ") "
+                                 "ORDER BY bm25(messages_fts), m.id DESC LIMIT ?")
+                            query limit)
 
-                  :else
-                  (sqlite-records db
-                    (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count "
-                         "FROM sessions s WHERE " hidden-filter " AND " source-filter " "
-                         "ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC LIMIT ?")
-                    limit))
-                result (if (and session_id (not around_message_id)) (vec (reverse result)) result)]
-            (ok {"mode" (cond session_id (if around_message_id "scroll" "read")
-                              (str/blank? (or query "")) "browse" :else "discover")
-                 "profile" (:profile ctx)
-                 "count" (count result)
-                 "results" (mapv (fn [row]
-                                   (cond-> row
-                                     (contains? row "content") (update "content" #(clip (str %) 4000))))
-                                 result)}))
-          (finally (.close db)))))))
+                          :else
+                          (sqlite-records db
+                            (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count "
+                                 "FROM sessions s WHERE " hidden-filter " AND " source-filter " "
+                                 "ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC LIMIT ?")
+                            limit))
+                        result (if (and session_id (not around_message_id)) (vec (reverse result)) result)
+                        discover? (and (not session_id) (not (str/blank? (or query ""))))
+                        result (if discover?
+                                 (mapv (fn [i row]
+                                         (merge row
+                                                (session-hydrate-discover-row
+                                                 db row (if (or (= detail-mode "full") (zero? i))
+                                                          "full" "compact"))))
+                                       (range) result)
+                                 result)]
+                    (ok (cond-> {"mode" (cond session_id (if around_message_id "scroll" "read")
+                                              (str/blank? (or query "")) "browse" :else "discover")
+                                 "profile" (:profile ctx)
+                                 "count" (count result)
+                                 "results" (mapv (fn [row]
+                                                   (cond-> row
+                                                     (contains? row "content") (update "content" #(clip (str %) 4000))))
+                                                 result)}
+                          discover? (assoc "detail" detail-mode))))))
+              (finally (.close db)))))))))
 
 (defn- ha-tool [name]
   (fn [ctx args] (homeassistant/call ctx name args)))
