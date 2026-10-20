@@ -19,6 +19,7 @@
   Shape rule measured earlier: typed-cap-call only in a typed defn's return
   position."
   (:require [itonami.messages :as m]
+            [itonami.tasks-state :as ts]
             [itonami.journal-core :as jc])
   (:export [ss-set-parent ss-parent ss-root ss-search])
   (:capabilities #{:fs/browse :fs/app-data}))
@@ -87,21 +88,32 @@
           (msg-scan base session query (+ k 1) n (- left 1) acc2))
         (msg-scan base session query (+ k 1) n left acc)))))
 
+(defn- stored-session [base :string name :string] :string
+  ;; a session state file carries its session name in row slot 2; the
+  ;; message journals carry nothing there. The store is hash-named, so the
+  ;; name comes from the content, never the filename.
+  (if (= 0 (string-length name))
+    ""
+    (if (not (= 110 (string-code-point-at name 0)))
+      ""
+      (let [content (wire-read (string-concat base (string-concat "/" name)))]
+        (ts/row-field content 2)))))
+
 (defn- sess-scan [base :string listing :string query :string i :i64 ns :i64 left :i64 acc :string] :string
   (if (or (>= i ns) (= 0 left))
     acc
     (let [line (jc/piece listing "
 " i)]
-      (if (= 1 (entry-isdir line))
-        (let [s (entry-name line)
-              hits (msg-scan base s query 0 (m/msg-count base s) left "")
-              left2 (- left (count-lines hits))
-              acc2 (if (= 0 (string-length hits))
-                     acc
-                     (if (= 0 (string-length acc)) hits (string-concat acc (string-concat "
+      (let [s (stored-session base (entry-name line))]
+        (if (= 0 (string-length s))
+          (sess-scan base listing query (+ i 1) ns left acc)
+          (let [hits (msg-scan base s query 0 (m/msg-count base s) left "")]
+            (let [left2 (- left (count-lines hits))]
+              (let [acc2 (if (= 0 (string-length hits))
+                           acc
+                           (if (= 0 (string-length acc)) hits (string-concat acc (string-concat "
 " hits))))]
-          (sess-scan base listing query (+ i 1) ns left2 acc2))
-        (sess-scan base listing query (+ i 1) ns left acc)))))
+                (sess-scan base listing query (+ i 1) ns left2 acc2)))))))))
 
 (defn ss-search [base :string query :string limit :i64] :string
   (let [listing (wire-browse base)]

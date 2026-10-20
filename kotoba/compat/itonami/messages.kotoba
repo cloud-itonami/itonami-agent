@@ -48,7 +48,7 @@
     (let [p (spath base session)]
       (if (= 1 (exists? p))
         0
-        (let [w (wire-write p (ts/row-encode 0 title "" "" ""))]
+        (let [w (wire-write p (ts/row-encode 0 title session "" ""))]
           1)))))
 
 (defn session-title [base :string session :string] :string
