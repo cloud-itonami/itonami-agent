@@ -735,6 +735,8 @@
 (defn- finish! [session exit-code reason source detail on-exit tmpdir]
   (when (compare-and-set! (:state session) :running :exited)
     (reset! (:exit-code session) exit-code)
+    (reset! (:completion-reason session) reason)
+    (reset! (:termination-source session) (or source ""))
     (reset! (:finished-at session) (h/now-ms))
     (try
       (when @(:notify-on-complete? session)
@@ -800,6 +802,8 @@
                          :handoff-note (atom "")
                          :notify-on-complete? (atom (boolean (get entry "notify_on_complete")))
                          :completion-event? (atom false)
+                         :completion-reason (atom "exited")
+                         :termination-source (atom "")
                          :on-exit nil :tmpdir nil
                          :completion-output-chars (or (get entry "completion_output_chars") 0)
                          :watch-patterns (vec (or (get entry "watch_patterns") []))
@@ -918,6 +922,11 @@
                      ;; Hermes `ProcessSession._completion_event`: set exactly
                      ;; when the exit is booked (finish! / detached close).
                      :completion-event? (atom false)
+                     ;; Hermes `ProcessSession.completion_reason` /
+                     ;; `termination_source`: the exit bookkeeping
+                     ;; `_build_process_completion_event` reads back.
+                     :completion-reason (atom "exited")
+                     :termination-source (atom "")
                      :on-exit on-exit :tmpdir tmpdir
                      :completion-output-chars (or completion-output-chars 0)
                      ;; Hermes `arm_heartbeat`: the effective interval is
@@ -1548,3 +1557,188 @@
             (p/resolved {"waited" (mapv :id pending)
                          "completed" completed
                          "timed_out" timed-out})))))))
+
+;; ---- watcher delivery loop helpers (Hermes gateway/run_notifications.py
+;; `._run_process_watcher` and its formatting / mode / backoff inputs) ----
+;; The loop itself lives in `itonami.agent.watcher`; these are its verbatim
+;; contracts. See that namespace for the adapter-surface hooks.
+
+(defn get-session
+  "Hermes `tools/process_registry.ProcessRegistry.get`: the registry lookup
+  the watcher loop polls."
+  [session-id]
+  (get @sessions session-id))
+
+(defn background-notifications-mode
+  "Hermes `gateway/run_config_loaders._load_background_notifications_mode`,
+  verbatim: the `HERMES_BACKGROUND_NOTIFICATIONS` env override, else
+  `display.background_process_notifications` (`false` = \"off\"); the result is
+  stripped and lower-cased, and anything outside #{\"concise\" \"all\"
+  \"result\" \"error\" \"off\"} falls back to \"concise\" (the unset default).
+  (Hermes logs a warning for the fallback; this fn is pure — the loop's
+  `:warn-fn` owns logging.)"
+  [env config]
+  (let [env-mode (get env "HERMES_BACKGROUND_NOTIFICATIONS")
+        mode (if (or (nil? env-mode) (= "" env-mode))
+               (let [raw (get-in config ["display" "background_process_notifications"])]
+                 (cond
+                   (false? raw) "off"
+                   (and (some? raw) (not= raw "")) (str raw)
+                   :else nil))
+               env-mode)
+        mode (str/lower-case (str/trim (str (or mode "concise"))))]
+    (if (contains? #{"concise" "all" "result" "error" "off"} mode)
+      mode
+      "concise")))
+
+(defn surface-child-process-notifications?
+  "Hermes `ProcessRegistry._surface_child_process_notifications`:
+  `delegation.surface_child_process_notifications` from the config (default
+  False)."
+  [config]
+  (boolean (get-in config ["delegation" "surface_child_process_notifications"])))
+
+(defn should-surface-notification
+  "Hermes `process_registry_notifications.should_surface_notification`,
+  verbatim: raw child-process noise surfaces only when the profile opts in.
+  The caller resolves the default (`surface_child_process_notifications?`) and
+  passes it explicitly, as the profile-scoped call does."
+  [evt surface-child?]
+  (or (not (child-notification? evt))
+      (boolean surface-child?)))
+
+(defn shorten-command-for-display
+  "Hermes `gateway/run._shorten_command_for_display`, verbatim: collapse a
+  shell command onto one line and cap its length for display (`…` on cut)."
+  ([command] (shorten-command-for-display command 80))
+  ([command limit]
+   (let [one-line (str/join " " (str/split (str/trim (str (or command ""))) #"\s+"))]
+     (if (> (count one-line) limit)
+       (str (subs one-line 0 (dec limit)) "…")
+       one-line))))
+
+(defn- redacted-output-tail
+  "Hermes `GatewayRunner._redacted_output_tail`: the last `limit` chars of the
+  output buffer through the redactors (unconditional floor) — Kotoba's
+  redaction pair is the one `completion-output` uses."
+  [session limit]
+  (let [s @(:output session)]
+    (if (= s "")
+      ""
+      (redact-command (subs s (max 0 (- (count s) limit)))))))
+
+(defn format-concise-process-notification
+  "Hermes `gateway/run._format_concise_process_notification`, verbatim text
+  (`locales/en.yaml` `gateway.background.*`): the one-line status header, with
+  the duration and exit code in parentheses; a failure appends the last-output
+  tail and the rerun hint. `session-id` rides the Hermes signature."
+  [session-id command exit-code output duration-seconds]
+  (let [ok (contains? #{0 nil} exit-code)
+        short-cmd (shorten-command-for-display command)
+        details (cond-> []
+                  (and (number? duration-seconds) (>= duration-seconds 0))
+                  (conj (let [secs (js/Math.trunc duration-seconds)]
+                          (cond
+                            (>= secs 3600) (str (quot secs 3600) "h " (quot (rem secs 3600) 60) "m")
+                            (>= secs 60) (str (quot secs 60) "m " (rem secs 60) "s")
+                            :else (str secs "s"))))
+                  (not ok) (conj (str "exit " exit-code)))
+        text (str (str/join " " (cond-> [(if ok "✅ Background task finished" "❌ Background task failed")]
+                                  (not (str/blank? short-cmd)) (conj (str "— `" short-cmd "`"))))
+                  (when (seq details) (str " (" (str/join ", " details) ")")))
+        text (if (and (not ok) (not= "" (str (or output ""))))
+               (let [tail-lines (->> (str/split (str/trim (str output)) #"\n")
+                                     (remove str/blank?)
+                                     (take-last 5))
+                     tail (str/join "\n" tail-lines)
+                     tail (if (> (count tail) 500) (subs tail (- (count tail) 500)) tail)]
+                 (if (str/blank? tail)
+                   text
+                   (str text ". Last output:\n```\n" tail "\n```")))
+               text)]
+    (if ok text (str text "\nAsk me to rerun it or show the full log."))))
+
+(defn format-process-final-message
+  "Hermes `GatewayRunner._format_process_final_message`, verbatim: every mode
+  shares the one-line status header; the raw-output modes (all/result/error)
+  append the bounded output tail under it (`gateway.background.final_output`).
+  `now-ms` supplies the wall clock for the duration."
+  [session-id session notify-mode now-ms]
+  (let [new-output (redacted-output-tail session 1000)
+        started (:started-at session)
+        dur (when (number? started) (max 0.0 (/ (- now-ms started) 1000)))
+        command (redact-command (:command session))
+        exit-code @(:exit-code session)]
+    (if (= notify-mode "concise")
+      (format-concise-process-notification session-id command exit-code new-output dur)
+      (let [header (format-concise-process-notification session-id command exit-code "" dur)]
+        (if (str/blank? (str/trim new-output))
+          header
+          (str header "\n\nFinal output:\n```\n" (str/trim new-output) "\n```"))))))
+
+(defn format-process-running-message
+  "Hermes `GatewayRunner._format_process_running_message`, verbatim
+  (`gateway.background.still_running` / `recent_output`)."
+  [session]
+  (let [new-output (redacted-output-tail session 500)
+        short-cmd (shorten-command-for-display (redact-command (:command session)))
+        header (str "⏳ Background task still running"
+                    (when-not (str/blank? short-cmd) (str " — `" short-cmd "`")))]
+    (if (str/blank? (str/trim new-output))
+      header
+      (str header "\n\nRecent output:\n```\n" (str/trim new-output) "\n```"))))
+
+(def ^:private watcher-route-fields
+  "Hermes `gateway/run_notifications._WATCHER_ROUTE_FIELDS`, verbatim."
+  ["session_key" "platform" "chat_type" "chat_id" "thread_id" "user_id" "user_name"])
+
+(defn build-process-completion-event
+  "Hermes `GatewayRunner._build_process_completion_event`: the synthetic
+  `completion` event for an agent-notify watcher. The output keeps the last
+  ~2000 chars snapped to a line boundary, with a marker when cut."
+  [watcher session session-id]
+  (let [raw (redact-command @(:output session))
+        out (if (> (count raw) 2000)
+              (let [tail (subs raw (- (count raw) 2000))
+                    nl (str/index-of tail "\n")
+                    tail (if nl (subs tail (inc nl)) tail)]
+                (str "[… output truncated — showing last " (count tail) " chars]\n" tail))
+              raw)
+        message-id (str/trim (str (or (get watcher "message_id") "")))
+        started (:started-at session)]
+    (cond-> (into {"type" "completion"
+                   "session_id" session-id}
+                  (for [k watcher-route-fields] [k (get watcher k "")]))
+      true (assoc "owner_task_id" (or @(:owner-task-id session) "")
+                  "task_id" (or @(:task-id session) "")
+                  "message_id" (when-not (str/blank? message-id) message-id))
+      (number? started) (assoc "started_at" (/ started 1000))
+      true (assoc "command" (redact-command (:command session))
+                  "exit_code" @(:exit-code session)
+                  "completion_reason" @(:completion-reason session)
+                  "termination_source" (or @(:termination-source session) "")
+                  "output" out
+                  "parent_session_id" (or (get watcher "parent_session_id")
+                                          @(:parent-session-id session)
+                                          "")))))
+
+(def max-completion-injection-attempts
+  "Hermes `gateway/run_notifications._MAX_COMPLETION_INJECTION_ATTEMPTS`:
+  process-watcher retries of a refused completion (~5 min at the default 5 s
+  check interval)."
+  8)
+
+(def completion-injection-retry-max-delay
+  "Hermes `gateway/run_notifications._COMPLETION_INJECTION_RETRY_MAX_DELAY`."
+  60)
+
+(defn jittered-backoff
+  "Hermes `agent/retry_utils.jittered_backoff` with `jitter_ratio=0.0` (the
+  process-watcher's calls pass 0.0, so the jitter term is exactly 0):
+  `min(base * 2^(attempt-1), max_delay)`, `attempt` 1-based; a 63+ exponent
+  or a non-positive base pins `max_delay`."
+  [attempt base-delay max-delay]
+  (let [exponent (max 0 (dec attempt))]
+    (if (or (>= exponent 63) (<= base-delay 0))
+      max-delay
+      (min (* base-delay (js/Math.pow 2 exponent)) max-delay))))

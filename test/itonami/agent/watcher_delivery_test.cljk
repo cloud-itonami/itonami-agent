@@ -1,0 +1,345 @@
+(ns itonami.agent.watcher-delivery-test
+  "The gateway watcher's delivery loop (Hermes gateway/run_notifications.py
+  `GatewayRunner._run_process_watcher`) and its verbatim contracts: the
+  formatting helpers (`gateway/run.py` `_format_concise_process_notification`,
+  `run_notifications._format_process_final_message` /
+  `_format_process_running_message` / `_build_process_completion_event`), the
+  mode loader (`run_config_loaders._load_background_notifications_mode`), the
+  surface policy (`process_registry_notifications.should_surface_notification`)
+  and the refusal backoff (`agent/retry_utils.jittered_backoff`)."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.process :as process]
+            [itonami.agent.watcher :as watcher]))
+
+(defn- parse-json [s] (js->clj (js/JSON.parse s)))
+
+(defn- fresh-home [tag]
+  (let [home (h/join (h/tmp-dir) (str "test-watcher-delivery-" tag "-" (.-pid js/process) "-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    home))
+
+(defn- fake-session
+  "A session map carrying exactly the atoms/fields the delivery loop and its
+  formatters read."
+  [id {:keys [state exit-code output command started-at owner task]}]
+  {:id id
+   :state (atom (or state :running))
+   :exit-code (atom exit-code)
+   :output (atom (or output ""))
+   :command (or command "echo hi")
+   :started-at started-at
+   :owner-task-id (atom (or owner ""))
+   :task-id (atom (or task "task-a"))
+   :completion-reason (atom "exited")
+   :termination-source (atom "")
+   :parent-session-id (atom "")})
+
+(defn- desc
+  [id {:keys [notify platform chat-id interval]}]
+  {"session_id" id
+   "check_interval" (or interval 5)
+   "session_key" "s1"
+   "platform" (or platform "telegram")
+   "chat_id" (or chat-id "c1")
+   "thread_id" "t1"
+   "user_id" "u1"
+   "user_name" "n1"
+   "message_id" "m1"
+   "notify_on_complete" (boolean notify)})
+
+(defn- passthrough-present!
+  "Render unconditionally and report the diagnostic flag back."
+  [diag-atom]
+  (fn [render _platform diagnostic]
+    (reset! diag-atom diagnostic)
+    (p/then (render) (fn [_] true))))
+
+;; ---- the loop ----
+
+(deftest silent-off-mode-pushes-nothing
+  (async done
+    (let [s (fake-session "proc_silent" {:exit-code 0 :output ""})
+          steps (atom 0)
+          sends (atom [])
+          enq (atom [])]
+      (-> (watcher/run-process-watcher!
+           (desc "proc_silent" {})
+           {:config {"display" {"background_process_notifications" "off"}}
+            :session-fn (fn [_] s)
+            :send! (fn [& args] (swap! sends conj args))
+            :enqueue! (fn [t e] (swap! enq conj [t e]) true)
+            :sleep-fn (fn [_]
+                        (let [i @steps]
+                          (swap! steps inc)
+                          (when (= i 1) (reset! (:state s) :exited))
+                          (p/resolved nil)))})
+          (p/then (fn [_]
+                    (testing "off without agent notify: wait for the exit, never push (Hermes `silent`)"
+                      (is (= [] @sends))
+                      (is (= [] @enq)))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest all-mode-running-updates-then-final
+  (async done
+    (let [s (fake-session "proc_all" {:exit-code 0 :output ""})
+          steps (atom 0)
+          sends (atom [])
+          diag (atom nil)]
+      (-> (watcher/run-process-watcher!
+           (desc "proc_all" {})
+           {:config {"display" {"background_process_notifications" "all"}}
+            :session-fn (fn [_] s)
+            :send! (fn [_ _ _ text _] (swap! sends conj text))
+            :present! (passthrough-present! diag)
+            :sleep-fn (fn [_]
+                        (let [i @steps]
+                          (swap! steps inc)
+                          (case i
+                            0 (reset! (:output s) "a")
+                            1 (swap! (:output s) str "b")
+                            (reset! (:state s) :exited))
+                          (p/resolved nil)))})
+          (p/then (fn [_]
+                    (testing "new output in `all` mode pushes the running update"
+                      (is (= 3 (count @sends)))
+                      (is (= ["⏳ Background task still running — `echo hi`\n\nRecent output:\n```\na\n```"
+                              "⏳ Background task still running — `echo hi`\n\nRecent output:\n```\nab\n```"]
+                             (take 2 @sends))))
+                    (testing "the exit pushes the final message with the raw-output block"
+                      (is (str/starts-with? (last @sends) "✅ Background task finished — `echo hi`"))
+                      (is (str/includes? (last @sends) "\n\nFinal output:\n```\nab\n```")))
+                    (testing "a clean completion is the requested result, not a diagnostic"
+                      (is (false? @diag)))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest agent-notify-injects-synthetic-completion
+  (async done
+    (let [s (fake-session "proc_inj" {:state :exited :exit-code 0 :output "done" :started-at 1000})
+          sends (atom [])
+          enq (atom [])]
+      (-> (watcher/run-process-watcher!
+           (desc "proc_inj" {:notify true})
+           {:config {}
+            :session-fn (fn [_] s)
+            :send! (fn [& args] (swap! sends conj args))
+            :enqueue! (fn [t e] (swap! enq conj [t e]) true)
+            :launching-turn-active? (fn [_ _] false)
+            :sleep-fn (fn [_] (p/resolved nil))})
+          (p/then (fn [_]
+                    (testing "the synthetic completion is injected once (`_enqueue_process_completion_notification`)"
+                      (is (= 1 (count @enq)))
+                      (let [[text evt] (first @enq)]
+                        (is (= "completion" (get evt "type")))
+                        (is (= "proc_inj" (get evt "session_id")))
+                        (is (= "s1" (get evt "session_key")))
+                        (is (= "telegram" (get evt "platform")))
+                        (is (= 1 (get evt "started_at")))
+                        (is (str/includes? text "completed normally (exit code 0)"))))
+                    (testing "delivered, launch turn idle: the chat gets no separate receipt"
+                      (is (= [] @sends)))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest launching-turn-busy-sends-concise-receipt
+  (async done
+    (let [s (fake-session "proc_busy" {:state :exited :exit-code 0 :output "done"})
+          sends (atom [])
+          enq (atom [])]
+      (-> (watcher/run-process-watcher!
+           (desc "proc_busy" {:notify true})
+           {:config {}
+            :session-fn (fn [_] s)
+            :send! (fn [_ _ _ text _] (swap! sends conj text))
+            :enqueue! (fn [t e] (swap! enq conj [t e]) true)
+            :launching-turn-active? (fn [_ _] true)
+            :sleep-fn (fn [_] (p/resolved nil))})
+          (p/then (fn [_]
+                    (testing "#112033: the concise receipt goes out while the launching turn is busy"
+                      (is (= 1 (count @enq)))
+                      (is (= 1 (count @sends)))
+                      (is (str/starts-with? (first @sends) "✅ Background task finished")))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest refused-injection-retries-with-jittered-backoff
+  (async done
+    (let [s (fake-session "proc_refused" {:state :exited :exit-code 0 :output "x"})
+          sleeps (atom [])
+          enq (atom [])
+          warned (atom [])
+          rechecked (atom nil)]
+      (-> (watcher/run-process-watcher!
+           (desc "proc_refused" {:notify true})
+           {:config {}
+            :session-fn (fn [_] s)
+            :enqueue! (fn [t e] (swap! enq conj [t e]) false)
+            :admission-recheck (fn [e] (reset! rechecked e) :committed)
+            :warn-fn (fn [& args] (swap! warned conj args))
+            :sleep-fn (fn [secs] (swap! sleeps conj secs) (p/resolved nil))})
+          (p/then (fn [_]
+                    (testing "a refusal retries at `jittered_backoff(…, jitter_ratio=0.0)` for at most 8 attempts"
+                      (is (= 8 (count @enq)))
+                      (is (= [5 10 20 40 60 60 60 60] @sleeps)))
+                    (testing "the last refusal's admission recheck is committed: no fallback notice"
+                      (is (some? @rechecked))
+                      (is (= [] @warned)))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest refused-injection-exhaustion-falls-back-to-notice
+  (async done
+    (let [s (fake-session "proc_fallback" {:state :exited :exit-code 1 :output "boom"})
+          warned (atom [])
+          sends (atom [])
+          diag (atom nil)]
+      (-> (watcher/run-process-watcher!
+           (desc "proc_fallback" {:notify true})
+           {:config {}
+            :session-fn (fn [_] s)
+            :enqueue! (fn [_ _] false)
+            :warn-fn (fn [& args] (swap! warned conj args))
+            :send! (fn [_ _ _ text _] (swap! sends conj text))
+            :present! (passthrough-present! diag)
+            :sleep-fn (fn [_] (p/resolved nil))})
+          (p/then (fn [_]
+                    (testing "8 refusals without a committed recheck warn exactly as Hermes"
+                      (is (= 1 (count @warned)))
+                      (is (str/includes? (str/join " " (first @warned))
+                                         "was refused 8 times; falling back to the notify_mode=concise notice")))
+                    (testing "then the plain notice goes out through present_notification's admission"
+                      (is (= 1 (count @sends)))
+                      (is (str/starts-with? (first @sends) "❌ Background task failed"))
+                      (is (str/includes? (first @sends) "Ask me to rerun it or show the full log."))
+                      (is (true? @diag)))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest consumed-completion-is-never-re-injected
+  (async done
+    (let [home (fresh-home "consumed")
+          ctx {:home home :task-id "task-w" :session-key ""}
+          res (parse-json (process/spawn! ctx {:argv ["/bin/sh" "-c" "echo w"]
+                                               :command "echo w"
+                                               :env (h/process-env)
+                                               :cwd home}))
+          id (get res "session_id")
+          sent (atom [])
+          enq (atom [])]
+      (-> (p/let [_ (process/manage ctx {"action" "wait" "session_id" id "timeout" 5})]
+            (is (process/is-completion-consumed? id))
+                    (watcher/run-process-watcher!
+                     (desc id {:notify true})
+                     {:config {}
+                      :session-fn process/get-session
+                      :send! (fn [& args] (swap! sent conj args))
+                      :enqueue! (fn [t e] (swap! enq conj [t e]) true)
+                      :sleep-fn (fn [_] (p/resolved nil))}))
+          (p/then (fn [_]
+                    (testing "wait/log consumed the completion: no injection, no raw notice (#65379)"
+                      (is (= [] @enq))
+                      (is (= [] @sent)))
+                    (h/rm home)
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (h/rm home) (done)))))))
+
+;; ---- the verbatim contracts ----
+
+(deftest shorten-command-for-display-is-verbatim
+  (testing "Hermes `gateway/run._shorten_command_for_display`"
+    (is (= "echo hi there" (process/shorten-command-for-display "  echo   hi\nthere ")))
+    (is (= (str (apply str (repeat 79 "a")) "…")
+           (process/shorten-command-for-display (apply str (repeat 100 "a")))))
+    (is (= "" (process/shorten-command-for-display nil)))))
+
+(deftest format-concise-process-notification-is-verbatim
+  (testing "Hermes `gateway/run._format_concise_process_notification` (locales/en.yaml `gateway.background.*`)"
+    (is (= "✅ Background task finished — `echo hi` (45s)"
+           (process/format-concise-process-notification "proc_x" "echo hi" 0 "" 45)))
+    (is (= "✅ Background task finished — `echo hi` (2h 5m)"
+           (process/format-concise-process-notification "proc_x" "echo hi" 0 "" 7500)))
+    (is (= "✅ Background task finished"
+           (process/format-concise-process-notification "proc_x" "" 0 "" nil)))
+    (is (= (str "❌ Background task failed — `echo hi there` (2m 5s, exit 3). Last output:\n```"
+                "\nline2\nline3\nline4\nline5\nline6\n```"
+                "\nAsk me to rerun it or show the full log.")
+           (process/format-concise-process-notification
+            "proc_x" "echo  hi\nthere" 3 "line1\n\nline2\nline3\nline4\nline5\nline6" 125)))))
+
+(deftest final-and-running-messages-are-verbatim
+  (let [s (fake-session "proc_f" {:exit-code 0 :output "hello world" :started-at 1000000})]
+    (testing "Hermes `_format_process_final_message` (concise mode shares only the header)"
+      (is (= "✅ Background task finished — `echo hi` (45s)"
+             (process/format-process-final-message "proc_f" s "concise" 1045000)))
+      (is (= "✅ Background task finished — `echo hi` (45s)\n\nFinal output:\n```\nhello world\n```"
+             (process/format-process-final-message "proc_f" s "result" 1045000))))
+    (testing "Hermes `_format_process_running_message`"
+      (is (= "⏳ Background task still running — `echo hi`\n\nRecent output:\n```\nhello world\n```"
+             (process/format-process-running-message s))))))
+
+(deftest build-process-completion-event-is-verbatim
+  (let [s (fake-session "proc_e"
+                        {:exit-code 2
+                         :output (str "a\n" (apply str (repeat 2500 "b")))
+                         :started-at 2000000
+                         :owner "task-o"
+                         :task "session:k"})
+        w (desc "proc_e" {:notify true})
+        evt (process/build-process-completion-event w s "proc_e")]
+    (testing "Hermes `GatewayRunner._build_process_completion_event` shape"
+      (is (= "completion" (get evt "type")))
+      (is (= "proc_e" (get evt "session_id")))
+      (is (= "s1" (get evt "session_key")))
+      (is (= "telegram" (get evt "platform")))
+      (is (= "c1" (get evt "chat_id")))
+      (is (= "t1" (get evt "thread_id")))
+      (is (= "task-o" (get evt "owner_task_id")))
+      (is (= "session:k" (get evt "task_id")))
+      (is (= "m1" (get evt "message_id")))
+      (is (= 2000 (get evt "started_at")))
+      (is (= 2 (get evt "exit_code")))
+      (is (= "exited" (get evt "completion_reason")))
+      (is (= "" (get evt "termination_source")))
+      (is (= "" (get evt "parent_session_id"))))
+    (testing "output keeps the last ~2000 chars with the truncation marker (#23284)"
+      (let [out (get evt "output")]
+        (is (str/starts-with? out "[… output truncated — showing last 2000 chars]\n"))
+        (is (= 2000 (count (subs out (inc (str/index-of out "\n"))))))))
+    (testing "a blank message_id is None, as Hermes `... or None`"
+      (is (nil? (get (process/build-process-completion-event
+                      (assoc w "message_id" "  ") s "proc_e")
+                     "message_id"))))))
+
+(deftest background-notifications-mode-is-verbatim
+  (testing "Hermes `run_config_loaders._load_background_notifications_mode`"
+    (is (= "concise" (process/background-notifications-mode {} {})))
+    (is (= "all" (process/background-notifications-mode {"HERMES_BACKGROUND_NOTIFICATIONS" "ALL"} {})))
+    (is (= "concise" (process/background-notifications-mode {"HERMES_BACKGROUND_NOTIFICATIONS" "junk"} {})))
+    (is (= "off" (process/background-notifications-mode
+                  {"HERMES_BACKGROUND_NOTIFICATIONS" ""}
+                  {"display" {"background_process_notifications" false}})))
+    (is (= "result" (process/background-notifications-mode
+                     {}
+                     {"display" {"background_process_notifications" "Result"}})))
+    (is (= "concise" (process/background-notifications-mode
+                      {}
+                      {"display" {"background_process_notifications" "  "}})))))
+
+(deftest jittered-backoff-matches-retry-utils
+  (testing "Hermes `agent/retry_utils.jittered_backoff` with jitter_ratio=0.0"
+    (is (= 10 (process/jittered-backoff 1 10 60)))
+    (is (= 40 (process/jittered-backoff 3 10 60)))
+    (is (= 60 (process/jittered-backoff 5 10 60)))
+    (is (= 60 (process/jittered-backoff 70 10 60)))
+    (is (= 60 (process/jittered-backoff 1 0 60)))))
+
+(deftest should-surface-notification-is-verbatim
+  (testing "Hermes `process_registry_notifications.should_surface_notification`"
+    (is (true? (process/should-surface-notification {"owner_task_id" "" "task_id" "session:k"} false)))
+    (is (false? (process/should-surface-notification {"owner_task_id" "sub-1" "task_id" "session:k"} false)))
+    (is (true? (process/should-surface-notification {"owner_task_id" "sub-1" "task_id" "session:k"} true)))
+    (is (false? (process/should-surface-notification {"task_id" "sub-2"} false)))))
