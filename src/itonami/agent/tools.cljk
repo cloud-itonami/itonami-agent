@@ -234,7 +234,7 @@
                "timeout" {"type" "integer" "minimum" 1 "maximum" 300 "description" "Maximum runtime in seconds (default 300)."}}
               ["code"])
    "session_search"
-   (fn-schema "session_search" "Search and read Hermes conversation history from this profile's state.db. Supports recent-session browsing, FTS discovery, reading the latest messages in a session, and scrolling around a message id. Cross-profile: pass profile=<name> (or the @session:<profile>/<id> link as session_id) to search another profile's state.db read-only. Discovery honours detail=adaptive (default: only the top-ranked hit is fully hydrated) / full. It is read-only."
+   (fn-schema "session_search" "Search and read Hermes conversation history from this profile's state.db. Supports recent-session browsing, FTS discovery, reading the latest messages in a session, and scrolling around a message id. Cross-profile: pass profile=<name> (or the @session:<profile>/<id> link as session_id) to search another profile's state.db read-only. Discovery honours detail=adaptive (default: only the top-ranked hit is fully hydrated) / full, plus sort (newest/oldest temporal bias), after/before session-start bounds, and exclude_session_ids (those sessions and their lineage omitted). It is read-only."
               {"query" {"type" "string" "description" "Full-text search query; omit to browse recent sessions."}
                "limit" {"type" "integer" "minimum" 1 "maximum" 20 "description" "Maximum sessions or matching messages (default 5)."}
                "session_id" {"type" "string" "description" "Read one session; an @session:<profile>/<id> link resolves to that profile (or pass profile=)."}
@@ -242,7 +242,11 @@
                "window" {"type" "integer" "minimum" 1 "maximum" 20 "description" "Messages on each side of the anchor (default 5)."}
                "profile" {"type" "string" "description" "Search another profile's history (read-only) instead of this one."}
                "detail" {"type" "string" "enum" ["adaptive" "full"] "description" "Discovery shape only. adaptive (default) fully hydrates the top-ranked result and returns only the anchor message for lower-ranked results; full returns bookends and the complete anchored window for every result."}
-               "role_filter" {"type" "string" "enum" ["user,assistant" "user,assistant,tool" "user" "assistant" "tool"]}}
+               "role_filter" {"type" "string" "enum" ["user,assistant" "user,assistant,tool" "user" "assistant" "tool"]}
+               "sort" {"type" "string" "enum" ["newest" "oldest"] "description" "Discovery shape only. Temporal bias on top of FTS5 ranking: omit for relevance-only (exploratory recall), 'newest' for \"where did we leave X\", 'oldest' for \"how did X start\"."}
+               "after" {"type" "string" "description" "Discovery shape only. Inclusive lower bound on session start time. ISO date/datetime (e.g. 2026-06-01) or relative duration (7d, 24h, 2w = within the last N). Use only when the user names a time frame. sort is a ranking bias, not a bound."}
+               "before" {"type" "string" "description" "Discovery shape only. Exclusive upper bound on session start time. ISO date/datetime (a date-only value is midnight UTC that day) or relative duration (7d = older than a week). Use only when the user names a time frame."}
+               "exclude_session_ids" {"type" "array" "items" {"type" "string"} "description" "Discovery shape only. Session ids already inspected this task. Those sessions and their lineage are omitted so a later query explores instead of repeating the same hit. Cap 20."}}
               [])
    "kanban_show"
    (fn-schema "kanban_show" "Read a Hermes Kanban task with its parent/child links, comments, recent events, and runs."
@@ -1603,6 +1607,113 @@
      "messages_after" (get view "messages_after")
      "detail" detail-level}))
 
+;; ---- Hermes session_search discovery `sort` / `after` / `before` / `exclude_session_ids`
+;; (tools/session_search_tool.py `_parse_iso_bound` / `_normalize_exclude_session_ids` /
+;; `_excluded_lineage_roots` / `_resolve_to_parent`; hermes_state_search.py
+;; `_search_filter_clauses` (`s.started_at >= ?` / `s.started_at < ?`, bound inside the
+;; query so LIMIT cannot be filled by out-of-window hits) and `_FTS_ORDER_BY`).
+
+(def ^:private session-relative-bound-re #"^(\d+)\s*([hdw])$")
+(def ^:private session-relative-unit-seconds {"h" 3600 "d" 86400 "w" 604800})
+(def ^:private session-iso-bound-re
+  ;; Extended ISO date/datetime: date-only, `T`/space separator, optional seconds
+  ;; and fraction, `Z` or ±HH[:MM] offset (the shapes `datetime.fromisoformat`
+  ;; accepts and the error message advertises).
+  #"^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d+))?)?(Z|z|[+-]\d{2}(?::?\d{2})?)?)?$")
+(def ^:private session-exclude-ids-cap 20)
+(def ^:private session-discover-scan-limit 300)
+
+(defn- session-py-repr
+  "Python repr() — only used to phrase Hermes' `invalid time bound: {value!r}` message."
+  [value]
+  (cond
+    (nil? value) "None"
+    (true? value) "True"
+    (false? value) "False"
+    (string? value) (let [q (if (and (str/includes? value "'") (not (str/includes? value "\""))) "\"" "'")]
+                      (str q (-> value (str/replace "\\" "\\\\") (str/replace q (str "\\" q))) q))
+    :else (str value)))
+
+(defn- session-relative-bound-ts
+  "`_parse_iso_bound`'s relative branch: \"7d\" / \"24h\" / \"2w\" = now minus N
+  hours/days/weeks (`^(\\d+)\\s*(h|d|w)$`, case-insensitive, over the stripped text)."
+  [text]
+  (when-let [[_ n unit] (re-matches session-relative-bound-re (str/lower-case text))]
+    (- (js/Math.floor (/ (.now js/Date) 1000))
+       (* (js/parseInt n 10) (get session-relative-unit-seconds unit)))))
+
+(defn- session-iso-epoch-ts
+  "`_parse_iso_bound`'s ISO branch: date-only is midnight UTC, naive datetimes are
+  UTC (as the Python forces with `replace(tzinfo=UTC)`), `Z`/±HH[:MM] offsets apply."
+  [text]
+  (when-let [[_ y mo d h mi s _frac off] (re-matches session-iso-bound-re text)]
+    (let [yr (js/parseInt y 10) mo1 (js/parseInt mo 10) dy (js/parseInt d 10)
+          hh (js/parseInt (or h "0") 10) mm (js/parseInt (or mi "0") 10) ss (js/parseInt (or s "0") 10)
+          last-day (.getUTCDate (js/Date. (js/Date.UTC yr mo1 0)))]
+      (when (and (<= 1 mo1 12) (<= 1 dy last-day) (<= 0 hh 23) (<= 0 mm 59) (<= 0 ss 59))
+        (let [base (js/Date.UTC yr (dec mo1) dy hh mm ss)
+              off-min (cond
+                        (or (nil? off) (= "Z" off) (= "z" off)) 0
+                        :else (let [sign (if (= "-" (subs off 0 1)) -1 1)
+                                    digits (str/replace (subs off 1) ":" "")
+                                    oh (js/parseInt (subs digits 0 2) 10)
+                                    om (if (>= (count digits) 4) (js/parseInt (subs digits 2 4) 10) 0)]
+                                (* sign (+ (* 60 oh) om))))]
+          (js/Math.floor (/ (- base (* off-min 60000)) 1000)))))))
+
+(defn session-parse-iso-bound
+  "Hermes `_parse_iso_bound` semantics: nil/blank -> nil; relative duration ->
+  now minus N hours/days/weeks; ISO date/datetime -> UTC unix seconds; anything
+  else raises Hermes' ValueError text verbatim (`invalid time bound: <repr>
+  (expected ISO date/datetime like 2026-07-01, or a relative duration like 7d,
+  24h, 2w)`), which `_dispatch` surfaces as the tool error."
+  [value]
+  (if (nil? value)
+    nil
+    (let [text (str/trim (str value))]
+      (if (str/blank? text)
+        nil
+        (or (session-relative-bound-ts text)
+            (session-iso-epoch-ts text)
+            (throw (js/Error. (str "invalid time bound: " (session-py-repr value)
+                                   " (expected ISO date/datetime like 2026-07-01, "
+                                   "or a relative duration like 7d, 24h, 2w)"))))))))
+
+(defn session-normalize-exclude-ids
+  "Hermes `_normalize_exclude_session_ids`: deduped, stripped session ids from a
+  string or list, capped at `_EXCLUDE_SESSION_IDS_CAP` (20)."
+  [raw]
+  (let [items (cond (string? raw) [raw]
+                    (array? raw) (vec raw)
+                    (sequential? raw) (vec raw)
+                    :else [])]
+    (loop [items items, out []]
+      (if (or (empty? items) (>= (count out) session-exclude-ids-cap))
+        out
+        (let [item (first items)
+              sid (if (string? item) (str/trim item) "")]
+          (recur (rest items)
+                 (if (and (seq sid) (not (some #(= sid %) out))) (conj out sid) out)))))))
+
+(defn- session-lineage-root
+  "`_resolve_to_parent`'s root id: walk `parent_session_id` to the top, cycle-safe."
+  [db session-id]
+  (loop [cur session-id visited #{}]
+    (if (or (nil? cur) (contains? visited cur))
+      cur
+      (let [parent (get (first (sqlite-records db "SELECT parent_session_id FROM sessions WHERE id = ?" cur))
+                        "parent_session_id")]
+        (if (and (string? parent) (seq parent))
+          (recur parent (conj visited cur))
+          cur)))))
+
+(defn- session-excluded-lineage-roots
+  "`_excluded_lineage_roots`: the excluded ids plus their lineage roots, so a
+  child id also hides its parent chain."
+  [db exclude-ids]
+  (reduce (fn [acc sid] (conj acc sid (or (session-lineage-root db sid) sid)))
+          #{} exclude-ids))
+
 (defn session-search
   "Read-only session history search. Cross-profile lookup follows Hermes
   `session_search_tool._resolve_profile_db`: the `profile` argument and a raw
@@ -1611,7 +1722,8 @@
   `_read_scoped`'s miss hint). Discovery honours Hermes' `detail` modes
   (`_hydrate_hit`: `adaptive` fully hydrates only the top-ranked hit, `full`
   hydrates every hit)."
-  [ctx {:strs [query limit session_id around_message_id window role_filter profile detail]}]
+  [ctx {:strs [query limit session_id around_message_id window role_filter profile detail
+               sort after before exclude_session_ids]}]
   (let [;; Hermes session_search_tool.session_search: ids never contain "/", so a
         ;; "/" splits session_id into profile + id; the embedded profile is
         ;; adopted only when none was passed.
@@ -1627,6 +1739,16 @@
         profile-target? (and (some? profile) (not (str/blank? (str profile))))
         detail-mode (if (and (string? detail) (= "full" (str/lower-case (str/trim detail))))
                       "full" "adaptive")
+        ;; `_dispatch`: sort is trimmed/lowercased and only "newest"/""oldest" count
+        ;; (anything else falls back to rank-only); the bounds parse (and its error)
+        ;; belongs to discovery alone.
+        sort-mode (when (string? sort)
+                    (let [s (str/lower-case (str/trim sort))]
+                      (when (#{"newest" "oldest"} s) s)))
+        bounds (try {:after (session-parse-iso-bound after)
+                     :before (session-parse-iso-bound before)}
+                    (catch :default e {:bound-error (.-message e)}))
+        excluded-ids (session-normalize-exclude-ids exclude_session_ids)
         resolved (try
                    {:db-path (if profile-target?
                                (session-resolve-profile-db-path (:home ctx) profile)
@@ -1650,6 +1772,9 @@
       (err "session_search requires this profile's state.db")
       (not (readable? ctx "session_search" (:db-path resolved)))
       (err "session_search denied by this run's read policy")
+      ;; Hermes `_dispatch` parses the bounds only for discovery — read/scroll/browse ignore them.
+      (and (:bound-error bounds) (not session_id) (not (str/blank? (or query ""))))
+      (err (:bound-error bounds))
       :else
       (let [opened (try {:db (sqlite/DatabaseSync. (:db-path resolved) #js {:readOnly true})}
                         (catch :default e
@@ -1692,15 +1817,38 @@
                               session_id limit))
 
                           (not (str/blank? (or query "")))
-                          (sqlite-records db
-                            (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count, "
-                                 "m.id AS match_message_id, m.role, m.content, m.timestamp, "
-                                 "snippet(messages_fts, 0, '[', ']', ' … ', 16) AS snippet "
-                                 "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
-                                 "JOIN sessions s ON s.id = m.session_id WHERE messages_fts MATCH ? AND "
-                                 hidden-filter " AND " source-filter " AND m.role IN (" role-sql ") "
-                                 "ORDER BY bm25(messages_fts), m.id DESC LIMIT ?")
-                            query limit)
+                          ;; hermes_state_search.py `_search_filter_clauses` /
+                          ;; `_FTS_ORDER_BY`: `after_ts`/`before_ts` bound
+                          ;; `sessions.started_at` (inclusive / exclusive) inside the
+                          ;; query so LIMIT cannot be filled by out-of-window hits, and
+                          ;; `sort` is a temporal bias on top of rank. The 300-row scan
+                          ;; is `_DISCOVER_SCAN_LIMIT`; exclusion (session_search_tool.py
+                          ;; `_excluded_lineage_roots`, `_discover`'s row filter) drops
+                          ;; rows before the cap so an excluded hit never starves the limit.
+                          (let [order-sql (case sort-mode
+                                            "newest" "ORDER BY m.timestamp DESC, bm25(messages_fts)"
+                                            "oldest" "ORDER BY m.timestamp ASC, bm25(messages_fts)"
+                                            "ORDER BY bm25(messages_fts), m.id DESC")
+                                window-sql (str (when (:after bounds) " AND s.started_at >= ?")
+                                                (when (:before bounds) " AND s.started_at < ?"))
+                                window-params (vec (concat (when (:after bounds) [(:after bounds)])
+                                                           (when (:before bounds) [(:before bounds)])))
+                                rows (apply sqlite-records db
+                                        (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count, "
+                                             "m.id AS match_message_id, m.role, m.content, m.timestamp, "
+                                             "snippet(messages_fts, 0, '[', ']', ' … ', 16) AS snippet "
+                                             "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
+                                             "JOIN sessions s ON s.id = m.session_id WHERE messages_fts MATCH ? AND "
+                                             hidden-filter " AND " source-filter " AND m.role IN (" role-sql ") "
+                                             window-sql " " order-sql " LIMIT ?")
+                                        (into [query] (conj window-params session-discover-scan-limit)))
+                                excluded (session-excluded-lineage-roots db excluded-ids)]
+                            (vec (take limit
+                                   (remove (fn [row]
+                                             (let [sid (get row "session_id")]
+                                               (or (contains? excluded sid)
+                                                   (contains? excluded (session-lineage-root db sid)))))
+                                           rows))))
 
                           :else
                           (sqlite-records db
