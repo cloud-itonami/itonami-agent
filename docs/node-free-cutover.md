@@ -318,3 +318,16 @@ allow-csv 35,37、KEXE_STRUCTURED_REPORT 付き）:
 guest 証跡の状態: **WRITE/APPEND/EXISTS は node 無しで動くことが実証済み**
 （exact grant、boot67、ファイル内容 `AAABB` を guest 自身の fs で確認）。
 READ とディレクトリ grant は上記 gap 解消待ち。
+
+## 計測 9 追記（2026-10-21）: gap 1 修正・guest 検証済み
+
+amu PR #1422（`kexe_loader`: fs READ provider をヒープ排除し string pool へ
+直接読取）で gap 1 を修正。guest 検証（boot68.log、exact-file grant）:
+
+    PHASE:EXISTS1:ANS1:1PHASE:WRITE:PHASE:APPEND:PHASE:READ:STORE_READ:AAABB
+    {:status :ok :result 1 ...}
+
+**WRITE→APPEND→READ の store cycle が node 無しで完走**（guest の実 fs に
+`AAABB` 着地も確認）。gap 2（descendant open 分支の SIGSYS）は未修・非
+allocator 起因として切り分け済み（amu#1421 に記録）。amu PR は CI
+（adopted-seed-native 他）が required なので checks 緑待ちで open。
