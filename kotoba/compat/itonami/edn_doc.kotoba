@@ -1,0 +1,40 @@
+(ns itonami.edn-doc
+  "cljs.reader/read-string の kotoba 置換（計測 5）: EDN は
+  document-edn-read で :document に読み、フィールドは map-field で取る。
+  測定済みの navigation 契約: map entry は 2 要素 vector [key value]、
+  vector は document-vector-at、list は document-list-at、scalar は
+  document-*-value（[:option X]）→ option-value で unwrap。
+
+  置換対象の cljs.reader 呼び出しは 3 箇所（p2p/profile/rails の
+  read-string）で、いずれも EDN ファイル全体を map として読む形。"
+  (:export [map-field map-field-i64 map-field-string
+            test-read test-map-field]))
+
+(defn map-field [d :document k :string fallback :document] :document
+  (map-field-run d k fallback 0 (document-count d)))
+
+(defn- map-field-run [d :document k :string fallback :document i :i64 n :i64] :document
+  (if (>= i n)
+    fallback
+    (let [e (option-value (document-map-entry-at d i) d)
+          kd (option-value (document-vector-at e 0) d)
+          kn (keyword-name (option-value (document-keyword-value kd) (keyword-from-string "")))]
+      (if (string=? kn k)
+        (option-value (document-vector-at e 1) d)
+        (map-field-run d k fallback (+ i 1) n)))))
+
+(defn map-field-i64 [d :document k :string fallback :i64] :i64
+  (option-value (document-i64-value (map-field d k d)) fallback))
+
+(defn map-field-string [d :document k :string fallback :string] :string
+  (option-value (document-string-value (map-field d k d)) fallback))
+
+(defn test-read [] :bool
+  (document-equal? (document-edn-read "{:a 1}") (document-edn-read "{:a 1}")))
+
+(defn test-map-field [] :bool
+  (let [d (document-edn-read "{:n 42 :s \"x\" :m {:k 1}}")]
+    (and (= 42 (map-field-i64 d "n" 0))
+         (string=? "x" (map-field-string d "s" ""))
+         (= 7 (map-field-i64 d "missing" 7))
+         (= 1 (map-field-i64 (map-field d "m" d) "k" 0)))))

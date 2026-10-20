@@ -121,3 +121,25 @@ open wall だった。実測の結論 — **コンテナは不要**:
 
 compat に `split-count` / `split-piece` / `test-split` を追加。
 `amu check :ok true` / `amu test 21/21`（:jvm-kir :js :wasm）。
+
+## 計測 5: cljs.reader の置換可否 → 置換可（2026-10-20）
+
+cljs.reader 呼び出しは 3 箇所（p2p/profile/rails の `reader/read-string`、
+いずれも EDN ファイル全体を map として読む形）。置換ルートを実測で確定:
+
+- **`document-edn-read` は runtime 実行可**（`document-equal?` と組み合わせて
+  3 target 緑）。EDN ファイル → `:document`。
+- navigation 契約を実測で確定（test で pin 済み）:
+  - map entry は **2 要素 vector [key value]**（`document-map-entry-at d i` →
+    entry、`document-vector-at entry 0/1` → key/value。entry 自体が value では
+    無い。`document-list-at` は list 専用で vector には `document-list-required`
+    を出して拒む）
+  - scalar は `document-*-value` → `[:option X]`、`option-value v default` で unwrap
+- ヘルパ `kotoba/compat/itonami/edn_doc.kotoba`（ns `itonami.edn-doc`）を実装:
+  `map-field`（key 名で fallback つき取得）/ `map-field-i64` /
+  `map-field-string`。`amu check :ok true` / `amu test 6/6`（3 target、
+  nested map と fallback を含む）。
+- `cljs.reader` モジュール自体は shim しない: port 済み呼び出しは edn_doc の
+  API を直接使う。**read-string の戻りである Clojure map は safe profile に
+  無い**（これが cljs.reader 壁の正体）。壁カウントは呼び出し 3 件の port で
+  消える。
