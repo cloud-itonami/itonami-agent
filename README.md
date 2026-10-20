@@ -98,9 +98,15 @@ timed-out process, and a diagnostic-only wake running but never displacing the
 printed answer under suppression), and any one-shot exit that skips the loop
 lingers bounded (`wait_for_pending_completions`, `waited`/`completed`/
 `timed_out` id lists, orphaned-pipe exits reconciled from the real child state)
-for `notify_on_complete` children before the parent dies. Remaining: gateway
-completion watchers, and Hermes' silent-background / `notify_unsupported`
-result notes. Kotoba `execute_code` runs one confined, stateless Python source string and does not expose `hermes_tools` RPC. Kotoba `session_search` reads only the current profile's local `state.db` and supports bounded browse, FTS discovery, read, and scroll; cross-profile lookup and Hermes adaptive detail are not implemented. `hermes-cli`/`hermes-cron` retain Hermes' full core inventory and refuse to start when any selected tool is unsupported, rather than silently presenting a reduced bundle |
+for `notify_on_complete` children before the parent dies. The spawn result carries Hermes' `spawn_background_process` result notes and
+effective arming (`hint` = `_SILENT_BACKGROUND_HINT` +
+`_HOMEBREW_CI_POLLER_HINT`, `notify_unsupported` = `_ASYNC_UNSUPPORTED_NOTE`
+on an async-unsupported turn — Hermes binds `async_delivery=False` for cron
+job turns, so Kotoba's default cron executor runs its turns `:async-delivery?`
+false — `watch_patterns_ignored`, `heartbeat_ignored`, `subagent_note`, and
+the `heartbeat_seconds` / `watch_patterns` keys; a delegated child's spawn
+stays armed exactly as Hermes while its result says so). Remaining: gateway
+completion watchers. Kotoba `execute_code` runs one confined, stateless Python source string and does not expose `hermes_tools` RPC. Kotoba `session_search` reads only the current profile's local `state.db` and supports bounded browse, FTS discovery, read, and scroll; cross-profile lookup and Hermes adaptive detail are not implemented. `hermes-cli`/`hermes-cron` retain Hermes' full core inventory and refuse to start when any selected tool is unsupported, rather than silently presenting a reduced bundle |
 | `cron/jobs.json` (including `monitor_script` / `monitor_url`), 5-field cron / interval / once schedules | read and written in Hermes' format; Kotoba can create, list, and update monitor jobs, then evaluates the monitor before the agent turn |
 | Pre-run script extensions `.sh`/`.bash`, `.cljk`, `.js`/`.mjs`, `.py`, `.hy` | extension dispatch; `.hy` runs through `hy.cmdline.hy_main` with the job/config-selected Python, which must have Hy installed |
 | cron prompt: `_CRON_HINT`, `## Script Output` / `## Script Error` block, empty stdout and `{"wakeAgent": false}` skip, `[SILENT]`, `[CRON_FAILURE]` | identical text and semantics |

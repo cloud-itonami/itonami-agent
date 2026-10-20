@@ -1,0 +1,119 @@
+(ns itonami.agent.spawn-notes-test
+  "Hermes tools/terminal_tool_background.spawn_background_process's spawn
+  result notes and effective arming (`spawn-notify-disposition`):
+  `_SILENT_BACKGROUND_HINT` / `_HOMEBREW_CI_POLLER_HINT` (`hint`),
+  `_ASYNC_UNSUPPORTED_NOTE` (`notify_unsupported`),
+  `_resolve_notification_flag_conflict` (`watch_patterns_ignored`),
+  `heartbeat_ignored`, `_SUBAGENT_NOTIFY_NOTE`, and the `heartbeat_seconds` /
+  `watch_patterns` result keys (Hermes `arm_heartbeat`'s floor-clamped return)."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.process :as process]))
+
+(defn- parse-json [s] (js->clj (js/JSON.parse s)))
+
+(defn- fresh-home [tag]
+  (let [home (h/join (h/tmp-dir) (str "test-notes-" tag "-" (.-pid js/process) "-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    home))
+
+(defn- spawn-sh!
+  "Spawn a short-lived process; resolves when its on-exit hook fires (after the
+  completion event would be enqueued — never via wait/log/poll, which consume
+  it). `opts` overrides the defaults, so `:command` may differ from the argv."
+  [ctx opts script]
+  (let [resolve-exit (atom nil)
+        exited (js/Promise. (fn [res] (reset! resolve-exit res)))
+        res (parse-json (process/spawn! ctx (merge {:argv ["/bin/sh" "-c" script]
+                                                    :command script
+                                                    :env (h/process-env)
+                                                    :cwd (:home ctx)
+                                                    :on-exit (fn [_ _] (@resolve-exit true))}
+                                                   opts)))]
+    [res exited]))
+
+(deftest silent-background-hint
+  (let [home (fresh-home "silent")
+        ctx {:home home :task-id "task-n" :session-key "s1"}
+        [res _] (spawn-sh! ctx {} "true")]
+    (testing "a spawn with no notification intent carries _SILENT_BACKGROUND_HINT, verbatim"
+      (is (string? (get res "hint")))
+      (is (str/starts-with? (get res "hint")
+                           "background=true without notify_on_complete=true means this process runs SILENTLY"))
+      (is (not (contains? res "notify_on_complete")))
+      (is (not (contains? res "notify_unsupported"))))))
+
+(deftest homebrew-ci-poller-hint-appends
+  (let [home (fresh-home "poller")
+        ctx {:home home :task-id "task-n" :session-key "s2"}
+        [res _] (spawn-sh! ctx {:command "gh pr view --json statusCheckRollup"} "true")]
+    (testing "_HOMEBREW_CI_POLLER_HINT joins after the silent hint with a blank line"
+      (is (str/starts-with? (get res "hint")
+                           "background=true without notify_on_complete=true means this process runs SILENTLY"))
+      (is (str/includes? (get res "hint") "\n\nThis looks like a homebrewed CI poller"))
+      (is (str/includes? (get res "hint") "green-ci-policy")))))
+
+(deftest notify-unsupported-on-an-async-unsupported-turn
+  (async done
+    (let [home (fresh-home "unsup")
+          ctx {:home home :task-id "task-n" :session-key "s3" :async-delivery? false}
+          [res exited] (spawn-sh! ctx {:notify-on-complete? true} "true")]
+      (testing "Hermes _apply_async_support drops the requested notify with _ASYNC_UNSUPPORTED_NOTE"
+        (is (= false (get res "notify_on_complete")))
+        (is (string? (get res "notify_unsupported")))
+        (is (str/includes? (get res "notify_unsupported") "process(action='poll')"))
+        (is (not (contains? res "hint"))))
+      (-> exited
+          (p/then (fn [_]
+                    (testing "the drop is real: no completion is ever queued"
+                      (is (= 0 (count (process/drain-notifications! {:session-key "s3"})))))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e)) (done)))))))
+
+(deftest heartbeat-ignored-when-no-delivery-can-come-back
+  (let [home (fresh-home "hb-ign")
+        ctx {:home home :task-id "task-n" :session-key "s4" :async-delivery? false}
+        [res _] (spawn-sh! ctx {:notify-on-complete? true :heartbeat-seconds 90} "true")]
+    (testing "Hermes' elif heartbeat_seconds branch: heartbeat_ignored, nothing armed"
+      (is (string? (get res "heartbeat_ignored")))
+      (is (str/includes? (get res "heartbeat_ignored") "notify=true delivery"))
+      (is (not (contains? res "heartbeat_seconds"))))))
+
+(deftest heartbeat-seconds-is-arm-heartbeats-clamped-return
+  (let [home (fresh-home "hb-ok")
+        ctx {:home home :task-id "task-n" :session-key "s5"}
+        [res _] (spawn-sh! ctx {:notify-on-complete? true :heartbeat-seconds 30} "true")]
+    (testing "arm_heartbeat returns the floor-clamped interval (HEARTBEAT_MIN_SECONDS = 60)"
+      (is (= 60 (get res "heartbeat_seconds")))
+      (is (true? (get res "notify_on_complete"))))))
+
+(deftest watch-patterns-conflict-note
+  (testing "Hermes _resolve_notification_flag_conflict (background): patterns dropped with a note"
+    (let [d (process/spawn-notify-disposition {:command "true"
+                                               :notify-on-complete? true
+                                               :watch-patterns ["ready"]})]
+      (is (true? (:notify-on-complete? d)))
+      (is (= [] (:watch-patterns d)))
+      (is (str/includes? (str (get-in d [:notes "watch_patterns_ignored"]))
+                        "duplicate notifications"))))
+  (testing "only an armed (post-conflict) list is echoed on the result"
+    (let [home (fresh-home "watch")
+          ctx {:home home :task-id "task-n" :session-key "s6"}
+          [res _] (spawn-sh! ctx {:watch-patterns ["ready"]} "true")]
+      (is (= ["ready"] (get res "watch_patterns")))
+      (is (not (contains? res "notify_on_complete")))
+      (is (not (contains? res "hint"))))))
+
+(deftest subagent-result-note-without-heartbeat-arming
+  (let [home (fresh-home "sub")
+        ctx {:home home :task-id "task-n" :session-key "s7"
+             :subagent {:parent-owner "task-p" :parent-session-key "s7"}}
+        [res _] (spawn-sh! ctx {:notify-on-complete? true :heartbeat-seconds 90} "true")]
+    (testing "the session stays armed but the result says the notice cannot reach the parent"
+      (is (= false (get res "notify_on_complete")))
+      (is (str/includes? (str (get res "subagent_note")) "process_manage(action='handoff'"))
+      (testing "Hermes' elif: a delegated child arms no heartbeat and says nothing about it"
+        (is (not (contains? res "heartbeat_seconds")))
+        (is (not (contains? res "heartbeat_ignored")))))))
