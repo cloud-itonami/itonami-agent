@@ -1,0 +1,27 @@
+(ns tasks-probe
+  "Guest evidence for the tasks-table port: conditional transitions, claim
+  with lock, done with result."
+  (:require [itonami.tasks :as t])
+  (:export [tasks-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn tasks-probe [] :i64
+  (let [c (t/task-create "/data/ts" "t1" 0)
+        c2 (t/task-create "/data/ts" "t1" 0)
+        tr (t/task-transition "/data/ts" "t1" 0 1)
+        bad (t/task-transition "/data/ts" "t1" 0 3)
+        cl (t/task-claim "/data/ts" "t1" "alice" "L1")
+        cl2 (t/task-claim "/data/ts" "t1" "bob" "L2")
+        st (t/task-status "/data/ts" "t1")
+        as (t/task-get-field "/data/ts" "t1" 1)
+        rn (t/task-transition "/data/ts" "t1" 2 3)
+        dn (t/task-done "/data/ts" "t1" "ok")
+        rs (t/task-get-field "/data/ts" "t1" 4)
+        say (wire-say (string-concat "TSRESULT:" (string-concat (string-from-i64 st) (string-concat ":" rs))))]
+    (if (and (= 1 c) (= 0 c2) (= 1 tr) (= 0 bad) (= 1 cl) (= 0 cl2)
+             (= 2 st) (string=? "alice" as) (= 1 rn) (= 1 dn)
+             (string=? "ok" rs) (= 6 (t/task-status "/data/ts" "t1")))
+      1 0)))

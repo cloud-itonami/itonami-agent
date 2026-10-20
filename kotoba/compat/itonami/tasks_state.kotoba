@@ -1,0 +1,73 @@
+(ns itonami.tasks-state
+  "The pure half of the tasks-table port (ledger 8 design A, consumer 4
+  slice 2: tools.cljk's tasks, 31 SQL). Kanban statuses measured from the
+  UPDATE surface: 0 todo / 1 ready / 2 claimed / 3 running / 4 blocked /
+  5 review / 6 done. Row content is five newline-separated fields: status
+  digit, assignee, claim lock, current run id, result.
+
+  The SQLite transitions are CONDITIONAL (UPDATE ... WHERE status=...), so
+  the port keeps a generic from-conditional flip: a transition succeeds only
+  when the row is in the expected status. Self-contained: native-qualified
+  ops."
+  (:require [itonami.journal-core :as jc])
+  (:export [status-code status-name row-encode row-status row-field
+            test-status test-row]))
+
+(defn status-code [name :string] :i64
+  ;; todo ready claimed running blocked review done -> 0..6; else -1.
+  (if (string=? name "todo") 0
+    (if (string=? name "ready") 1
+      (if (string=? name "claimed") 2
+        (if (string=? name "running") 3
+          (if (string=? name "blocked") 4
+            (if (string=? name "review") 5
+              (if (string=? name "done") 6 -1))))))))
+
+(defn status-name [code :i64] :string
+  (if (= code 0) "todo"
+    (if (= code 1) "ready"
+      (if (= code 2) "claimed"
+        (if (= code 3) "running"
+          (if (= code 4) "blocked"
+            (if (= code 5) "review"
+              (if (= code 6) "done" ""))))))))
+
+(defn row-encode [status :i64 assignee :string lock :string run :string result :string] :string
+  (string-concat (string-substring "0123456" status (+ status 1))
+                 (string-concat "
+" (string-concat assignee
+                 (string-concat "
+" (string-concat lock
+                 (string-concat "
+" (string-concat run
+                 (string-concat "
+" result)))))))))
+
+(defn row-status [content :string] :i64
+  (if (= 0 (string-length content))
+    -1
+    (- (string-code-point-at content 0) 48)))
+
+(defn row-field [content :string n :i64] :string
+  ;; n: 1 assignee, 2 lock, 3 run, 4 result (journal-core piece on newlines;
+  ;; a field carrying a newline would shift the columns -- such fields are
+  ;; refused by the writer side).
+  (if (= 0 (string-length content))
+    ""
+    (jc/piece content "
+" n)))
+
+(defn test-status [] :bool
+  (and (= 0 (status-code "todo"))
+       (= 6 (status-code "done"))
+       (= -1 (status-code "nope"))
+       (string=? "running" (status-name 3))
+       (string=? "" (status-name 9))))
+
+(defn test-row [] :bool
+  (and (= 2 (row-status (row-encode 2 "alice" "L1" "r1" "")))
+       (= -1 (row-status ""))
+       (string=? "alice" (row-field (row-encode 2 "alice" "L1" "r1" "ok") 1))
+       (string=? "L1" (row-field (row-encode 2 "alice" "L1" "r1" "ok") 2))
+       (string=? "r1" (row-field (row-encode 2 "alice" "L1" "r1" "ok") 3))
+       (string=? "ok" (row-field (row-encode 2 "alice" "L1" "r1" "ok") 4))))
