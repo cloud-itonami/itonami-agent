@@ -1,0 +1,25 @@
+(ns ledger-probe
+  "Guest evidence for the execution ledger port: the claim! contract (one
+  active row per job), claim -> running -> finish, per-job counts."
+  (:require [itonami.ledger :as l])
+  (:export [ledger-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn ledger-probe [] :i64
+  (let [c1 (l/lg-claim "/data/lg" "job1" "ex1" "cron")
+        c1b (l/lg-claim "/data/lg" "job1" "ex1" "cron")
+        c2 (l/lg-claim "/data/lg" "job1" "ex2" "cron")
+        r1 (l/lg-mark-running "/data/lg" "job1" "ex1")
+        c2b (l/lg-claim "/data/lg" "job1" "ex2" "cron")
+        f1 (l/lg-finish "/data/lg" "job1" "ex1" 2 "")
+        c2c (l/lg-claim "/data/lg" "job1" "ex2" "cron")
+        f2 (l/lg-finish "/data/lg" "job1" "ex2" 3 "boom")
+        ac (l/lg-active-count "/data/lg" "job1")
+        rc (l/lg-row-count "/data/lg" "job1")
+        say (wire-say (string-concat "LGRESULT:" (string-concat (string-from-i64 rc) (string-concat ":" (string-from-i64 ac)))))]
+    (if (and (= 1 c1) (= 0 c1b) (= 0 c2) (= 1 r1) (= 0 c2b)
+             (= 1 f1) (= 1 c2c) (= 1 f2) (= 0 ac) (= 2 rc))
+      1 0)))
