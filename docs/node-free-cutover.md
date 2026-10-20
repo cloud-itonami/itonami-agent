@@ -37,14 +37,44 @@ range_read fsync stat_nofollow owner make_temp_dir）/ `fs_browse` /
 
 ## trench 順序（node+kbb が消えるまで）
 
-1. read 面: octal → 済（本 PR）。main.cljk の reader dispatch は regex/anon
+1. read 面: octal → 済（PR #54）。main.cljk の reader dispatch は regex/anon
    の置換個別に潰す。
 2. require 面: `clojure.string` / `promesa.core` の compat モジュールを
    amu `--source-path` 専用に供給（kbb の classpath には出さない — 両 CLI の
-   分離は AGENTS.md の Two CLIs 表どおり）。
+   分離は AGENTS.md の Two CLIs 表どおり）。→ **clojure.string 半分は 済**
+   （下の計測 3）。promesa は effect 層の話なので trench 4 に送る。
 3. `["node:…"]` import → host adapter 境界（kexe wire 呼び出し）へ置換。
 4. effect 半分を guest に port → kexe の native CLI として起動、kbb launcher
    （`env -S kbb --backend sci`）を廃止。
+
+## 計測 3: compat 導入後の拒否深さ（2026-10-20、32 モジュール）
+
+計測コマンド: `amu check src/… --source-path src --source-path kotoba/compat`。
+clojure.string は compat（`kotoba/compat/clojure/string.kotoba`）で解消し、
+拒否は次の壁まで前進した:
+
+| 次の壁 | 件数 | モジュール |
+|---|---|---|
+| `["node:…"]` 文字列 import | 16 | browser computer_use confine delivery_queue execution_ledger host identity mcp notepad oauth p2p platform_adapters soul tools vault webguard |
+| `promesa.core` 未充足 | 9 | browser_cloud cron gateway homeassistant loop process provider quiet watcher |
+| `cljs.reader` 未充足（**新**） | 2 | profile rails |
+| `str/join` / `str/split` 未実装（**新**、fail-closed） | 3 | delivery manifest（join）/ yaml（split） |
+| `:read` reader dispatch | 1 | main |
+| `:subset`（link 抜け、swap! の atom cell 契約）（**新**） | 1 | browser_provider |
+
+compat（`kotoba/compat/clojure/string.kotoba`）の内容と境界:
+blank? trim trimr includes? starts-with? ends-with? lower-case upper-case
+index-of replace replace-first（11 fn、test 6 件 = 18/18 が 3 target 緑）。
+実測した境界はモジュール header に明記してある:
+
+- join / split / split-lines は **未実装**: safe profile に string のコンテナが
+  無い（`:vector-string` は profile 外、`count` は bounded vector 専用）。
+- replace / replace-first は string パターンのみ（regex は read 壁）。
+- lower/upper は ASCII テーブル参照で自前実装 — `string-fold-ascii` /
+  `string-upper` は **compile は通るが runtime 未実装**（test runner が
+  `unsupported KIR operation`）という罠を実測で回避。
+- 文字列 escape は reader 非対応（`\t` 等）。docstring 内の `\"` も同じ理由で
+  入れない（ns が clause count エラーに化ける）。
 
 ## 決定コア（kexe-first）の dispatch parity — 実測
 

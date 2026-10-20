@@ -1,0 +1,142 @@
+(ns clojure.string
+  "The clojure.string surface itonami-agent uses, as a kotoba module for the
+  amu source path ONLY (kbb keeps its own clojure.string -- see the Two CLIs
+  table in AGENTS.md). Measured surface across src/test (2026-10-20):
+  blank? includes? starts-with? ends-with? replace trim join split lower-case
+  split-lines trimr replace-first index-of upper-case.
+
+  Boundaries measured for this compiler (safe profile), each fail-closed or
+  named here rather than approximated silently:
+  - join / split / split-lines are NOT in this module: the safe profile has no
+    container of strings (:vector-string is outside the profile; count wants a
+    bounded vector). They stay an open wall in docs/node-free-cutover.md.
+  - replace / replace-first take a STRING pattern. A regex pattern is the
+    host-regex-literal wall and is refused at read time.
+  - lower-case / upper-case are ASCII table lookups (65..90 / 97..122) built
+    from string-code-point-at + substring: string-fold-ascii and string-upper
+    are compile-admitted but NOT runtime-executable (measured: the test
+    runner reports unsupported KIR operation), so they are not used here.
+    Tests pin the ASCII behavior; Unicode case-folding is not claimed.
+  - blank?/trim/trimr whitespace is the ASCII set 9 10 11 12 13 32 (test-pinned)."
+  (:export [blank? trim trimr includes? starts-with? ends-with?
+            lower-case upper-case index-of replace replace-first
+            test-blank test-trim test-match test-case test-index-of
+            test-replace]))
+
+(defn- ws? [c :i64] :bool
+  (or (= c 32) (or (= c 9) (or (= c 10) (or (= c 11) (or (= c 12) (= c 13)))))))
+
+(defn- start-trimmed [s :string i :i64 n :i64] :i64
+  (if (>= i n)
+    n
+    (if (ws? (string-code-point-at s i))
+      (start-trimmed s (+ i 1) n)
+      i)))
+
+(defn- end-trimmed [s :string j :i64 floor :i64] :i64
+  (if (<= j floor)
+    floor
+    (if (ws? (string-code-point-at s (- j 1)))
+      (end-trimmed s (- j 1) floor)
+      j)))
+
+(defn blank? [s :string] :bool
+  (= (start-trimmed s 0 (string-length s)) (string-length s)))
+
+(defn trim [s :string] :string
+  ;; floor at the trimmed start: an all-blank string trims to "" (start = n,
+  ;; end = n) instead of an inverted range.
+  (let [a (start-trimmed s 0 (string-length s))]
+    (string-substring s a (end-trimmed s (string-length s) a))))
+
+(defn trimr [s :string] :string
+  (string-substring s 0 (end-trimmed s (string-length s) 0)))
+
+(defn starts-with? [s :string p :string] :bool
+  (and (>= (string-length s) (string-length p))
+       (string=? (string-substring s 0 (string-length p)) p)))
+
+(defn ends-with? [s :string p :string] :bool
+  (and (>= (string-length s) (string-length p))
+       (string=? (string-substring s (- (string-length s) (string-length p))
+                                   (string-length s))
+                 p)))
+
+(defn includes? [s :string p :string] :bool
+  (>= (string-index-of s p) 0))
+
+(defn- fold-run [s :string i :i64 n :i64 upper :i64] :string
+  (if (>= i n)
+    ""
+    (let [c (string-code-point-at s i)
+          lo (and (= upper 0) (>= c 65) (<= c 90))
+          hi (and (= upper 1) (>= c 97) (<= c 122))
+          piece (if (or lo hi)
+                  (if (= upper 0)
+                    (string-substring "abcdefghijklmnopqrstuvwxyz" (- c 65) (- c 64))
+                    (string-substring "ABCDEFGHIJKLMNOPQRSTUVWXYZ" (- c 97) (- c 96)))
+                  (string-substring s i (+ i 1)))]
+      (string-concat piece (fold-run s (+ i 1) n upper)))))
+
+(defn lower-case [s :string] :string
+  (fold-run s 0 (string-length s) 0))
+
+(defn upper-case [s :string] :string
+  (fold-run s 0 (string-length s) 1))
+
+(defn index-of [s :string p :string not-found :i64] :i64
+  (let [i (string-index-of s p)]
+    (if (< i 0) not-found i)))
+
+(defn replace [s :string match :string repl :string] :string
+  (string-replace-all s match repl))
+
+(defn replace-first [s :string match :string repl :string] :string
+  (let [i (string-index-of s match)]
+    (if (< i 0)
+      s
+      (string-concat (string-concat (string-substring s 0 i) repl)
+                     (string-substring s (+ i (string-length match))
+                                       (string-length s))))))
+
+;; tests: they PIN the host semantics this module relies on (index-of's
+;; not-found encoding, replace-all's arity, the case-folding scope) so a
+;; compiler or runtime change surfaces here instead of in a bot turn.
+
+(defn test-blank [] :bool
+  ;; whitespace literals carry no escapes (the kotoba reader refuses them),
+  ;; so only the space code point is exercised here; ws? covers 9 10 11 12 13.
+  (and (blank? "")
+       (blank? "   ")
+       (not (blank? " x "))
+       (not (blank? "x"))))
+
+(defn test-trim [] :bool
+  (and (= "x" (trim "  x  "))
+       (= "x" (trim "x"))
+       (= "" (trim "   "))
+       (= "  x" (trimr "  x  "))
+       (= "" (trim ""))))
+
+(defn test-match [] :bool
+  (and (starts-with? "abc" "ab")
+       (not (starts-with? "ab" "abc"))
+       (ends-with? "abc" "bc")
+       (not (ends-with? "bc" "abc"))
+       (includes? "abc" "b")
+       (not (includes? "abc" "z"))))
+
+(defn test-case [] :bool
+  (and (= "abc-_19" (lower-case "AbC-_19"))
+       (= "ABC-_19" (upper-case "AbC-_19"))))
+
+(defn test-index-of [] :bool
+  (and (= 1 (index-of "abc" "b" -1))
+       (= 0 (index-of "abc" "a" -1))
+       (= -1 (index-of "abc" "z" -1))
+       (= 7 (index-of "abc" "z" 7))))
+
+(defn test-replace [] :bool
+  (and (= "bbb" (replace "aaa" "a" "b"))
+       (= "baa" (replace-first "aaa" "a" "b"))
+       (= "aaa" (replace "aaa" "z" "b"))))
