@@ -1,0 +1,34 @@
+(ns render-probe
+  "Guest evidence for the notepad listing + prompt section: browse listing,
+  ORDER BY key sorting, and byte-exact render parity with notepad.cljk."
+  (:require [itonami.notepad :as np]
+            [itonami.notepad-render :as nr])
+  (:export [render-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn render-probe [] :i64
+  (let [s1 (np/notepad-set "/data/nr" "banana" "2")
+        s2 (np/notepad-set "/data/nr" "apple" "1")
+        s3 (np/notepad-set "/data/nr" "cherry" "3")
+        keys (nr/note-keys "/data/nr")
+        k0 (nr/note-key-at keys 0)
+        k2 (nr/note-key-at keys 2)
+        out (nr/render-notes "/data/nr" "job9")
+        empty (nr/render-notes "/data/nrempty" "job9")
+        say (wire-say (string-concat "RNRESULT:" (string-concat k0 (string-concat ":" (string-from-i64 (string-length out))))))]
+    (if (and (= 1 s1) (= 1 s2) (= 1 s3)
+             (string=? "apple" k0) (string=? "cherry" k2)
+             (string=? out "## Job notepad (persistent across runs)
+This durable scratchpad survives between scheduled runs of this job. Update it via the CLI, e.g.:
+`itonami-agent cron notepad job9 set <key> <value>` (also: get/delete/list; `itonami-agent cron notepad job9 delete <key>` removes an entry).
+
+- apple: 1
+- banana: 2
+- cherry: 3
+
+")
+             (= 0 (string-length empty)))
+      1 0)))

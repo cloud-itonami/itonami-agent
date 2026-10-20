@@ -13,7 +13,7 @@
   refuse the whole journal build. Only native-qualified ops appear below
   (string-length / string-substring / string-index-of / string-code-point-at /
   string-concat / string= -- each measured qualified on aarch64-linux)."
-  (:export [entry-ok journal-size entry-index-ok piece
+  (:export [entry-ok journal-size entry-index-ok piece count-pieces
             test-entry-ok test-journal-size test-entry-index test-piece]))
 
 (defn- token-in [s :string token :string] :bool
@@ -28,7 +28,7 @@
       (if (token-in entry "WRITE_SEP") 0
         (if (token-in entry "APPEND_SEP") 0 1)))))
 
-(defn- count-pieces [s :string sep :string] :i64
+(defn count-pieces [s :string sep :string] :i64
   ;; split-count without string-split-count (not native-qualified).
   ;; Pieces = 1 + separators.
   (if (= 0 (string-length s))

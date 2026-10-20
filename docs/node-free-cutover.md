@@ -602,3 +602,27 @@ upsert の repeat は recurrences フィールドの 10 進 bump
 task_events / tasks / task_links / task_runs / messages / **incidents** の
 全 9 テーブルが実装・guest 実証済み。残は .cljk 呼び出し差し替え本体
 （store 面の障壁は解消済み）。
+
+## 計測 20: notepad の list/render port — byte 一致 parity（2026-10-21、boot90.log）
+
+.cljk 呼び出し差し替えの最初の consumer（notepad.cljk の list-notes /
+render-notepad-section 面）:
+
+- `notepad_render.kotoba`: browse リスト → **key ソート**（insertion sort +
+  string-compare、SQL の ORDER BY key に対応）→ **prompt section を
+  byte 一致**で生成（空 notepad は ""、prompt-cache 安全の契約を維持）。
+- guest 実行（node 無し）: 3 keys（banana/apple/cherry と順不同で投入）→
+  ソート済み listing（先頭 apple / 末尾 cherry）→ render **317 bytes =
+  .cljk と byte 一致** → 空 store は "" → `RNRESULT:apple:317` /
+  `:ok :result 1`。
+
+### browse プロバイダの罠（boot88 で実測）と index 転換
+
+`:fs/browse`（wire 34）の fs_browse_provider は **entries 構築に malloc を
+使い、gap 1 と同じ SIGSYS**（musl malloc→mmap→seccomp）。対応として
+listing を **key index journal**（notepad-set が追加、delete は compact
+書換）に転換 — browse 非依存で完走。loader 側の browse heap-free 化は
+amu の修正候補として記録（gap 1 と同じ runbook）。
+
+実装罠（検証が捕捉）: render のヘッダ末尾の改行が 1 つ不足（316 vs 317）
+→ probe の byte 一致 assert が検出し、修正で全緑。

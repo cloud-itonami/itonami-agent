@@ -1,0 +1,110 @@
+(ns itonami.notepad-render
+  "The notepad listing + prompt-section port (ledger 8 design A: the
+  list-notes / render-notepad-section surface of notepad.cljk). The SQLite
+  list is ORDER BY key -- the guest sorts the browse listing with an
+  insertion sort over string-compare, then renders the byte-exact prompt
+  section (empty notepad answers the empty string, keeping prompts
+  byte-identical for jobs that never touch the notepad).
+
+  Boundaries measured: the loader's browse answer is NAME<TAB>flag lines, so
+  a key carrying a tab is refused at the writer side (key-ok in
+  notepad-core already refuses newlines); keys carrying either are outside
+  the port.
+
+  Shape rule measured earlier: typed-cap-call only in a typed defn's return
+  position."
+  (:require [itonami.notepad :as np]
+            [itonami.journal :as j]
+            [itonami.journal-core :as jc])
+  (:export [browse-entries note-keys note-key-at render-notes])
+  (:capabilities #{:fs/browse}))
+
+(defn- wire-browse [dir :string] :string
+  (typed-cap-call :fs/browse :string :string dir))
+
+(defn browse-entries [dir :string] :string
+  (wire-browse dir))
+
+(defn- entry-name [line :string] :string
+  (jc/piece line "	" 0))
+
+(defn- sort-insert [sorted :string name :string] :string
+  (if (= 0 (string-length sorted))
+    name
+    (sort-insert-run sorted name 0)))
+
+(defn- sort-insert-run [sorted :string name :string i :i64] :string
+  (if (>= i (string-length sorted))
+    (string-concat sorted (string-concat "
+" name))
+    (let [rest (string-substring sorted i (string-length sorted))]
+      (let [len (string-length (jc/piece rest "
+" 0))]
+        (let [cur (string-substring rest 0 len)]
+          (if (< (string-compare name cur) 0)
+            (if (= i 0)
+              (string-concat name (string-concat "
+" sorted))
+              (string-concat (string-substring sorted 0 i)
+                             (string-concat name (string-substring sorted i (string-length sorted)))))
+            (sort-insert-run sorted name (+ i len 1))))))))
+
+(defn- sort-index [base :string i :i64 n :i64 acc :string] :string
+  (if (>= i n)
+    acc
+    (sort-index base (+ i 1) n
+                (sort-insert acc (j/journal-entry (np/note-path base "_idx") i)))))
+
+(defn- sort-run [listing :string i :i64 n :i64 acc :string] :string
+  (if (>= i n)
+    acc
+    (let [line (jc/piece listing "
+" i)]
+      (sort-run listing (+ i 1) n (sort-insert acc (entry-name line))))))
+
+(defn note-keys [base :string] :string
+  ;; the sorted key listing (index order -> ORDER BY key), newline-joined.
+  ;; The source is the store's key INDEX journal (browse-free: the loader's
+  ;; browse provider mallocs and hits the same seccomp wall as the old read
+  ;; provider, measured boot88 -- an amu fix candidate).
+  (let [listing (j/journal-count (np/note-path base "_idx"))]
+    (if (= 0 listing)
+      ""
+      (sort-index base 0 listing ""))))
+
+(defn note-key-at [keys :string i :i64] :string
+  (jc/piece keys "
+" i))
+
+(defn render-notes [base :string job-id :string] :string
+  ;; byte-exact with notepad.cljk's render-notepad-section:
+  ;; header + lines joined by newline + two trailing newlines.
+  (let [keys (note-keys base)]
+    (if (= 0 (string-length keys))
+      ""
+      (let [h1 (string-concat "## Job notepad (persistent across runs)
+This durable scratchpad survives between scheduled runs of this job. Update it via the CLI, e.g.:
+`itonami-agent cron notepad " job-id)]
+        (let [h2 (string-concat h1 " set <key> <value>` (also: get/delete/list; `itonami-agent cron notepad ")]
+          (let [h3 (string-concat h2 job-id)]
+            (let [h4 (string-concat h3 " delete <key>` removes an entry).
+
+")]
+              (let [lines (render-lines base keys 0 (jc/count-pieces keys "
+"))]
+                (string-concat (string-concat h4 lines) "
+
+")))))))))
+
+(defn- render-lines [base :string keys :string i :i64 n :i64] :string
+  (if (>= i n)
+    (string-concat "" "
+")
+    (let [k (jc/piece keys "
+" i)]
+      (let [v (np/notepad-get base k)]
+        (let [line (string-concat "- " (string-concat k (string-concat ": " v)))]
+          (if (= (+ i 1) n)
+            line
+            (string-concat line (string-concat "
+" (render-lines base keys (+ i 1) n)))))))))
