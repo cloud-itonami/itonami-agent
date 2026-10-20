@@ -1,0 +1,18 @@
+(ns probe-io
+  "Example: the host adapter boundary (ledger 計測 6). A guest that performs
+  effects through typed-cap-call -- no node imports. The ns declares the
+  bounded :capabilities set; a --policy grants them by catalog name.
+
+  Verified 2026-10-20: amu check :ok true (effects named), amu compile to
+  aarch64-linux kexe ok, and in the guest VM (boot62.log, no node) wire 37
+  wrote CAP_WRITE_OK to the console and the fn returned 1 -- while the same
+  guest with NO grants fails closed with KEXE_TRAP {:kind :signal :SIGTRAP}.
+  amu test cannot exercise capability guests yet (internal compiler error)."
+  (:export [test-io test-args])
+  (:capabilities #{:io/write :cli/args}))
+(defn test-io [] :bool
+  (let [r (typed-cap-call :io/write :string :string "CAP_WRITE_OK")]
+    (string=? r r)))
+(defn test-args [] :bool
+  (let [r (typed-cap-call :cli/args :string :string "")]
+    (string=? r r)))
