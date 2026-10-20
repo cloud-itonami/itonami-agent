@@ -1,0 +1,111 @@
+(ns itonami.task-attachments
+  "The kanban attachments metadata store (ledger measurement 34, slice 3):
+  the task-attachment metadata rows of the kanban-attach/kanban-attachments
+  tools, over a per-task metadata journal (tasks-core length-prefix codec;
+  entry fields (run=empty, filename, type+content) -- the content rides the
+  entry so at-content-at round-trips it) plus one content file per
+  attachment named by the hex sha256 of task+filename.
+
+  Measured boundaries: the content is carried as the TEXT the tool called
+  content_base64 -- the guest has no base64 codec, so decode/encode stays
+  at the handler trench and the stored bytes are that text. The 25MB cap
+  and the task_id/filename regexes are handler concerns too (the tool
+  validates before calling); this slice keeps the store semantics. The
+  created_at column is dropped (no clock wiring).
+
+  Shape rule measured earlier: typed-cap-call only in a typed defn's return
+  position."
+  (:require [itonami.tasks-core :as tc]
+            [itonami.notepad-core :as nc])
+  (:export [at-add at-count at-filename-at at-type-at at-content-at])
+  (:capabilities #{:fs/app-data :hash/sha256}))
+
+(defn- wire-hash [s :string] :string
+  (typed-cap-call :hash/sha256 :string :string s))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- wire-append [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "APPEND_SEP" content))))
+
+(defn- exists? [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn- apath [base :string task :string] :string
+  (string-concat base
+                 (string-concat "/at"
+                                (string-concat (nc/hex-encode (wire-hash task))
+                                               ".journal"))))
+
+(defn- cpath [base :string task :string filename :string] :string
+  (string-concat base
+                 (string-concat "/ab"
+                                (string-concat (nc/hex-encode (wire-hash (string-concat task filename)))
+                                               ".bin"))))
+
+;; the metadata entry uses the codec's three slots directly: run = the
+;; content type, kind = the filename, payload = the content -- so both
+;; carry any bytes a string can hold, no separator needed.
+
+(defn at-add [base :string task :string filename :string ctype :string content :string] :i64
+  (if (or (= 0 (string-length task)) (= 0 (string-length filename)))
+    0
+    (let [p (apath base task)]
+      (let [e (tc/event-encode ctype filename content)]
+        (let [w (if (= 1 (exists? p))
+                  (wire-append p e)
+                  (wire-write p e))]
+          (let [b (wire-write (cpath base task filename) content)]
+            1))))))
+
+(defn- walk-at [content :string i :i64 k :i64 n :i64] :string
+  (if (>= i (string-length content))
+    ""
+    (let [rest (string-substring content i (string-length content))]
+      (let [len (tc/event-len rest)]
+        (let [entry (string-substring rest 0 len)]
+          (if (= k n)
+            entry
+            (walk-at content (+ i len) (+ k 1) n)))))))
+
+(defn- entry-of [base :string task :string k :i64] :string
+  (let [p (apath base task)]
+    (if (= 0 (exists? p))
+      ""
+      (let [content (wire-read p)]
+        (walk-at content 0 0 k)))))
+
+(defn- walk-count [content :string i :i64 acc :i64] :i64
+  (if (>= i (string-length content))
+    acc
+    (let [rest (string-substring content i (string-length content))]
+      (let [len (tc/event-len rest)]
+        (walk-count content (+ i len) (+ acc 1))))))
+
+(defn at-count [base :string task :string] :i64
+  (let [p (apath base task)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (walk-count content 0 0)))))
+
+(defn at-filename-at [base :string task :string k :i64] :string
+  (tc/event-kind (entry-of base task k)))
+
+(defn at-type-at [base :string task :string k :i64] :string
+  (tc/event-run (entry-of base task k)))
+
+(defn at-content-at [base :string task :string k :i64] :string
+  (tc/event-payload (entry-of base task k)))
