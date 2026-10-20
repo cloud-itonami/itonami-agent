@@ -1,0 +1,267 @@
+(ns itonami.agent.code-rpc
+  "Hermes' execute_code `hermes_tools` RPC, file transport — the wire contract of
+  tools/code_execution_rpc.py + tools/code_execution_tool.py, verbatim:
+
+    * the generated hermes_tools.py stub module (`generate-hermes-tools`,
+      byte-identical to `generate_hermes_tools_module(..., transport=\"file\")`)
+    * the request pipeline (`handle-request` = `_handle_rpc_request`: constant-time
+      token check, allow-list, call budget, terminal param stripping, dispatch,
+      log; only a dispatched call consumes budget and is logged)
+    * the file transport (`serve-tick!` = one `_rpc_poll_loop` pass: req_NNNNNN
+      files answered into res_NNNNNN atomically and owner-only, malformed /
+      unauthorized / non-int-seq requests removed without a response)
+
+  The script-side `_call` writes `req_<seq:06d>` (JSON: tool, args, seq, token)
+  and polls `res_<seq:06d>`; the host answers exactly one response line as JSON.
+  `dispatch` is (fn [tool-name args-map] result-string) — the run's own tool
+  handlers, so an in-script call is indistinguishable from the agent's."
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]
+            ["node:crypto" :as crypto]
+            ["node:fs" :as fs]))
+
+;; ---- constants (tools/code_execution_tool.py, tools/registry.py) ----------
+
+(def sandbox-allowed-tools
+  "code_execution_tool/SANDBOX_ALLOWED_TOOLS, sorted as the refusal lists them."
+  ["patch" "read_file" "search_files" "terminal" "web_extract" "web_search" "write_file"])
+
+(def terminal-blocked-params
+  "code_execution_rpc/_TERMINAL_BLOCKED_PARAMS — parameters that must not be
+  used from an ephemeral sandbox script."
+  #{"background" "pty" "notify" "notify_on_complete" "watch_patterns"
+    "heartbeat" "persist_on_release"})
+
+(def default-max-tool-calls
+  "code_execution_tool/DEFAULT_MAX_TOOL_CALLS."
+  50)
+
+(def max-tool-error-chars
+  "registry/_MAX_TOOL_ERROR_CHARS."
+  2048)
+
+(def tool-error-truncation-marker
+  "registry/_TOOL_ERROR_TRUNCATION_MARKER."
+  "… [truncated]")
+
+;; ---- tool_error (tools/registry.py) --------------------------------------
+
+(defn tool-error
+  "registry/tool_error: the `{\"error\": <message>}` JSON string, with the error
+  body bounded so a raw exception can't bloat history across retries."
+  [message]
+  (let [text (str message)]
+    (h/json-str {"error" (if (<= (count text) max-tool-error-chars)
+                           text
+                           (str (subs text 0 max-tool-error-chars)
+                                tool-error-truncation-marker))})))
+
+(defn- bounded300 [s]
+  (let [text (str s)] (subs text 0 (min 300 (count text)))))
+
+(defn result-error
+  "code_execution_rpc/_result_error: the `error` text of a JSON-object tool
+  result (≤ 300 chars), else \"\"."
+  [result]
+  (if (and (string? result) (str/starts-with? result "{") (str/includes? result "\"error\""))
+    (try
+      (let [body (h/json-parse result)
+            e (when (map? body) (get body "error"))]
+        (if e (bounded300 e) ""))
+      (catch :default _ ""))
+    ""))
+
+(defn tool-errors-since
+  "code_execution_rpc/tool_errors_since: failed in-script tool calls since
+  `start` (at most 5) — a script that ignores a helper's {\"error\"} return
+  would otherwise report plain success while the write it relied on never
+  happened."
+  [log start]
+  (vec (take 5 (for [e (drop start log)
+                     :when (get e "error")]
+                 {"tool" (get e "tool") "error" (get e "error")}))))
+
+;; ---- hermes_tools.py generation (code_execution_tool.py) ------------------
+
+(def ^:private shim-header
+  ;; code_execution_tool/_FILE_TRANSPORT_HEADER verbatim (the generated module's
+  ;; source up to the first stub).
+  "\"\"\"Auto-generated Hermes tools RPC stubs (file-based transport).\"\"\"\nimport json, os, shlex, tempfile, threading, time\n\n_RPC_DIR = os.environ.get(\"HERMES_RPC_DIR\") or os.path.join(tempfile.gettempdir(), \"hermes_rpc\")\n_seq = 0\n# `_seq += 1` is not atomic (read-modify-write), so concurrent _call()\n# invocations from multiple threads could allocate the same sequence number\n# and clobber each other's request files. Guard seq allocation with a lock.\n_seq_lock = threading.Lock()\n\n# ---------------------------------------------------------------------------\n# Convenience helpers (avoid common scripting pitfalls)\n# ---------------------------------------------------------------------------\n\ndef json_parse(text: str):\n    \"\"\"Parse JSON tolerant of control characters and UTF-8 BOM (strict=False).\n    Use this instead of json.loads() when parsing output from terminal()\n    or web_extract() that may contain raw tabs/newlines in strings,\n    or from tools/files that prepend a UTF-8 BOM (salvage #57870, credit @woxinwuhen713-bit).\"\"\"\n    if isinstance(text, str) and text.startswith(\"\ufeff\"):\n        text = text[1:]\n    return json.loads(text, strict=False)\n\n\ndef shell_quote(s: str) -> str:\n    \"\"\"Shell-escape a string for safe interpolation into commands.\n    Use this when inserting dynamic content into terminal() commands:\n        terminal(f\"echo {shell_quote(user_input)}\")\n    \"\"\"\n    return shlex.quote(s)\n\n\ndef retry(fn, max_attempts=3, delay=2):\n    \"\"\"Retry a function up to max_attempts times with exponential backoff.\n    Use for transient failures (network errors, API rate limits):\n        result = retry(lambda: terminal(\"gh issue list ...\"))\n    \"\"\"\n    last_err = None\n    for attempt in range(max_attempts):\n        try:\n            return fn()\n        except Exception as e:\n            last_err = e\n            if attempt < max_attempts - 1:\n                time.sleep(delay * (2 ** attempt))\n    raise last_err\n\n\ndef _call(tool_name, args):\n    \"\"\"Send a tool call request via file-based RPC and wait for response.\"\"\"\n    global _seq\n    with _seq_lock:\n        _seq += 1\n        seq = _seq\n    seq_str = f\"{seq:06d}\"\n    req_file = os.path.join(_RPC_DIR, f\"req_{seq_str}\")\n    res_file = os.path.join(_RPC_DIR, f\"res_{seq_str}\")\n\n    # Write request atomically (write to .tmp, then rename).\n    # encoding=\"utf-8\" is critical: on Windows-hosted remote backends\n    # (or any non-UTF-8 locale) the default open() mode would mangle\n    # non-ASCII chars in tool args when encoding them as JSON.\n    tmp = req_file + \".tmp\"\n    # The request carries the RPC token and tool args: owner-only even under a\n    # permissive process umask.\n    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)\n    with os.fdopen(fd, \"w\", encoding=\"utf-8\") as f:\n        json.dump({\n            \"tool\": tool_name,\n            \"args\": args,\n            \"seq\": seq,\n            \"token\": os.environ.get(\"HERMES_RPC_TOKEN\", \"\"),\n        }, f)\n    os.rename(tmp, req_file)\n\n    # Wait for response with adaptive polling\n    deadline = time.monotonic() + 300  # 5-minute timeout per tool call\n    poll_interval = 0.05  # Start at 50ms\n    while not os.path.exists(res_file):\n        if time.monotonic() > deadline:\n            raise RuntimeError(f\"RPC timeout: no response for {tool_name} after 300s\")\n        time.sleep(poll_interval)\n        poll_interval = min(poll_interval * 1.2, 0.25)  # Back off to 250ms\n\n    with open(res_file, encoding=\"utf-8\") as f:\n        raw = f.read()\n\n    # Clean up response file\n    try:\n        os.unlink(res_file)\n    except OSError:\n        pass\n\n    result = json.loads(raw)\n    if isinstance(result, str):\n        try:\n            return json.loads(result)\n        except (json.JSONDecodeError, TypeError):\n            return result\n    return result\n\n")
+
+(def ^:private tool-stubs
+  ;; code_execution_tool/_TOOL_STUBS: name -> [signature, docstring, args_dict_expr]
+  {"web_search"
+   ["query: str, limit: int = 5"
+    "\"\"\"Search the web. Returns dict with data.web list of {url, title, description}.\"\"\""
+    "{\"query\": query, \"limit\": limit}"]
+   "web_extract"
+   ["urls: list, char_limit: int = None"
+    "\"\"\"Extract content from URLs (no LLM summarization). Returns dict with results list of {url, title, content, error}. Pages over char_limit (default 15000) are head+tail truncated with the full text stored on disk; the content footer gives the path. content is markdown.\"\"\""
+    "{\"urls\": urls, \"char_limit\": char_limit}"]
+   "read_file"
+   ["path: str, offset: int = 1, limit: int = 2000"
+    "\"\"\"Read a file (1-indexed lines). Returns dict with \"content\" and \"total_lines\".\"\"\""
+    "{\"path\": path, \"offset\": offset, \"limit\": limit}"]
+   "write_file"
+   ["path: str, content: str, cross_profile: bool = False"
+    "\"\"\"Write content to a file (always overwrites). Returns dict with status.\"\"\""
+    "{\"path\": path, \"content\": content, \"cross_profile\": cross_profile}"]
+   "search_files"
+   ["pattern: str, target: str = \"content\", path: str = \".\", file_glob: str = None, limit: int = 50, offset: int = 0, output_mode: str = \"content\", context: int = 0, order: str = \"discovery\""
+    "\"\"\"Search file contents (target=\"content\") or find files by name (target=\"files\"). Returns dict with \"matches\".\"\"\""
+    "{\"pattern\": pattern, \"target\": target, \"path\": path, \"file_glob\": file_glob, \"limit\": limit, \"offset\": offset, \"output_mode\": output_mode, \"context\": context, \"order\": order}"]
+   "patch"
+   ["path: str = None, old_string: str = None, new_string: str = None, replace_all: bool = False, mode: str = \"replace\", patch: str = None, cross_profile: bool = False"
+    "\"\"\"Targeted find-and-replace (mode=\"replace\") or V4A multi-file patches (mode=\"patch\"). Returns dict with status.\"\"\""
+    "{\"path\": path, \"old_string\": old_string, \"new_string\": new_string, \"replace_all\": replace_all, \"mode\": mode, \"patch\": patch, \"cross_profile\": cross_profile}"]
+   "terminal"
+   ["command: str, timeout: int = None, workdir: str = None"
+    "\"\"\"Run a shell command (foreground only). Returns dict with \"output\" and \"exit_code\".\"\"\""
+    "{\"command\": command, \"timeout\": timeout, \"workdir\": workdir}"]})
+
+(defn sandbox-tools-for
+  "code_execution_tool/_sandbox_tools_for: enabled ∩ SANDBOX_ALLOWED_TOOLS, or
+  every sandbox tool when the intersection is empty."
+  [enabled]
+  (let [x (filter (set enabled) sandbox-allowed-tools)]
+    (if (seq x) (vec x) sandbox-allowed-tools)))
+
+(defn generate-hermes-tools
+  "Source of the hermes_tools.py stub module for SANDBOX_ALLOWED_TOOLS ∩
+  `enabled` — byte-identical to
+  `generate_hermes_tools_module(list(...), transport=\"file\")`."
+  [enabled]
+  (let [names (sort (sandbox-tools-for enabled))
+        stubs (for [n names
+                    :let [[sig doc args-expr] (get tool-stubs n)]]
+                (str "def " n "(" sig "):\n    " doc "\n    return _call('" n "', " args-expr ")\n"))]
+    (str shim-header (str/join "\n" stubs))))
+
+;; ---- request pipeline (code_execution_rpc/_handle_rpc_request) ------------
+
+(defn- token-str
+  "Python `str(request.get(\"token\") or \"\")`: JSON null/false map to \"\"."
+  [request]
+  (let [t (get request "token")]
+    (if (or (nil? t) (false? t)) "" (str t))))
+
+(defn token-ok?
+  "code_execution_rpc/_rpc_token_ok: constant-time token check; an empty server
+  token fails closed. Compared as bytes."
+  [request rpc-token]
+  (and (string? rpc-token)
+       (not (str/blank? rpc-token))
+       (try
+         (crypto/timingSafeEqual (js/Buffer.from (token-str request) "utf8")
+                                 (js/Buffer.from rpc-token "utf8"))
+         (catch :default _ false))))
+
+(defn make-state
+  "One execute_code run's RPC server state. `dispatch` is
+  (fn [tool-name args-map] result-string) — the run's own tool handlers."
+  [{:keys [rpc-dir rpc-token dispatch allowed-tools max-tool-calls]}]
+  {:rpc-dir rpc-dir
+   :rpc-token (or rpc-token "")
+   :dispatch dispatch
+   :allowed (vec (sort (or (seq allowed-tools) sandbox-allowed-tools)))
+   :max-tool-calls (or max-tool-calls default-max-tool-calls)
+   :counter (atom 0)
+   :log (atom [])})
+
+(defn- args-preview [args]
+  (let [s (str args)] (subs s 0 (min 80 (count s)))))
+
+(defn- duration-seconds [call-start]
+  (/ (js/Math.round (* 100 (/ (- (h/now-ms) call-start) 1000))) 100))
+
+(defn handle-request
+  "code_execution_rpc/_handle_rpc_request: enforce allow-list + budget, then
+  dispatch one authenticated request. Only a dispatched call consumes budget
+  and is logged; refusals are free. Returns the response string."
+  [state request]
+  (let [tool-name (get request "tool" "")
+        tool-args (get request "args" {})
+        call-start (h/now-ms)]
+    (cond
+      (not (some #{tool-name} (:allowed state)))
+      (tool-error (str "Tool '" tool-name "' is not available in execute_code. Available: "
+                       (str/join ", " (:allowed state))))
+
+      (>= @(:counter state) (:max-tool-calls state))
+      (tool-error (str "Tool call limit reached (" (:max-tool-calls state)
+                       "). No more tool calls allowed in this execution."))
+
+      :else
+      (let [args (if (= tool-name "terminal")
+                   (into {} (remove (fn [[k _]] (contains? terminal-blocked-params k))
+                                    (if (map? tool-args) tool-args {})))
+                   tool-args)
+            result (try
+                     (let [r ((:dispatch state) tool-name args)]
+                       (if (string? r) r (h/json-str r)))
+                     (catch :default e
+                       (tool-error (let [m (.-message e)]
+                                     (if (string? m) m (str e))))))
+            error (result-error result)
+            entry (cond-> {"tool" tool-name
+                           "args_preview" (args-preview args)
+                           "duration" (duration-seconds call-start)}
+                    (seq error) (assoc "error" error))]
+        (swap! (:counter state) inc)
+        (swap! (:log state) conj entry)
+        result))))
+
+;; ---- file transport (code_execution_rpc/_rpc_poll_loop) -------------------
+
+(defn- req-file? [f]
+  (and (str/starts-with? f "req_") (not (str/ends-with? f ".tmp"))))
+
+(defn- res-name
+  "Python f\"res_{seq:06d}\" — width counts the sign."
+  [seq]
+  (let [width (if (neg? seq) 5 6)
+        digits (.padStart (str (js/Math.abs seq)) width "0")]
+    (str "res_" (if (neg? seq) "-" "") digits)))
+
+(defn- int-seq?
+  "Python `isinstance(seq, int)` on the parsed JSON value (booleans are ints in
+  Python; JSON numbers arrive here all the same)."
+  [s]
+  (and (number? s) (not (boolean? s)) (= s (js/Math.floor s)) (js/Number.isFinite s)))
+
+(defn- write-res-atomic!
+  "Owner-only (0600) tmp + rename, as `_remote_write(..., atomic=True)`."
+  [path s]
+  (let [tmp (str path ".tmp")]
+    (fs/writeFileSync tmp s #js {:mode 384 :encoding "utf8"})
+    (fs/renameSync tmp path)
+    path))
+
+(defn- serve-one!
+  "Answer one req file; returns 1 when a response was written, 0 when the
+  request was removed unanswered (malformed, unauthorized, non-int seq)."
+  [state f]
+  (let [path (h/join (:rpc-dir state) f)
+        done (fn [] (h/rm path) 0)]
+    (if-let [request (try
+                       (let [parsed (h/json-parse (h/slurp path))]
+                         (when (map? parsed) parsed))
+                       (catch :default _ nil))]
+      (cond
+        (not (token-ok? request (:rpc-token state))) (done)
+        (not (int-seq? (get request "seq"))) (done)
+        :else
+        (do (write-res-atomic! (h/join (:rpc-dir state) (res-name (get request "seq")))
+                               (handle-request state request))
+            (h/rm path)
+            1))
+      (done))))
+
+(defn serve-tick!
+  "One `_rpc_poll_loop` pass over the rpc dir: every pending request is parsed,
+  authenticated, answered into `res_<seq:06d>` and removed. Returns the number
+  of requests answered."
+  [state]
+  (reduce (fn [answered f] (+ answered (serve-one! state f)))
+          0
+          (sort (filter req-file? (h/ls (:rpc-dir state))))))
