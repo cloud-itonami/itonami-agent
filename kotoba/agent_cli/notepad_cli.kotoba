@@ -6,6 +6,9 @@
     get    -> value / <key> is not set
     delete -> deleted / <key> is not set
     list   -> <key> = <value> per line, ORDER BY key (the SQLite ORDER BY)
+    clear  -> cleared  (the cron job reset; an internal surface, not a CLI
+              verb in main.cljk -- exposed here so the cron call site can
+              splice the guest)
 
   argv on wire 38: 0 verb / 1 base / 2 key / 3 value (everything after the
   loader `--`). A missing or unknown verb answers the usage line on stderr
@@ -78,4 +81,7 @@
                 (ok "")
                 (ok (list-run base keys 0 (jc/count-pieces keys "
 ") ""))))
-            (fail usage)))))))
+            (if (string=? verb "clear")
+              (let [n (np/notepad-clear base)]
+                (ok "cleared"))
+              (fail usage))))))))

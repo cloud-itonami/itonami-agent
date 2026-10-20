@@ -22,7 +22,8 @@
   position."
   (:require [itonami.notepad-core :as core]
             [itonami.journal-core :as jc])
-  (:export [note-path note-stored-key notepad-set notepad-get notepad-delete])
+  (:export [note-path note-stored-key notepad-set notepad-get notepad-delete
+            notepad-clear])
   (:capabilities #{:fs/app-data :hash/sha256 :fs/browse}))
 
 (def max-job-total-bytes 65536)
@@ -134,6 +135,23 @@
               (if (string=? stored key)
                 (string-substring content (+ i 1) (string-length content))
                 ""))))))))
+
+(defn- clear-run [base :string listing :string i :i64 n :i64 acc :i64] :i64
+  ;; every key file unlinked -- the job reset cron performs between runs.
+  (if (>= i n)
+    acc
+    (let [name (entry-name (jc/piece listing "\n" i))]
+      (let [acc2 (if (= 1 (note-file? name))
+                   (let [u (wire-unlink (string-concat base (string-concat "/" name)))]
+                     (+ acc 1))
+                   acc)]
+        (clear-run base listing (+ i 1) n acc2)))))
+
+(defn notepad-clear [base :string] :i64
+  (let [listing (wire-browse base)]
+    (if (= 0 (string-length listing))
+      0
+      (clear-run base listing 0 (jc/count-pieces listing "\n") 0))))
 
 (defn notepad-delete [base :string key :string] :i64
   (let [p (note-path base key)]
