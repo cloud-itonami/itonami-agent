@@ -14,7 +14,8 @@
             [itonami.journal :as j]
             [itonami.journal-core :as jc]
             [itonami.notepad :as np])
-  (:export [lg-claim lg-mark-running lg-finish lg-active-count lg-row-count])
+  (:export [lg-claim lg-mark-running lg-finish lg-active-count lg-row-count
+            lg-mark-handoff lg-adopt lg-recover lg-set-outcome lg-failure lg-status])
   (:capabilities #{:fs/app-data}))
 
 (defn- wire-exists [path :string] :string
@@ -108,3 +109,79 @@
 (defn lg-row-count [base :string job :string] :i64
   (let [q (jpath base job)]
     (count-run base q 0 (j/journal-count q) 0 0)))
+
+(defn lg-status [base :string job :string id :string] :i64
+  (let [p (spath base id)]
+    (if (= 0 (exists? p))
+      -1
+      (let [content (wire-read p)]
+        (core/row-status content)))))
+
+(defn lg-mark-handoff [base :string job :string id :string owner-ok :i64] :i64
+  ;; mark-handoff-pending!: owner-fenced, claimed only. The pid/process facts
+  ;; are the host's (kexe-first: facts in as i64 flags).
+  (if (= owner-ok 0)
+    0
+    (let [p (spath base id)]
+      (if (= 0 (exists? p))
+        0
+        (let [content (wire-read p)]
+          (if (= 0 (core/row-status content))
+            (let [w (wire-write p (core/row-encode5 0 (core/row-field content 1)
+                                                    (core/row-field content 2)
+                                                    (core/row-field content 3) 1))]
+              1)
+            0))))))
+
+(defn lg-adopt [base :string job :string id :string grace-ok :i64] :i64
+  ;; adopt-claimed!: the single claimed -> running gate.
+  (if (= grace-ok 0)
+    0
+    (let [p (spath base id)]
+      (if (= 0 (exists? p))
+        0
+        (let [content (wire-read p)]
+          (if (= 0 (core/row-status content))
+            (let [w (wire-write p (core/row-encode5 1 (core/row-field content 1)
+                                                    "" (core/row-field content 3) 0))]
+              1)
+            0))))))
+
+(defn lg-recover [base :string job :string id :string owner-gone :i64 grace-ok :i64] :i64
+  ;; recover-interrupted!: claimed/running rows whose owner is gone, outside
+  ;; the adoption grace window, are fenced unknown -- never retried.
+  (if (= owner-gone 0)
+    0
+    (if (= grace-ok 0)
+      0
+      (let [p (spath base id)]
+        (if (= 0 (exists? p))
+          0
+          (let [content (wire-read p)]
+            (let [st (core/row-status content)]
+              (if (= 1 (core/active-ok st))
+                (let [w (wire-write p (core/row-encode5 4 (core/row-field content 1)
+                                                        "scheduler restarted before a terminal result; execution outcome is unknown"
+                                                        (core/row-field content 3) 0))]
+                  1)
+                0))))))))
+
+(defn lg-set-outcome [base :string job :string id :string outcome :string] :i64
+  (let [p (spath base id)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (let [w (wire-write p (core/row-encode5 (core/row-status content)
+                                                (core/row-field content 1)
+                                                (core/row-field content 2)
+                                                outcome
+                                                (core/row-handoff content)))]
+          1)))))
+
+(defn lg-failure [base :string job :string id :string] :string
+  ;; the incident failure-type for this row's stored error.
+  (let [p (spath base id)]
+    (if (= 0 (exists? p))
+      "unknown"
+      (let [content (wire-read p)]
+        (core/failure-type (core/row-field content 2))))))
