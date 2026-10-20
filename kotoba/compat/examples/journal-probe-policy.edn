@@ -1,0 +1,1 @@
+{:allow #{[:cap/call :fs/app-data] [:cap/call :io/write]}}
