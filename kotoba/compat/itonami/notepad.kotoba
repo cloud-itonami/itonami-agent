@@ -1,0 +1,75 @@
+(ns itonami.notepad
+  "The effect half of the per-job KV notepad port: one file per key, the file
+  named by the hex-encoded sha256 of the key (safe for any hash answer shape,
+  <= 128 hex chars) and holding entry-encode(key, value) so a get verifies the
+  stored key it got. Set is a whole-file WRITE (upsert = last write wins),
+  delete is the loader's UNLINK_SEP mutation form. All refusals answer
+  fail-closed (0 / empty) before any wire write, so an oversized write leaves
+  the store untouched -- parity with notepad.cljk.
+
+  Open (measured, next slice): the 64KB per-job total needs a bounded
+  directory scan (:fs/browse) over the job's key files.
+
+  Shape rule measured earlier: typed-cap-call only in a typed defn's return
+  position."
+  (:require [itonami.notepad-core :as core])
+  (:export [note-path notepad-set notepad-get notepad-delete])
+  (:capabilities #{:fs/app-data :hash/sha256}))
+
+(defn- wire-hash [key :string] :string
+  (typed-cap-call :hash/sha256 :string :string key))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- wire-unlink [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "UNLINK_SEP")))
+
+(defn- exists? [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn note-path [base :string key :string] :string
+  (string-concat base
+                 (string-concat "/n"
+                                (string-concat (core/hex-encode (wire-hash key))
+                                               ".txt"))))
+
+(defn notepad-set [base :string key :string value :string] :i64
+  (if (= 0 (core/key-ok key))
+    0
+    (if (= 0 (core/value-ok value))
+      0
+      (let [p (note-path base key)]
+        (let [r (wire-write p (core/entry-encode key value))]
+          1)))))
+
+(defn notepad-get [base :string key :string] :string
+  (let [p (note-path base key)]
+    (if (= 0 (exists? p))
+      ""
+      (let [content (wire-read p)]
+        (let [i (string-index-of content "
+")]
+          (if (< i 0)
+            ""
+            (let [stored (string-substring content 0 i)]
+              (if (string=? stored key)
+                (string-substring content (+ i 1) (string-length content))
+                ""))))))))
+
+(defn notepad-delete [base :string key :string] :i64
+  (let [p (note-path base key)]
+    (if (= 0 (exists? p))
+      0
+      (let [r (wire-unlink p)]
+        1))))
