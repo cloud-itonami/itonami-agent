@@ -1,6 +1,6 @@
 (ns agent-cli-route
-  (:export [route-code admit-turn usage-line-count test-route-code
-            test-admit-turn test-usage-lines]))
+  (:export [route-code admit-turn admit-gateway usage-line-count
+            test-route-code test-admit-turn test-admit-gateway test-usage-lines]))
 
 ;; itonami-agent's CLI route + turn-gate decision, as a kotoba guest.
 ;;
@@ -21,8 +21,17 @@
 ;;                                                (toolset gate, loop.cljk)
 ;;   3 `provider_error: no provider configured`          (provider gate)
 ;;
+;; Dispatch parity with -main's `(case (first pos) ...)` (read 2026-10-20):
+;;   "bridge" "chat" "vault" "mcp" "cron" "profile" "gateway" "peer"
+;;   ("help" "--help" nil) -> usage; anything else -> die 2 unknown command.
+;; Two -main gates stay HOST facts by design and are not modelled here:
+;;   - `invalid profile name` (string shape; die 2) folds into profile-ok
+;;   - `--oneshot` takes over every non-peer route before the case dispatch
+;;
 ;; Route codes (pinned by test-route-code):
-;;   1 usage   2 chat   3 bridge   4 cron   5 profile   6 peer   7 turn
+;;    0 unknown command (the host dies 2)
+;;    1 usage   2 chat   3 bridge   4 cron   5 profile   6 peer   7 turn
+;;    8 vault   9 mcp   10 gateway
 ;; Turn codes (pinned by test-admit-turn):
 ;;    1  turn may proceed
 ;;   -1  no prompt            (the launcher prints the usage block)
@@ -30,19 +39,28 @@
 ;;   -3  profile refused      (boundary 1)
 ;;   -4  toolset unsupported  (boundary 2)
 ;;   -5  no provider          (boundary 3)
+;; Gateway codes (pinned by test-admit-gateway):
+;;    1  `gateway run` proceeds
+;;   -6  not `run` (the host prints `usage: itonami-agent gateway run`)
 ;;
 ;; Admission bounds measured for this compiler: pure i64 surface, <= 5
 ;; params (admit-turn sits at exactly 5 -- a sixth is refused by the ABI),
 ;; no rem/mod, if/cond branches one type.
 
 (defn route-code [cmd1 :i64 has-z :i64] :i64
-  ;; cmd1: 0 none, 1 chat, 2 bridge, 3 cron, 4 profile, 5 peer (first
-  ;; positional, already classified by the host's positional scan).
-  ;; has-z: 1 when -z/--prompt was given.
+  ;; cmd1: 0 none, 1 chat, 2 bridge, 3 cron, 4 profile, 5 peer, 6 vault,
+  ;; 7 mcp, 8 gateway, 9 unknown (first positional, already classified by the
+  ;; host's positional scan). has-z: 1 when -z/--prompt was given.
   (if (= cmd1 0)
     (if (= has-z 1) 7 1)
-    ;; cmd1 1..5 maps to route codes 2..6 (the usage block's order).
-    (+ cmd1 1)))
+    (if (<= cmd1 5)
+      ;; cmd1 1..5 maps to route codes 2..6 (the usage block's order).
+      (+ cmd1 1)
+      (if (<= cmd1 8)
+        ;; vault/mcp/gateway sit after the turn code, so shift by one more.
+        (+ cmd1 2)
+        ;; an unrecognized command is its own refusal route.
+        0))))
 
 (defn admit-turn [has-p :i64 has-z :i64 profile-ok :i64
                   tools-ok :i64 provider-ok :i64] :i64
@@ -56,10 +74,16 @@
         -3
         (if (= tools-ok 0) -4 (if (= provider-ok 0) -5 1))))))
 
+(defn admit-gateway [has-run :i64] :i64
+  ;; `gateway` dispatches only on its `run` subcommand (-main's
+  ;; `(if (= "run" (second pos)) ...)`); anything else is a usage refusal.
+  (if (= has-run 1) 1 -6))
+
 (defn usage-line-count [route :i64] :i64
   ;; How many usage lines the host prints for a route. The turn route prints
   ;; none: a turn with a refusal shows the refusal's message instead, and a
-  ;; turn that proceeds prints its result.
+  ;; turn that proceeds prints its result. Routes 0 and 10 print their own
+  ;; single refusal line, not the usage block, so they count 0 here.
   (if (= route 1) 8 0))
 
 (defn test-route-code [] :bool
@@ -69,7 +93,11 @@
        (= 3 (route-code 2 0))
        (= 4 (route-code 3 0))
        (= 5 (route-code 4 0))
-       (= 6 (route-code 5 0))))
+       (= 6 (route-code 5 0))
+       (= 8 (route-code 6 0))
+       (= 9 (route-code 7 0))
+       (= 10 (route-code 8 0))
+       (= 0 (route-code 9 0))))
 
 (defn test-admit-turn [] :bool
   (and (= 1 (admit-turn 1 1 1 1 1))
@@ -78,6 +106,10 @@
        (= -3 (admit-turn 1 1 0 1 1))
        (= -4 (admit-turn 1 1 1 0 1))
        (= -5 (admit-turn 1 1 1 1 0))))
+
+(defn test-admit-gateway [] :bool
+  (and (= 1 (admit-gateway 1))
+       (= -6 (admit-gateway 0))))
 
 (defn test-usage-lines [] :bool
   (and (= 8 (usage-line-count 1))

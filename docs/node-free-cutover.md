@@ -1,0 +1,72 @@
+# node+kbb prune 台帳 — itonami-agent CLI を kotoba/amu selfhost へ
+
+目的: 実行経路から node + kbb（org-babashka-nbb / SCI-on-Node）を prune し、
+kotoba / amu selfhost（amu-compile した native kexe）だけで動く形へ移す。
+計画の筋は kexe-first（kagi ADR-0002）: 決定は pure kotoba guest に、effect は
+host adapter / kexe wire providers に置く。tracked: Linear JUN-110 系。
+
+## 計測 1: `amu check` 拒否インベントリ（2026-10-20, amu c3b1ef6a）
+
+`amu check src/itonami/agent/<f> --source-path src` を 30 モジュール全数に実行。
+
+| 拒否 | before | after (本 PR) | 内容 |
+|---|---|---|---|
+| `:read` leading-zero octal | 2 (p2p/cron) | 0 | `{:mode 0600}` → `384`（chmod 値同一） |
+| `:read` reader dispatch | 1 (main) | 1 | `#?`/`#"`/`#(` 系。regex/anon の置換は個別 trench |
+| `:project-link` 文字列 host import | 27 | 28 | `["node:crypto"]` 等 30 箇所 / 13 ファイル |
+| `:project-link` require 未充足 | (同上) | (同上) | `clojure.string` ×30、`promesa.core` ×15 |
+
+`required module clojure.string is missing from the explicit source paths` という
+形（= **compat モジュールを `--source-path` で差し込めば通る**）なので、
+require 面は shim で機械的に溶ける。文字列 import は「host adapter 境界」に
+落とす設計判断（JUN-13 の方針どおり）。
+
+構文面の残数（grep 計測）: `#"` regex 231 / `#(…)` anon 211 / `#js` 72。
+
+## 計測 2: effect 半分の受け皿は kexe ABI に揃っている
+
+amu `tools/kexe_loader.c` の provider 面（実測で列挙）:
+`io_read` / `io_write` / `io_write_error` / `cli_args` / `env_read` /
+`clock_text` / `hash_sha256` / `identity_verify` / `entropy_draw` /
+`fs_app_data_*`（exists read write stat mtime chmod mkdir unlink rmdir rename
+range_read fsync stat_nofollow owner make_temp_dir）/ `fs_browse` /
+`process_spawn` / `net_broker`（listen/dial, wire 43/45）/ `gpu_compute`。
+
+→ turn の effect 半分（profile 読取・provider hop・tool 実行・出力）に必要な
+機構はすべてここにある。**残る壁は言語 subset（上表）と port 量だけ。**
+
+## trench 順序（node+kbb が消えるまで）
+
+1. read 面: octal → 済（本 PR）。main.cljk の reader dispatch は regex/anon
+   の置換個別に潰す。
+2. require 面: `clojure.string` / `promesa.core` の compat モジュールを
+   amu `--source-path` 専用に供給（kbb の classpath には出さない — 両 CLI の
+   分離は AGENTS.md の Two CLIs 表どおり）。
+3. `["node:…"]` import → host adapter 境界（kexe wire 呼び出し）へ置換。
+4. effect 半分を guest に port → kexe の native CLI として起動、kbb launcher
+   （`env -S kbb --backend sci`）を廃止。
+
+## 決定コア（kexe-first）の dispatch parity — 実測
+
+`kotoba/agent_cli/route.kotoba` が `-main` の `(case (first pos) …)` と 1:1
+（vault/mcp/gateway/unknown route code と `admit-gateway` を追加）。
+host fact のまま残すもの: profile 名検証、`--oneshot` の route 乗っ取り。
+
+- `amu check`: ok（effects #{}）
+- `amu test`: 12/12（targets `:jvm-kir :js :wasm`）
+- `amu compile --target aarch64-linux --jvm-free` → kexe →
+  `extract-native`: route-code(offset 0, arity 2) / admit-turn(92, 5) /
+  admit-gateway(164, 1)
+- node 無し guest 実行証跡: `workspaces/hermes/itonami-aiueos-vm-boot/boot61.log`
+  （QEMU virt arm64, initramfs に node なし）:
+  ROUTE `7 1 2 3 4 5 6 8 9 10 0` / TURN `1 -1 -2 -3 -4 -5` / GATEWAY `1 -6`
+  — 全数が test のオラクルと一致、qemu exit 0 で poweroff。
+
+## 罠（実測）
+
+- initramfs newc の padding は**アーカイブ先頭からの絶対 4 バイト境界合わせ**
+  （header は 110 bytes なので相対 padding だと全 entry が 2 バイトずれ、
+  kernel は `Initramfs unpacking failed: broken padding` で落ちる）。
+- `kbb --backend sci run-tests.cljk` は `--classpath src:test` が要る。
+  run-tests の baseline は `137 tests / 980 assertions / 5 failures`（uid 依存
+  fixture 由来の既存 failure。本 branch で増減なし）。

@@ -93,7 +93,7 @@
       (let [kp (crypto/generateKeyPairSync "ed25519")]
         (h/spit f (h/json-str {"public" (.toString (.export (.-publicKey kp) #js {:type "spki" :format "der"}) "base64")
                                "private" (.toString (.export (.-privateKey kp) #js {:type "pkcs8" :format "der"}) "base64")})
-                {:mode 0600})))
+                {:mode 384}))) ; 0600 octal -- Kotoba's reader has no octal prefix
     (let [{:strs [public private]} (h/json-parse (h/slurp f))
           pub-der (js/Buffer.from public "base64")]
       {:did (pub->did (spki->raw pub-der))
