@@ -1,0 +1,45 @@
+(ns itonami.incidents-core
+  "The pure half of the cron_incidents port (ledger 8 design A, consumer 3
+  incidents slice). Measured states from the UPDATE surface: 0 open /
+  1 alerted / 2 closed / 3 resolved. The ack UPDATE is
+  WHERE state != 'closed' -- the same from-conditional flip as the tasks
+  table. Recurrences is a decimal-string field bumped in place.
+
+  Row fields (tasks-state codec): 0 state digit / 1 job id / 2 failure type /
+  3 recurrences / 4 spare. Self-contained: native-qualified ops."
+  (:require [itonami.tasks-core :as tc])
+  (:export [state-code state-name bump-recurrences recurrences-of
+            test-state test-bump]))
+
+(defn state-code [name :string] :i64
+  (if (string=? name "open") 0
+    (if (string=? name "alerted") 1
+      (if (string=? name "closed") 2
+        (if (string=? name "resolved") 3 -1)))))
+
+(defn state-name [code :i64] :string
+  (if (= code 0) "open"
+    (if (= code 1) "alerted"
+      (if (= code 2) "closed"
+        (if (= code 3) "resolved" "")))))
+
+(defn recurrences-of [s :string] :i64
+  (if (= 0 (string-length s))
+    0
+    (tc/dec-at s 0 (tc/dec-len s 0))))
+
+(defn bump-recurrences [s :string] :string
+  (string-from-i64 (+ 1 (recurrences-of s))))
+
+(defn test-state [] :bool
+  (and (= 0 (state-code "open"))
+       (= 3 (state-code "resolved"))
+       (= -1 (state-code "nope"))
+       (string=? "alerted" (state-name 1))
+       (string=? "" (state-name 9))))
+
+(defn test-bump [] :bool
+  (and (string=? "1" (bump-recurrences ""))
+       (string=? "1" (bump-recurrences "0"))
+       (string=? "12" (bump-recurrences "11"))
+       (= 11 (recurrences-of "11x"))))

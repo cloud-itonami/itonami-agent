@@ -1,0 +1,118 @@
+(ns itonami.incidents
+  "The effect half of the cron_incidents port: per-incident state files
+  (notepad's hashed naming) plus a per-job journal of incident ids for the
+  resolve-all walk. The measured shapes: INSERT (upsert-create), the
+  recurrence bump (upsert-repeat), UPDATE state='alerted' (mark-alerted),
+  UPDATE state='closed' WHERE state!='closed' (ack -- a from-conditional
+  flip), UPDATE state='resolved' (resolve per job).
+
+  Parity notes: *_at timestamps folded out (clock wiring); the ORDER BY
+  last_seen_at DESC, id DESC listing becomes the per-job journal walk in
+  reverse order at the call site.
+
+  Shape rule measured earlier: typed-cap-call only in a typed defn's return
+  position."
+  (:require [itonami.incidents-core :as ic]
+            [itonami.tasks-state :as ts]
+            [itonami.journal :as j]
+            [itonami.notepad :as np])
+  (:export [inc-upsert inc-get-state inc-recurrences inc-alert inc-ack
+            inc-resolve-job])
+  (:capabilities #{:fs/app-data}))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- exists? [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn- ipath [base :string id :string] :string
+  (np/note-path base (string-concat "i" id)))
+
+(defn- jpath [base :string job :string] :string
+  (np/note-path base (string-concat "k" job)))
+
+(defn inc-upsert [base :string id :string job :string failure :string] :i64
+  (if (= 0 (string-length id))
+    0
+    (let [p (ipath base id)]
+      (if (= 1 (exists? p))
+        (let [content (wire-read p)]
+          (let [r (ic/bump-recurrences (ts/row-field content 3))]
+            (let [w (wire-write p (ts/row-encode (ts/row-status content)
+                                                  (ts/row-field content 1)
+                                                  (ts/row-field content 2)
+                                                  r ""))]
+              2)))
+        (let [w (wire-write p (ts/row-encode 0 job failure "0" ""))]
+          (let [a (j/journal-append (jpath base job) id)]
+            1))))))
+
+(defn inc-get-state [base :string id :string] :i64
+  (let [p (ipath base id)]
+    (if (= 0 (exists? p))
+      -1
+      (let [content (wire-read p)]
+        (ts/row-status content)))))
+
+(defn inc-recurrences [base :string id :string] :i64
+  (let [p (ipath base id)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (ic/recurrences-of (ts/row-field content 3))))))
+
+(defn inc-alert [base :string id :string] :i64
+  (let [p (ipath base id)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (if (= 0 (ts/row-status content))
+          (let [w (wire-write p (ts/row-encode 1 (ts/row-field content 1)
+                                                (ts/row-field content 2)
+                                                (ts/row-field content 3) ""))]
+            1)
+          0)))))
+
+(defn inc-ack [base :string id :string] :i64
+  (let [p (ipath base id)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (if (= 2 (ts/row-status content))
+          0
+          (let [w (wire-write p (ts/row-encode 2 (ts/row-field content 1)
+                                                (ts/row-field content 2)
+                                                (ts/row-field content 3) ""))]
+            1))))))
+
+(defn- resolve-run [base :string q :string i :i64 n :i64] :i64
+  (if (>= i n)
+    0
+    (let [id (j/journal-entry q i)]
+      (let [p (ipath base id)]
+        (let [content (wire-read p)]
+          (let [st (ts/row-status content)]
+            (let [done (if (or (= st 0) (= st 1))
+                         (let [w (wire-write p (ts/row-encode 3 (ts/row-field content 1)
+                                                               (ts/row-field content 2)
+                                                               (ts/row-field content 3) ""))]
+                           1)
+                         0)]
+              (+ done (resolve-run base q (+ i 1) n)))))))))
+
+(defn inc-resolve-job [base :string job :string] :i64
+  (let [q (jpath base job)]
+    (if (= 0 (exists? q))
+      0
+      (resolve-run base q 0 (j/journal-count q)))))
