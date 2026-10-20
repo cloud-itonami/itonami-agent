@@ -1,0 +1,1 @@
+{:allow #{[:cap/call :io/write] [:cap/call :cli/args]}}

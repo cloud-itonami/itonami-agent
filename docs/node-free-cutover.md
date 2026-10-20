@@ -143,3 +143,51 @@ cljs.reader 呼び出しは 3 箇所（p2p/profile/rails の `reader/read-string
   API を直接使う。**read-string の戻りである Clojure map は safe profile に
   無い**（これが cljs.reader 壁の正体）。壁カウントは呼び出し 3 件の port で
   消える。
+
+## 計測 6: host adapter 境界（`["node:…"]` の置換）— 一巡完了（2026-10-20）
+
+`["node:fs"]` 等の文字列 import 30 箇所の置換機構を実測で確定し、
+end-to-end で通した。機構は 3 点セット:
+
+1. ns の bounded 宣言: `(:capabilities #{:io/write :cli/args ...})`
+   （名前付き keyword の set、上限 256。keyword で無いと
+   `namespace-capabilities-shape` で拒否）
+2. 呼び出し: `(typed-cap-call :ns/op request-type result-type request)`
+   — 例: `(typed-cap-call :io/write :string :string s)`。
+   参考実装は amu/seed/02-io.kotoba。
+3. 付与: `amu check/compile --policy policy.edn`、policy は
+   `{:allow #{[:cap/call :io/write]}}`（**catalog 名で書ける**。wire id は
+   ABI の中だけで、人が書く数字ではない — capability_names.cljk が翻訳）。
+
+正本: `kotoba-lang/lang/capability-catalog.edn`（名前 ↔ `:compiler-wire-id`
++ classification）。実測した wire id: hash/sha256=3, clock/now=7,
+process/spawn=20, fs/app-data-bytes=35, io/write=37, cli/args=38,
+io/write-error=39, io/read=41。ほか catalog に fs/app-data, fs/browse,
+env/read, entropy/draw, identity/verify, gpu/compute 等。
+
+node import との対応（port 時の置換表）:
+
+| node import | capability |
+|---|---|
+| node:fs read/write | `:fs/app-data`（+ `:fs/app-data-bytes`） |
+| node:crypto hash | `:hash/sha256` |
+| node:os env | `:env/read` |
+| node:child_process | `:process/spawn` |
+| stdout / stderr | `:io/write` / `:io/write-error` |
+| argv | `:cli/args` |
+| node:http / node:net / node:dns | net broker（wire 43/45 listen/dial。catalog 名は要確認） |
+| node:readline | `:io/read` |
+| node:path | 純粋 port（capability 不要） |
+| **node:sqlite** | **capability が無い** — execution_ledger / delivery_queue / notepad / tools の 4 件は `:fs/app-data` ベースの store への port か新 capability が必要（open） |
+
+end-to-end 実測（boot62.log、guest VM、node 無し）:
+
+    TEST_IO_GRANTED: CAP_WRITE_OK1     <- wire 37 がコンソールへ出力、return 1
+    TEST_IO_DENIED:  KEXE_TRAP {:kind :signal :signal :SIGTRAP}
+
+grants なしの同じ guest は **名前付き trap で fail-closed**。check :ok true
+（effects / named-operations に名前が出る）、compile aarch64-linux kexe 成功。
+例は `kotoba/compat/examples/host-adapter-io.kotoba` + 同 policy。
+
+計測した制約: **`amu test` は capability guest を走らせられない**（internal
+compiler error）。adapter 系の検証は kexe + kexe_loader / guest VM 経路で行う。
