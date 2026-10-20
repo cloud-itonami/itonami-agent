@@ -510,3 +510,24 @@ node:sqlite port 最後の consumer（tools、121 SQL）の査定。正体は
 
 実装上の罠（記録）: 空 entry で substring が OOB → field-at は
 空/短小 entry を fail-closed で "" に。
+
+## 計測 16: tasks テーブル port — node 無しで完走（2026-10-21、boot83.log）
+
+計測 14 設計第 2 スライス（tools の tasks、31 SQL）。Kanban 状態機械:
+
+- 状態語彙（UPDATE 面から実測）: 0 todo / 1 ready / 2 claimed / 3 running /
+  4 blocked / 5 review / 6 done。row は 5 フィールド
+  （status/assignee/claim_lock/current_run_id/result）。
+- **SQLite の遷移は条件付き**（UPDATE ... WHERE status=...）→
+  `task-transition` は **from 一致のときだけ flip**（generic な条件遷移で
+  全 UPDATE 形を吸収）。claim は ready→claimed + assignee/lock、
+  done は running→done + result。
+- guest 実行（node 無し）: create 1 / 重複 0 / 0→1 遷移 1 / 不正 from 0 /
+  claim(alice,L1) 1 / 二重 claim 0 / status 2 / assignee alice /
+  2→3 遷移 1 / done("ok") 1 / result "ok" / 最終 status 6 →
+  `TSRESULT:2:ok` / `:ok :result 1`。
+- tasks_state 6/6 緑、8-module graph の native compile 成功。
+
+parity notes: claim_expires / heartbeat / block_kind（時計・再発）は
+open。row のフィールドに改行は入れない（journal_core piece 列のため —
+改行を含む result は events の length-prefix codec 側で扱う）。

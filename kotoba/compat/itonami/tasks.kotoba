@@ -1,0 +1,100 @@
+(ns itonami.tasks
+  "The effect half of the tasks-table port: one state file per task id
+  (notepad's hashed naming). The SQLite transitions are CONDITIONAL
+  (UPDATE ... WHERE status=...), so task-transition flips only when the row
+  is in the expected status; claim takes ready -> claimed with the assignee
+  and claim lock; done takes running -> done with the result.
+
+  Parity notes: claim_expires / heartbeats / block_kind columns are folded
+  out of this slice (timestamps and recurrence need the clock wiring); the
+  status set is the measured seven.
+
+  Shape rule measured earlier: typed-cap-call only in a typed defn's return
+  position."
+  (:require [itonami.tasks-state :as ts]
+            [itonami.notepad :as np])
+  (:export [task-create task-status task-transition task-claim task-done
+            task-get-field])
+  (:capabilities #{:fs/app-data}))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- exists? [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn- tpath [base :string id :string] :string
+  (np/note-path base (string-concat "t" id)))
+
+(defn task-create [base :string id :string status :i64] :i64
+  (if (= 0 (string-length id))
+    0
+    (if (< status 0)
+      0
+      (if (> status 6)
+        0
+        (let [p (tpath base id)]
+          (if (= 1 (exists? p))
+            0
+            (let [w (wire-write p (ts/row-encode status "" "" "" ""))]
+              1)))))))
+
+(defn task-status [base :string id :string] :i64
+  (let [p (tpath base id)]
+    (if (= 0 (exists? p))
+      -1
+      (let [content (wire-read p)]
+        (ts/row-status content)))))
+
+(defn task-get-field [base :string id :string n :i64] :string
+  (let [p (tpath base id)]
+    (if (= 0 (exists? p))
+      ""
+      (let [content (wire-read p)]
+        (ts/row-field content n)))))
+
+(defn task-transition [base :string id :string from :i64 to :i64] :i64
+  (if (or (< to 0) (> to 6))
+    0
+    (let [p (tpath base id)]
+      (if (= 0 (exists? p))
+        0
+        (let [content (wire-read p)]
+          (if (= from (ts/row-status content))
+            (let [w (wire-write p (ts/row-encode to (ts/row-field content 1)
+                                                  (ts/row-field content 2)
+                                                  (ts/row-field content 3)
+                                                  (ts/row-field content 4)))]
+              1)
+            0))))))
+
+(defn task-claim [base :string id :string assignee :string lock :string] :i64
+  (let [p (tpath base id)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (if (= 1 (ts/row-status content))
+          (let [w (wire-write p (ts/row-encode 2 assignee lock "" ""))]
+            1)
+          0)))))
+
+(defn task-done [base :string id :string result :string] :i64
+  (let [p (tpath base id)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (if (= 3 (ts/row-status content))
+          (let [w (wire-write p (ts/row-encode 6 (ts/row-field content 1) ""
+                                               (ts/row-field content 3) result))]
+            1)
+          0)))))
