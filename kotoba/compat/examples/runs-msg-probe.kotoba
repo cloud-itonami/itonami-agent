@@ -1,0 +1,33 @@
+(ns runs-msg-probe
+  "Guest evidence for the task_runs and messages ports: run state flips,
+  session title, message journal with newline content and indexed paging."
+  (:require [itonami.runs :as r]
+            [itonami.messages :as m])
+  (:export [runs-msg-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn runs-msg-probe [] :i64
+  (let [rc (r/run-create "/data/rm" "r1" "t1" "cron")
+        rc2 (r/run-create "/data/rm" "r1" "t1" "cron")
+        rs (r/run-set "/data/rm" "r1" 0 1 "")
+        rsbad (r/run-set "/data/rm" "r1" 0 2 "")
+        rf (r/run-set "/data/rm" "r1" 1 2 "done-ok")
+        rout (r/run-get-field "/data/rm" "r1" 3)
+        sc (m/session-create "/data/rm" "s1" "chat-1")
+        st (m/session-title "/data/rm" "s1")
+        ma1 (m/msg-append "/data/rm" "s1" "user" "hello")
+        ma2 (m/msg-append "/data/rm" "s1" "assistant" "a
+b")
+        mc (m/msg-count "/data/rm" "s1")
+        mr (m/msg-role-at "/data/rm" "s1" 1)
+        mct (m/msg-content-at "/data/rm" "s1" 1)
+        say (wire-say (string-concat "RMRESULT:" (string-concat rout (string-concat ":" mct))))]
+    (if (and (= 1 rc) (= 0 rc2) (= 1 rs) (= 0 rsbad) (= 1 rf)
+             (string=? "done-ok" rout) (= 1 sc) (string=? "chat-1" st)
+             (= 1 ma1) (= 1 ma2) (= 2 mc) (string=? "assistant" mr)
+             (string=? "a
+b" mct))
+      1 0)))

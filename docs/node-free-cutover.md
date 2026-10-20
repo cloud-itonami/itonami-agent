@@ -553,3 +553,30 @@ open。row のフィールドに改行は入れない（journal_core piece 列�
 これで node:sqlite port（計測 8）の store 面は **全テーブルの設計・実装・
 guest 実証が揃った**（残: task_runs / messages = 既存パターンの薄い面と
 incidents、および .cljk 側の呼び出し差し替え）。
+
+## 計測 18: task_runs + messages port — node 無しで完走（2026-10-21、boot86.log）
+
+計測 14 設計の薄い面 2 つを一括で:
+
+- `runs.kotoba`（task_runs、10 SQL）: per-run state（tasks-state codec の
+  列を流用: 0 status / 1 profile / 2 task / 3 outcome）+ from-conditional
+  flip。UPDATE ... WHERE id 形を吸収。
+- `messages.kotoba`（messages + ROW_NUMBER window）: per-session journal
+  （**tasks-core の length-prefix codec を再利用** — content は改行を含む）+
+  セッション title は state フィールド。window の OFFSET ページングは
+  `msg-role-at` / `msg-content-at`（journal index = message id）に還元。
+- guest 実行（node 無し）: run create 1 / 重複 0 / 0→1 flip 1 / 不正 from 0 /
+  1→2 flip(outcome "done-ok") 1 / outcome 往復 ✓ / session create 1 /
+  title "chat-1" / msg 2 append（content "a\nb"）/ count 2 / role-at 1 =
+  "assistant" / content-at 1 = "a\nb" → `RMRESULT:done-ok:a\nb` /
+  `:ok :result 1`。
+- 11-module graph の native compile 成功。
+
+実装罠（probe が検出）: run-set の outcome を field 4 に書いて field 3 を
+読んでいた（列対応の不一致）→ probe の assertion が正確に捕捉。修正後
+全緑。
+
+これで **node:sqlite port（計測 8）の全テーブルが実装・guest 実証済み**:
+notepad / delivery_queue / execution_ledger / task_events / tasks /
+task_links / task_runs / messages。残: incidents（独立テーブル）と
+.cljk 呼び出し差し替え本体。

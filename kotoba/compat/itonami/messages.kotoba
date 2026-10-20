@@ -1,0 +1,107 @@
+(ns itonami.messages
+  "The messages/session port (ledger 8 design A, consumer 4 slice 5): one
+  length-prefixed journal per session (task_events' codec reused -- content
+  carries newlines), message id = journal position. The measured shapes:
+  ordered scans with OFFSET (the ROW_NUMBER paging) reduce to
+  message-at (index), and the session row (title, started_at) is the
+  session's own state file.
+
+  Parity notes: timestamps folded out (clock wiring); the session title
+  lives in the message journal's sister state file as field 1 of the
+  tasks-state codec."
+  (:require [itonami.tasks-core :as tc]
+            [itonami.tasks-state :as ts]
+            [itonami.notepad :as np])
+  (:export [session-create msg-append msg-count msg-role-at msg-content-at
+            session-title])
+  (:capabilities #{:fs/app-data}))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- wire-append [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "APPEND_SEP" content))))
+
+(defn- exists? [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn- mpath [base :string session :string] :string
+  (np/note-path base (string-concat "m" session)))
+
+(defn- spath [base :string session :string] :string
+  (np/note-path base (string-concat "z" session)))
+
+(defn session-create [base :string session :string title :string] :i64
+  (if (= 0 (string-length session))
+    0
+    (let [p (spath base session)]
+      (if (= 1 (exists? p))
+        0
+        (let [w (wire-write p (ts/row-encode 0 title "" "" ""))]
+          1)))))
+
+(defn session-title [base :string session :string] :string
+  (let [p (spath base session)]
+    (if (= 0 (exists? p))
+      ""
+      (let [content (wire-read p)]
+        (ts/row-field content 1)))))
+
+(defn msg-append [base :string session :string role :string content :string] :i64
+  (if (= 0 (string-length session))
+    0
+    (let [p (mpath base session)]
+      (let [e (tc/event-encode "" role content)]
+        (if (= 1 (exists? p))
+          (let [a (wire-append p e)]
+            1)
+          (let [w (wire-write p e)]
+            1))))))
+
+(defn- walk-at [content :string i :i64 k :i64 n :i64] :string
+  (if (>= i (string-length content))
+    ""
+    (let [rest (string-substring content i (string-length content))]
+      (let [len (tc/event-len rest)]
+        (let [entry (string-substring rest 0 len)]
+          (if (= k n)
+            entry
+            (walk-at content (+ i len) (+ k 1) n)))))))
+
+(defn- entry-of [base :string session :string k :i64] :string
+  (let [p (mpath base session)]
+    (if (= 0 (exists? p))
+      ""
+      (let [content (wire-read p)]
+        (walk-at content 0 0 k)))))
+
+(defn msg-count [base :string session :string] :i64
+  (let [p (mpath base session)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (msg-walk-count content 0 0)))))
+
+(defn- msg-walk-count [content :string i :i64 acc :i64] :i64
+  (if (>= i (string-length content))
+    acc
+    (let [rest (string-substring content i (string-length content))]
+      (let [len (tc/event-len rest)]
+        (msg-walk-count content (+ i len) (+ acc 1))))))
+
+(defn msg-role-at [base :string session :string k :i64] :string
+  (tc/event-kind (entry-of base session k)))
+
+(defn msg-content-at [base :string session :string k :i64] :string
+  (tc/event-payload (entry-of base session k)))
