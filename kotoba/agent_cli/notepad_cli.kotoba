@@ -1,0 +1,81 @@
+(ns agent-cli-notepad
+  "The `cron notepad` verbs as a one-shot kexe guest -- trench 4 shape for
+  this surface (the native CLI), byte-parity with main.cljk printing:
+
+    set    -> <key> = <value>
+    get    -> value / <key> is not set
+    delete -> deleted / <key> is not set
+    list   -> <key> = <value> per line, ORDER BY key (the SQLite ORDER BY)
+
+  argv on wire 38: 0 verb / 1 base / 2 key / 3 value (everything after the
+  loader `--`). A missing or unknown verb answers the usage line on stderr
+  (wire 39) and exit 2, mirroring main.cljk die 2.
+
+  Measured parity edges (kept, not papered over): the module store cannot
+  tell a stored empty value from an absent key (both answer empty), so get
+  prints the not-set line for an empty answer; and a refused set (cap
+  violation) prints nothing and exits 2 -- the cljk route threw an ex-info
+  there, which the subset cannot express."
+  (:require [itonami.notepad :as np]
+            [itonami.notepad-render :as nr]
+            [itonami.journal-core :as jc])
+  (:export [notepad-cli])
+  (:capabilities #{:cli/args :io/write :io/write-error}))
+
+(def usage "usage: itonami-agent cron notepad <job-id> set <key> <value> | get <key> | delete <key> | list")
+
+(defn- wire-arg [i :i64] :string
+  (typed-cap-call :cli/args :string :string (string-from-i64 i)))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn- wire-die [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn- list-run [base :string keys :string i :i64 n :i64 acc :string] :string
+  (if (>= i n)
+    acc
+    (let [k (nr/note-key-at keys i)]
+      (let [v (np/notepad-get base k)]
+        (let [line (string-concat k (string-concat " = " v))]
+          (let [acc2 (if (= 0 (string-length acc))
+                       line
+                       (string-concat acc (string-concat "
+" line)))]
+            (list-run base keys (+ i 1) n acc2)))))))
+
+(defn- fail [msg :string] :i64
+  (let [w (wire-die msg)]
+    2))
+
+(defn- ok [line :string] :i64
+  (let [w (wire-say line)]
+    0))
+
+(defn notepad-cli [] :i64
+  (let [verb (wire-arg 0) base (wire-arg 1) key (wire-arg 2) value (wire-arg 3)]
+    (if (string=? verb "set")
+      (if (= 0 (string-length key))
+        (fail usage)
+        (if (= 0 (string-length value))
+          (fail usage)
+          (if (= 1 (np/notepad-set base key value))
+            (ok (string-concat key (string-concat " = " value)))
+            (fail usage))))
+      (if (string=? verb "get")
+        (let [v (np/notepad-get base key)]
+          (if (= 0 (string-length v))
+            (ok (string-concat key " is not set"))
+            (ok v)))
+        (if (string=? verb "delete")
+          (if (= 1 (np/notepad-delete base key))
+            (ok "deleted")
+            (ok (string-concat key " is not set")))
+          (if (string=? verb "list")
+            (let [keys (nr/note-keys base)]
+              (if (= 0 (string-length keys))
+                (ok "")
+                (ok (list-run base keys 0 (jc/count-pieces keys "
+") ""))))
+            (fail usage)))))))
