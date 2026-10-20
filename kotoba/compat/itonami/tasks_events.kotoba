@@ -1,0 +1,98 @@
+(ns itonami.tasks-events
+  "The effect half of the task_events journalization: one length-prefixed
+  journal per task (notepad's hashed naming), event id = journal position.
+  The measured query shapes reduce to walks: ev-last-by-kind is
+  ORDER BY id DESC LIMIT 1; ev-first-after is the id > ? scan. Payloads may
+  carry newlines (the loader's only content rule is the _SEP token ban), so
+  entries are prefix-parsed, not line-parsed.
+
+  Shape rule measured earlier: typed-cap-call only in a typed defn's return
+  position."
+  (:require [itonami.tasks-core :as tc]
+            [itonami.notepad :as np])
+  (:export [ev-append ev-count ev-last-by-kind ev-first-after])
+  (:capabilities #{:fs/app-data}))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- wire-append [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "APPEND_SEP" content))))
+
+(defn- exists? [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn- jpath [base :string task :string] :string
+  (np/note-path base (string-concat "e" task)))
+
+(defn- walk-count [content :string i :i64 acc :i64] :i64
+  (if (>= i (string-length content))
+    acc
+    (walk-count content (+ i (tc/event-len (string-substring content i (string-length content))))
+                (+ acc 1))))
+
+(defn- walk-last [content :string i :i64 kind :string acc :string] :string
+  (if (>= i (string-length content))
+    acc
+    (let [rest (string-substring content i (string-length content))]
+      (let [len (tc/event-len rest)]
+        (let [entry (string-substring rest 0 len)]
+          (let [acc2 (if (string=? (tc/event-kind entry) kind)
+                       (tc/event-payload entry)
+                       acc)]
+            (walk-last content (+ i len) kind acc2)))))))
+
+(defn- walk-first [content :string i :i64 kind :string after :i64 id :i64] :string
+  (if (>= i (string-length content))
+    ""
+    (let [rest (string-substring content i (string-length content))]
+      (let [len (tc/event-len rest)]
+        (let [entry (string-substring rest 0 len)]
+          (if (and (> id after) (string=? (tc/event-kind entry) kind))
+            (tc/event-payload entry)
+            (walk-first content (+ i len) kind after (+ id 1))))))))
+
+(defn ev-append [base :string task :string run :string kind :string payload :string] :i64
+  (if (= 0 (string-length task))
+    0
+    (if (= 0 (string-length kind))
+      0
+      (let [p (jpath base task)]
+        (let [e (tc/event-encode run kind payload)]
+          (if (= 1 (exists? p))
+            (let [a (wire-append p e)]
+              1)
+            (let [w (wire-write p e)]
+              1)))))))
+
+(defn ev-count [base :string task :string] :i64
+  (let [p (jpath base task)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (walk-count content 0 0)))))
+
+(defn ev-last-by-kind [base :string task :string kind :string] :string
+  (let [p (jpath base task)]
+    (if (= 0 (exists? p))
+      ""
+      (let [content (wire-read p)]
+        (walk-last content 0 kind "")))))
+
+(defn ev-first-after [base :string task :string kind :string after :i64] :string
+  (let [p (jpath base task)]
+    (if (= 0 (exists? p))
+      ""
+      (let [content (wire-read p)]
+        (walk-first content 0 kind after 0)))))
