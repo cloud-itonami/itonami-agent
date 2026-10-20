@@ -1,0 +1,122 @@
+(ns itonami.journal-core
+  "The pure half of the newline-delimited journal store (ledger 8 design A):
+  node:sqlite's port absorbs into append-only journals plus bounded scans.
+  Invariant: every entry is one line -- the writer appends entry + newline, so
+  a journal always ends with a newline and its entry count is pieces - 1.
+  Entries carrying a newline, empty entries, or a loader write token
+  (WRITE_SEP / APPEND_SEP, which the loader refuses fail-closed) are rejected
+  here first, so a bad entry never reaches the wire.
+
+  Self-contained on purpose: the native admission gate scans EVERY linked
+  function, so requiring clojure.string here would drag its split-count
+  (string-split-count, not native-qualified -- measured) into the graph and
+  refuse the whole journal build. Only native-qualified ops appear below
+  (string-length / string-substring / string-index-of / string-code-point-at /
+  string-concat / string= -- each measured qualified on aarch64-linux)."
+  (:export [entry-ok journal-size entry-index-ok piece
+            test-entry-ok test-journal-size test-entry-index test-piece]))
+
+(defn- token-in [s :string token :string] :bool
+  (>= (string-index-of s token) 0))
+
+(defn entry-ok [entry :string] :i64
+  ;; 1 = the entry is one safe line; 0 = refuse (fail-closed, never partial).
+  (if (= 0 (string-length entry))
+    0
+    (if (token-in entry "
+") 0
+      (if (token-in entry "WRITE_SEP") 0
+        (if (token-in entry "APPEND_SEP") 0 1)))))
+
+(defn- count-pieces [s :string sep :string] :i64
+  ;; split-count without string-split-count (not native-qualified).
+  ;; Pieces = 1 + separators.
+  (if (= 0 (string-length s))
+    1
+    (let [i (string-index-of s sep)]
+      (if (< i 0)
+        1
+        (+ 1 (count-pieces (string-substring s (+ i (string-length sep))
+                                            (string-length s))
+                           sep))))))
+
+(defn- piece-run [s :string sep :string k :i64] :string
+  ;; the k-th piece of s split on sep (empty pieces count), "" past the end.
+  (let [i (string-index-of s sep)]
+    (if (< i 0)
+      (if (= k 0) s "")
+      (if (= k 0)
+        (string-substring s 0 i)
+        (piece-run (string-substring s (+ i (string-length sep))
+                                     (string-length s))
+                   sep (- k 1))))))
+
+(defn piece [s :string sep :string k :i64] :string
+  (if (< k 0) "" (piece-run s sep k)))
+
+(defn journal-size [content :string] :i64
+  ;; entries in a well-formed journal (ends with a newline; empty = 0 entries).
+  (if (= 0 (string-length content))
+    0
+    (let [pieces (count-pieces content "
+")]
+      (if (= "" (piece content "
+" (- pieces 1)))
+        (- pieces 1)
+        pieces))))
+
+(defn entry-index-ok [size :i64 k :i64] :i64
+  (if (< k 0) 0 (if (>= k size) 0 1)))
+
+(defn test-entry-ok [] :bool
+  (and (= 1 (entry-ok "hello"))
+       (= 0 (entry-ok ""))
+       (= 0 (entry-ok "a
+b"))
+       (= 0 (entry-ok "xWRITE_SEPy"))
+       (= 0 (entry-ok "xAPPEND_SEPy"))))
+
+(defn test-journal-size [] :bool
+  (and (= 0 (journal-size ""))
+       (= 1 (journal-size "
+"))
+       (= 1 (journal-size "a
+"))
+       (= 2 (journal-size "a
+b
+"))
+       (= 2 (journal-size "a
+b"))))
+
+(defn test-entry-index [] :bool
+  (and (= 1 (entry-index-ok 2 0))
+       (= 1 (entry-index-ok 2 1))
+       (= 0 (entry-index-ok 2 2))
+       (= 0 (entry-index-ok 2 -1))
+       (= 0 (entry-index-ok 0 0))))
+
+(defn test-piece [] :bool
+  (and (= "a" (piece "a
+b
+c" "
+" 0))
+       (= "b" (piece "a
+b
+c" "
+" 1))
+       (= "c" (piece "a
+b
+c" "
+" 2))
+       (= "" (piece "a
+b
+c" "
+" 3))
+       (= "" (piece "a
+b
+c" "
+" -1))
+       (= "" (piece "a
+
+" "
+" 1))))

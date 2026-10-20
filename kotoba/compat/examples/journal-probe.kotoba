@@ -1,0 +1,23 @@
+(ns journal-probe
+  "Guest evidence for the journal store (ledger 8 design A): append three
+  entries, refuse a bad one, count, read the middle, fail closed past the end."
+  (:require [itonami.journal :as j])
+  (:export [journal-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn journal-probe [] :i64
+  (let [a (j/journal-append "/data/j.txt" "one")
+        b (j/journal-append "/data/j.txt" "two")
+        c (j/journal-append "/data/j.txt" "three")
+        bad (j/journal-append "/data/j.txt" "x
+y")
+        n (j/journal-count "/data/j.txt")
+        e1 (j/journal-entry "/data/j.txt" 1)
+        far (j/journal-entry "/data/j.txt" 99)
+        say (wire-say (string-concat "JRESULT:" (string-concat e1 (string-concat ":" (string-from-i64 n)))))]
+    (if (and (= 1 a) (= 1 b) (= 1 c) (= 0 bad) (= 3 n)
+             (string=? e1 "two") (= 0 (string-length far)))
+      1 0)))

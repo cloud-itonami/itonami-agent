@@ -1,0 +1,61 @@
+(ns itonami.journal
+  "The effect half of the newline-delimited journal store: append-only writes
+  over :fs/app-data (WRITE_SEP to create, APPEND_SEP to append) and bounded
+  reads (whole-file READ + journal-core counting). Single-writer discipline is
+  the caller's, matching the ledger's store design. Everything fallible
+  answers fail-closed (0 / empty), never a partial state.
+
+  Measured shape rule (project mode): a typed-cap-call must sit in the RETURN
+  position of a typed defn -- a call-argument position is refused with
+  named capability operation requires a typed result context. The wire fns
+  below are therefore one call each, and the wrappers reason over their
+  results."
+  (:require [itonami.journal-core :as core])
+  (:export [journal-exists journal-append journal-count journal-entry])
+  (:capabilities #{:fs/app-data}))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- wire-append [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "APPEND_SEP" content))))
+
+(defn journal-exists [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn journal-append [path :string entry :string] :i64
+  (if (= 0 (core/entry-ok entry))
+    0
+    (let [line (string-concat entry "
+")]
+      (let [e (journal-exists path)]
+        (if (= e 1)
+          (let [r (wire-append path line)] 1)
+          (let [r (wire-write path line)] 1))))))
+
+(defn journal-count [path :string] :i64
+  (if (= 0 (journal-exists path))
+    0
+    (let [content (wire-read path)]
+      (core/journal-size content))))
+
+(defn journal-entry [path :string k :i64] :string
+  (if (= 0 (journal-exists path))
+    ""
+    (let [content (wire-read path)]
+      (let [size (core/journal-size content)]
+        (if (= 0 (core/entry-index-ok size k))
+          ""
+          (core/piece content "
+" k))))))

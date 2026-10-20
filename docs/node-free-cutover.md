@@ -351,3 +351,30 @@ boot71.log — **exact / directory 両 grant で store cycle が完走**
 （EXISTS → 1 / WRITE / APPEND / READ('AAABB') / :result 1、guest の実 fs に
 AAABB 着地）。verify-loader-fuzz: PASS_LOADER_SOURCE_BOUND_FUZZ
 （floors [60 100 18]、floorsLowered false）。
+
+## 計測 10: journal store スライス — node 無しで完走（2026-10-21、boot73.log）
+
+計測 8 設計 A の最初のスライスを実装・実証:
+
+- `kotoba/compat/itonami/journal_core.kotoba`（pure: entry 検証・piece
+  走査・size 計算）+ `journal.kotoba`（effect: :fs/app-data の
+  EXISTS/WRITE/APPEND/READ を 1 呼び出し 1 wire 関数に）。
+- guest 実行（node 無し、KEXE_CAP_RESOURCES_35=/data）: 3 append →
+  不正 entry（改行入り）拒否 → count 3 → 1 番目 "two" → 範囲外 "" →
+  `JRESULT:two:3` / `:status :ok :result 1`。guest の実 fs に
+  `one\ntwo\nthree` の journal が着地。
+- テスト: journal_core 12/12（3 target）、check :ok true、**aarch64-linux
+  native compile 成功**。
+
+実測した 2 つの構文ゲート（計画に影響）:
+
+1. **typed-cap-call は typed defn の return 位置のみ**（project mode）。
+   let 束縛・呼び出し引数の位置は `named capability operation requires a
+   typed result context` で拒否。→ wire 関数を「1 呼び出し = 1 関数」に。
+2. **native target は `string-split-count` を qualify しない**（index-of /
+   substring / concat / code-point-at / string=? / replace-all は全て
+   native 可、個別コンパイルで実測）。さらに **リンクした graph の全関数を
+   gate が走査する**ため、未使用でも compat の split-count が影を落とす。
+   → journal_core は自己完結（count を string-index-of 再帰に）。
+   clojure.string compat の split-count/split-lines は native 経路では
+   使えない（wasm/js では可）。
