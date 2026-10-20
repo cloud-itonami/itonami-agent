@@ -7,9 +7,15 @@
 
   Boundaries measured for this compiler (safe profile), each fail-closed or
   named here rather than approximated silently:
-  - join / split / split-lines are NOT in this module: the safe profile has no
-    container of strings (:vector-string is outside the profile; count wants a
-    bounded vector). They stay an open wall in docs/node-free-cutover.md.
+  - split needs NO string container (the safe profile has none: :vector-string
+    is outside the profile; count wants a bounded vector): split-count (pieces,
+    empty pieces counted -- Clojure str/split parity, test-pinned) plus
+    split-piece (the k-th piece). join has no container to take, so ported
+    callers fold string-concat; split-lines is split-count/piece over pieces
+    delimited by a one-code-point newline.
+  - string-index-of-from is compile-admitted but NOT runtime-executable (the
+    same trap as string-fold-ascii / string-upper), so split-piece scans with
+    string-index-of on the remaining suffix.
   - replace / replace-first take a STRING pattern. A regex pattern is the
     host-regex-literal wall and is refused at read time.
   - lower-case / upper-case are ASCII table lookups (65..90 / 97..122) built
@@ -20,8 +26,9 @@
   - blank?/trim/trimr whitespace is the ASCII set 9 10 11 12 13 32 (test-pinned)."
   (:export [blank? trim trimr includes? starts-with? ends-with?
             lower-case upper-case index-of replace replace-first
+            split-count split-piece
             test-blank test-trim test-match test-case test-index-of
-            test-replace]))
+            test-replace test-split]))
 
 (defn- ws? [c :i64] :bool
   (or (= c 32) (or (= c 9) (or (= c 10) (or (= c 11) (or (= c 12) (= c 13)))))))
@@ -98,6 +105,33 @@
       (string-concat (string-concat (string-substring s 0 i) repl)
                      (string-substring s (+ i (string-length match))
                                        (string-length s))))))
+
+(defn split-count [s :string sep :string] :i64
+  (string-split-count s sep))
+
+(defn split-piece [s :string sep :string k :i64] :string
+  (split-piece-run s sep k (string-length sep)))
+
+(defn- split-piece-run [s :string sep :string k :i64 seplen :i64] :string
+  ;; the k-th piece of s split on sep (empty pieces count), or "" past the
+  ;; last piece. Clojure str/split parity without a string container.
+  (let [i (string-index-of s sep)]
+    (if (< i 0)
+      (if (= k 0) s "")
+      (if (= k 0)
+        (string-substring s 0 i)
+        (split-piece-run (string-substring s (+ i seplen) (string-length s))
+                         sep (- k 1) seplen)))))
+
+(defn test-split [] :bool
+  (and (= 3 (split-count "a,b,c" ","))
+       (= 1 (split-count "abc" ","))
+       (= 3 (split-count "a,,b" ","))
+       (= "a" (split-piece "a,b,c" "," 0))
+       (= "b" (split-piece "a,b,c" "," 1))
+       (= "c" (split-piece "a,b,c" "," 2))
+       (= "" (split-piece "a,b,c" "," 3))
+       (= "" (split-piece "a,,b" "," 1))))
 
 ;; tests: they PIN the host semantics this module relies on (index-of's
 ;; not-found encoding, replace-all's arity, the case-folding scope) so a

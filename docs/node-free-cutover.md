@@ -67,8 +67,9 @@ blank? trim trimr includes? starts-with? ends-with? lower-case upper-case
 index-of replace replace-first（11 fn、test 6 件 = 18/18 が 3 target 緑）。
 実測した境界はモジュール header に明記してある:
 
-- join / split / split-lines は **未実装**: safe profile に string のコンテナが
-  無い（`:vector-string` は profile 外、`count` は bounded vector 専用）。
+- ~~join / split / split-lines は未実装~~ → **container 境界は解決済み（計測 4）**。
+  split は scalar API（`split-count` + `split-piece`）で吸収でき、string の
+  コンテナは不要と実測。join は port 先で `string-concat` fold に置換。
 - replace / replace-first は string パターンのみ（regex は read 壁）。
 - lower/upper は ASCII テーブル参照で自前実装 — `string-fold-ascii` /
   `string-upper` は **compile は通るが runtime 未実装**（test runner が
@@ -100,3 +101,23 @@ host fact のまま残すもの: profile 名検証、`--oneshot` の route 乗�
 - `kbb --backend sci run-tests.cljk` は `--classpath src:test` が要る。
   run-tests の baseline は `137 tests / 980 assertions / 5 failures`（uid 依存
   fixture 由来の既存 failure。本 branch で増減なし）。
+
+## 計測 4: string container 境界の解決（2026-10-20、trench 2 の続き）
+
+疑問: `str/join` / `str/split` は safe profile に string のコンテナが無いため
+open wall だった。実測の結論 — **コンテナは不要**:
+
+- `string-split-count` は **runtime 実行可**（`string-fold-ascii` /
+  `string-upper` / `string-index-of-from` は compile 通るが
+  `unsupported KIR operation` という罠には当たらなかった）。empty piece を
+  数える = Clojure `str/split` と一致（`"a,,b"` `","` → 3、test で pin）。
+- `split-piece(s, sep, k)` は `string-index-of`（実行可）+ `string-substring`
+  の再帰で k 番目 piece を返せる。存在しない piece は `""`（fail-closed）。
+  `string-index-of-from` が runtime 未実装なので、残余 suffix に
+  `string-index-of` を掛ける形にした。
+- `join` は入力コンテナが要るが、port 先の呼び出し側を `string-concat` の
+  fold に書き換えれば消える（binary concat は実行可）。`split-lines` は
+  改行 1 コードポイント区切りの split-count/piece で同じ形。
+
+compat に `split-count` / `split-piece` / `test-split` を追加。
+`amu check :ok true` / `amu test 21/21`（:jvm-kir :js :wasm）。
