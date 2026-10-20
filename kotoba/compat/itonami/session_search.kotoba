@@ -1,0 +1,111 @@
+(ns itonami.session-search
+  "The session-search store pilot (ledger measurement 34, slice 1): the
+  core of the session_search tool family over the ported per-session
+  message journals (itonami.messages) -- a substring search across
+  sessions and the lineage root walk. The full tool surface (profile
+  resolution, ISO bounds, detail modes, exclusions) stays at the handler
+  trench; this is the store semantics the 17 SQL express.
+
+  Layout: sessions are directories under base (the messages module owns
+  their journals and titles); a session's parent link is one file beside
+  them (s<session>.parent), written whole. ss-root walks parents up to
+  64 hops (a cycle answers the last id seen), ss-root of an unknown
+  session is the session itself.
+
+  ss-search answers up to limit lines of session<TAB>message-index<TAB>
+  role<TAB>content for messages whose content contains the query (the
+  SQL LIKE semantics), sessions and messages in store order.
+
+  Shape rule measured earlier: typed-cap-call only in a typed defn's return
+  position."
+  (:require [itonami.messages :as m]
+            [itonami.journal-core :as jc])
+  (:export [ss-set-parent ss-parent ss-root ss-search])
+  (:capabilities #{:fs/browse :fs/app-data}))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- wire-browse [dir :string] :string
+  (typed-cap-call :fs/browse :string :string dir))
+
+(defn- ppath [base :string session :string] :string
+  (string-concat base (string-concat "/s" (string-concat session ".parent"))))
+
+(defn ss-set-parent [base :string session :string parent :string] :i64
+  (let [r (wire-write (ppath base session) parent)]
+    1))
+
+(defn ss-parent [base :string session :string] :string
+  (let [p (ppath base session)]
+    (let [a (wire-exists p)]
+      (if (or (= 0 (string-length a)) (not (= 49 (string-code-point-at a 0))))
+        ""
+        (wire-read p)))))
+
+(defn- root-walk [base :string session :string depth :i64] :string
+  (if (>= depth 64)
+    session
+    (let [p (ss-parent base session)]
+      (if (= 0 (string-length p))
+        session
+        (root-walk base p (+ depth 1))))))
+
+(defn ss-root [base :string session :string] :string
+  (root-walk base session 0))
+
+(defn- entry-name [line :string] :string
+  (jc/piece line "	" 0))
+
+(defn- entry-isdir [line :string] :i64
+  (let [f (jc/piece line "	" 1)]
+    (if (string=? f "1") 1 0)))
+
+(defn- count-lines [s :string] :i64
+  (if (= 0 (string-length s)) 0 (jc/count-pieces s "\n")))
+
+(defn- hit-line [session :string k :i64 role :string content :string] :string
+  (string-concat session
+    (string-concat "	" (string-concat (string-from-i64 k)
+      (string-concat "	" (string-concat role (string-concat "	" content)))))))
+
+(defn- msg-scan [base :string session :string query :string k :i64 n :i64 left :i64 acc :string] :string
+  (if (or (>= k n) (= 0 left))
+    acc
+    (let [c (m/msg-content-at base session k)]
+      (if (>= (string-index-of c query) 0)
+        (let [line (hit-line session k (m/msg-role-at base session k) c)
+              acc2 (if (= 0 (string-length acc)) line (string-concat acc (string-concat "
+" line)))]
+          (msg-scan base session query (+ k 1) n (- left 1) acc2))
+        (msg-scan base session query (+ k 1) n left acc)))))
+
+(defn- sess-scan [base :string listing :string query :string i :i64 ns :i64 left :i64 acc :string] :string
+  (if (or (>= i ns) (= 0 left))
+    acc
+    (let [line (jc/piece listing "
+" i)]
+      (if (= 1 (entry-isdir line))
+        (let [s (entry-name line)
+              hits (msg-scan base s query 0 (m/msg-count base s) left "")
+              left2 (- left (count-lines hits))
+              acc2 (if (= 0 (string-length hits))
+                     acc
+                     (if (= 0 (string-length acc)) hits (string-concat acc (string-concat "
+" hits))))]
+          (sess-scan base listing query (+ i 1) ns left2 acc2))
+        (sess-scan base listing query (+ i 1) ns left acc)))))
+
+(defn ss-search [base :string query :string limit :i64] :string
+  (let [listing (wire-browse base)]
+    (if (= 0 (string-length listing))
+      ""
+      (sess-scan base listing query 0 (jc/count-pieces listing "
+") limit ""))))
