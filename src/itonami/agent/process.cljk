@@ -157,6 +157,128 @@
 ;; skipped by drains that pass skip-poll-observed (the CLI agent path).
 (defonce ^:private poll-observed (atom #{}))
 
+;; ---- gateway completion watchers (Hermes tools/terminal_tool_background
+;; `._register_completion_watcher` -> gateway/run_notifications.py
+;; `arm_process_watcher`) ----
+;; Gateway mode registers a fast watcher at spawn time so completion triggers
+;; a new agent turn without waiting for the post-turn drain: a process that
+;; finishes while its launching turn is still running would otherwise stay
+;; unwatched (Hermes #112033). CLI mode uses the completion queue directly.
+
+;; Hermes tools/process_registry.py `ProcessRegistry.pending_watchers`: the
+;; side-channel for check_interval watchers (the gateway reads after agent
+;; run). A descriptor waits here for the startup / post-turn drain whenever
+;; the gateway is not serving.
+(defonce ^:private pending-watchers (atom []))
+
+;; The live gateway runner's `arm_process_watcher`
+;; (gateway/run_notifications.py), or nil when nothing serves: `(arm watcher)`
+;; truthy = armed on the live gateway loop; false keeps the descriptor in
+;; `pending-watchers`, exactly as Hermes' `arm_process_watcher` returning
+;; False.
+(defonce ^:private watcher-runner (atom nil))
+
+(defn set-watcher-runner!
+  "Install or clear the gateway runner's arm hook (Hermes `gateway.run
+  ._gateway_runner_ref`). nil = the gateway is not serving (startup,
+  shutdown)."
+  [arm-fn]
+  (reset! watcher-runner arm-fn))
+
+(defn take-pending-watchers!
+  "The startup / post-turn watcher drain (gateway/run_startup.py,
+  gateway/run_turn_persistence.py): detach the batch atomically (reassign,
+  not clear()) so concurrent appends aren't dropped."
+  []
+  (let [batch @pending-watchers]
+    (reset! pending-watchers [])
+    batch))
+
+(def ^:private watcher-route-keys
+  "Hermes tools/process_registry.py `_WATCHER_ROUTE_KEYS`, in event-dict key
+  order (`watcher_<key>` on the session)."
+  ["platform" "chat_id" "user_id" "user_name" "thread_id" "message_id"])
+
+(def ^:private routing-env-vars
+  "Hermes tools/terminal_tool_background.py `_ROUTING_FIELDS` (session
+  attribute -> HERMES_SESSION_* env var), verbatim - `parent_session_id` is
+  the spawning conversation's session-db id (the gateway's completion
+  pre-flight drops the notification when that session is gone)."
+  [["platform" "HERMES_SESSION_PLATFORM"]
+   ["chat_id" "HERMES_SESSION_CHAT_ID"]
+   ["user_id" "HERMES_SESSION_USER_ID"]
+   ["user_name" "HERMES_SESSION_USER_NAME"]
+   ["thread_id" "HERMES_SESSION_THREAD_ID"]
+   ["message_id" "HERMES_SESSION_MESSAGE_ID"]
+   ["parent_session_id" "HERMES_SESSION_ID"]])
+
+(defn- watcher-attr [route-key]
+  (if (= route-key "parent_session_id")
+    :parent-session-id
+    (keyword (str "watcher-" (str/replace route-key #"_" "-")))))
+
+(defn- checkpoint-key [route-key]
+  (if (= route-key "parent_session_id")
+    "parent_session_id"
+    (str "watcher_" route-key)))
+
+(defn- watcher-session-fields
+  "The session's watcher/routing atoms (`watcher_<key>`, `watcher_interval`,
+  `parent_session_id` - Hermes tools/process_registry.py
+  `_CHECKPOINT_FIELDS`). With a checkpoint entry, the stored values;
+  otherwise the defaults."
+  ([] (watcher-session-fields nil))
+  ([entry]
+   (into {:watcher-interval (atom (int (or (get entry "watcher_interval") 0)))}
+         (for [[k _] routing-env-vars]
+           [(watcher-attr k) (atom (str (or (get entry (checkpoint-key k)) "")))]))))
+
+(defn- stamp-gateway-routing!
+  "Hermes tools/terminal_tool_background._stamp_gateway_routing: copy the
+  spawning chat's routing metadata onto the process session so completion /
+  watch notifications reach the right chat/thread. No platform in the session
+  env stamps nothing."
+  [session env]
+  (let [platform (str (or (get env "HERMES_SESSION_PLATFORM") ""))]
+    (when-not (str/blank? platform)
+      (doseq [[k var] routing-env-vars]
+        (reset! (get session (watcher-attr k)) (str (or (get env var) "")))))))
+
+(defn register-completion-watcher!
+  "Hermes tools/terminal_tool_background._register_completion_watcher, verbatim
+  contract: gateway mode registers a fast watcher so completion triggers a new
+  agent turn (CLI mode uses the completion queue directly). Armed on the live
+  gateway loop right away (`run_notifications.arm_process_watcher`); before
+  the gateway serves, or while it stops, the descriptor waits in
+  `pending-watchers` for the startup / post-turn drain. Returns the
+  descriptor."
+  [session session-key]
+  (reset! (:watcher-interval session) 5)
+  (let [watcher (into {"session_id" (:id session)
+                       "check_interval" 5
+                       "session_key" (str session-key)
+                       "platform" @(:watcher-platform session)
+                       "notify_on_complete" true
+                       "parent_session_id" @(:parent-session-id session)}
+                      (for [k ["chat_id" "user_id" "user_name" "thread_id" "message_id"]]
+                        [k @(get session (watcher-attr k))]))
+        arm @watcher-runner]
+    (when-not (and (fn? arm) (arm watcher))
+      (swap! pending-watchers conj watcher))
+    watcher))
+
+(defn- recovered-watcher
+  "Hermes tools/process_registry_checkpoint.py's recovery re-enqueue
+  descriptor: `check_interval` is the STORED `watcher_interval` (not the
+  spawn-time 5) and the route keys ride in `_WATCHER_ROUTE_KEYS` order."
+  [session]
+  (into {"session_id" (:id session)
+         "check_interval" @(:watcher-interval session)
+         "session_key" @(:session-key session)
+         "notify_on_complete" @(:notify-on-complete? session)
+         "parent_session_id" @(:parent-session-id session)}
+        (for [k watcher-route-keys] [k @(get session (watcher-attr k))])))
+
 (defn container-task-id
   "Hermes `tools/terminal_tool._resolve_container_task_id` for a non-container
   backend (Kotoba has no Docker/SSH environments; delegate children share the
@@ -252,14 +374,14 @@
      "task_id" @(:task-id session)
      "owner_task_id" @(:owner-task-id session)
      "session_key" @(:session-key session)
-     "watcher_platform" ""
-     "watcher_chat_id" ""
-     "watcher_user_id" ""
-     "watcher_user_name" ""
-     "watcher_thread_id" ""
-     "watcher_message_id" ""
-     "watcher_interval" 0
-     "parent_session_id" ""
+     "watcher_platform" @(:watcher-platform session)
+     "watcher_chat_id" @(:watcher-chat-id session)
+     "watcher_user_id" @(:watcher-user-id session)
+     "watcher_user_name" @(:watcher-user-name session)
+     "watcher_thread_id" @(:watcher-thread-id session)
+     "watcher_message_id" @(:watcher-message-id session)
+     "watcher_interval" @(:watcher-interval session)
+     "parent_session_id" @(:parent-session-id session)
      "notify_on_complete" (boolean @(:notify-on-complete? session))
      "completion_output_chars" (or (:completion-output-chars session) 0)
      "watch_patterns" (vec (:watch-patterns session))
@@ -668,7 +790,7 @@
         ;; reused; only a positive mismatch refuses adoption.
         (when (= "running" (pid-fate pid expected))
           (let [started (get entry "started_at")
-                session {:id id :home home :command (get entry "command" "unknown")
+                session (merge {:id id :home home :command (get entry "command" "unknown")
                          :cwd (get entry "cwd") :pid pid :child nil :detached? true
                          :host-start-time expected
                          :task-id (atom (str (or (get entry "task_id") "")))
@@ -692,8 +814,14 @@
                                                      started
                                                      (/ (h/now-ms) 1000))))
                          :finished-at (atom nil) :state (atom :running)
-                         :exit-code (atom nil) :output (atom "")}]
+                         :exit-code (atom nil) :output (atom "")}
+                        (watcher-session-fields entry))]
             (swap! sessions assoc id session)
+            ;; Hermes tools/process_registry_checkpoint.py: "Re-enqueue
+            ;; watcher so gateway can resume notifications" for an adopted
+            ;; detached session with a positive `watcher_interval`.
+            (when (pos? @(:watcher-interval session))
+              (swap! pending-watchers conj (recovered-watcher session)))
             session))))))
 
 (defn restore-checkpoint!
@@ -780,7 +908,7 @@
                             #js {:cwd cwd :env (clj->js env) :detached true
                                  :stdio #js ["pipe" "pipe" "pipe"]})
                     (catch :default e e))
-            session {:id id :home home :command command :cwd cwd :child child
+            session (merge {:id id :home home :command command :cwd cwd :child child
                      :pid (when-not (instance? js/Error child) (.-pid child))
                      :task-id (atom task-key)
                      :owner-task-id (atom owner)
@@ -807,12 +935,22 @@
                      :killed-by (atom nil)
                      :started-at (h/now-ms) :finished-at (atom nil)
                      :state (atom :running) :exit-code (atom nil)
-                     :output (atom "")}]
+                     :output (atom "")} (watcher-session-fields))]
         (if (instance? js/Error child)
           (do (when tmpdir (h/rm tmpdir))
               (h/json-str {"error" (str "background spawn failed: " (.-message child))}))
           (do
             (swap! sessions assoc id session)
+            ;; Hermes `_apply_async_support` stamps the gateway routing on the
+            ;; session (requested notification intent + async delivery
+            ;; supported); `_register_completion_watcher` then arms the watcher
+            ;; for an effective notify when `watcher_platform` is stamped.
+            (when (and (or notify-requested (boolean (seq watch-patterns)))
+                       (not (false? (:async-delivery? ctx))))
+              (stamp-gateway-routing! session env))
+            (when (and (:notify-on-complete? disp)
+                       (not (str/blank? @(:watcher-platform session))))
+              (register-completion-watcher! session session-key))
             (when (pos? (:heartbeat-seconds session)) (ensure-heartbeat-timer!))
             (.on (.-stdout child) "data" #(append-output! session %))
             (.on (.-stderr child) "data" #(append-output! session %))
