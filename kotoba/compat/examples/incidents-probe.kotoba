@@ -1,0 +1,27 @@
+(ns incidents-probe
+  "Guest evidence for the cron_incidents port: upsert create/repeat,
+  alerted, ack (WHERE state!='closed'), resolve per job."
+  (:require [itonami.incidents :as x])
+  (:export [incidents-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn incidents-probe [] :i64
+  (let [c (x/inc-upsert "/data/ic" "i1" "job1" "timeout")
+        rep (x/inc-upsert "/data/ic" "i1" "job1" "timeout")
+        rec (x/inc-recurrences "/data/ic" "i1")
+        al (x/inc-alert "/data/ic" "i1")
+        al2 (x/inc-alert "/data/ic" "i1")
+        ak (x/inc-ack "/data/ic" "i1")
+        ak2 (x/inc-ack "/data/ic" "i1")
+        st (x/inc-get-state "/data/ic" "i1")
+        c2 (x/inc-upsert "/data/ic" "i2" "job1" "oom")
+        c3 (x/inc-upsert "/data/ic" "i3" "job1" "oom")
+        rz (x/inc-resolve-job "/data/ic" "job1")
+        s2 (x/inc-get-state "/data/ic" "i2")
+        say (wire-say (string-concat "ICRESULT:" (string-concat (string-from-i64 rec) (string-concat ":" (string-from-i64 rz)))))]
+    (if (and (= 1 c) (= 2 rep) (= 1 rec) (= 1 al) (= 0 al2) (= 1 ak) (= 0 ak2)
+             (= 2 st) (= 1 c2) (= 1 c3) (= 2 rz) (= 3 s2))
+      1 0)))

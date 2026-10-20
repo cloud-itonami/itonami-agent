@@ -580,3 +580,25 @@ incidents、および .cljk 側の呼び出し差し替え）。
 notepad / delivery_queue / execution_ledger / task_events / tasks /
 task_links / task_runs / messages。残: incidents（独立テーブル）と
 .cljk 呼び出し差し替え本体。
+
+## 計測 19: cron_incidents port — node 無しで完走（2026-10-21、boot87.log）
+
+node:sqlite port（計測 8）**最後のテーブル**。状態機械は UPDATE 面から
+実測: 0 open / 1 alerted / 2 closed / 3 resolved。ack は
+`WHERE state != 'closed'` = from-conditional flip（tasks と同じ機構）、
+upsert の repeat は recurrences フィールドの 10 進 bump
+（tasks-core の dec codec 再用）。
+
+- `incidents_core.kotoba`（pure 6/6 緑）+ `incidents.kotoba`（effect:
+  inc-upsert create/repeat / inc-alert / inc-ack / inc-resolve-job =
+  per-job journal を open/alerted だけ resolved に）。
+- guest 実行（node 無し）: create 1 / repeat → recurrences **1** /
+  alert 1 / 再 alert 0 / ack 1 / **再 ack 0**（WHERE state!='closed'）/
+  closed 確認 / i2,i3 create / **resolve-job → 2**（closed の i1 は
+  対象外）/ i2 = resolved → `ICRESULT:1:2` / `:ok :result 1`。
+- 13-module graph の native compile 成功。
+
+**node:sqlite port 完走**: notepad / delivery_queue / execution_ledger /
+task_events / tasks / task_links / task_runs / messages / **incidents** の
+全 9 テーブルが実装・guest 実証済み。残は .cljk 呼び出し差し替え本体
+（store 面の障壁は解消済み）。
