@@ -1,0 +1,191 @@
+(ns itonami.agent.code-rpc-test
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [itonami.agent.host :as h]
+            [itonami.agent.code-rpc :as code-rpc]))
+
+(defn- scratch-dir []
+  (h/mkdirs (h/join (h/tmp-dir) (str "code-rpc-test-" (h/random-hex 6)))))
+
+;; ---- hermes_tools.py generation ------------------------------------------
+
+(deftest golden-shim-matches-hermes
+  ;; test/golden_hermes_tools.py is the verbatim output of
+  ;; tools.code_execution_tool.generate_hermes_tools_module(sorted(SANDBOX_ALLOWED_TOOLS),
+  ;; transport="file") from the Hermes source tree. The generator must be
+  ;; byte-identical, or an in-script import contract could drift silently.
+  (let [golden (h/slurp (h/join "test" "golden_hermes_tools.py"))]
+    (is (= golden (code-rpc/generate-hermes-tools [])))
+    (is (= golden (code-rpc/generate-hermes-tools code-rpc/sandbox-allowed-tools)))
+    (is (= golden (code-rpc/generate-hermes-tools ["read_file" "patch" "search_files"
+                                                  "terminal" "web_extract" "web_search"
+                                                  "write_file"])))))
+
+(deftest shim-filters-to-enabled-tools
+  (let [src (code-rpc/generate-hermes-tools ["terminal" "read_file"])]
+    (is (str/includes? src "def read_file(path: str, offset: int = 1, limit: int = 2000):"))
+    (is (str/includes? src "def terminal(command: str, timeout: int = None, workdir: str = None):"))
+    (is (not (str/includes? src "def patch(")))
+    (is (not (str/includes? src "def web_search(")))
+    ;; stubs join sorted by name, exactly as Hermes joins _TOOL_STUBS
+    (is (< (str/index-of src "def read_file(") (str/index-of src "def terminal(")))
+    ;; the helpers ride in every generated module
+    (is (str/includes? src "def json_parse(text: str):"))
+    (is (str/includes? src "def shell_quote(s: str) -> str:"))
+    (is (str/includes? src "def retry(fn, max_attempts=3, delay=2):"))
+    (is (str/includes? src "def _call(tool_name, args):"))))
+
+;; ---- request pipeline ----------------------------------------------------
+
+(defn- recording-state [opts]
+  (let [seen (atom [])]
+    [(code-rpc/make-state
+      (merge {:rpc-dir "unused" :rpc-token "tok"
+              :dispatch (fn [name args]
+                          (swap! seen conj [name args])
+                          (h/json-str {"tool" name}))}
+             opts))
+     seen]))
+
+(deftest handle-request-refusals-are-free
+  (let [[st seen] (recording-state {})
+        r1 (code-rpc/handle-request st {"tool" "mystery" "args" {}})
+        r2 (code-rpc/handle-request
+            (code-rpc/make-state {:rpc-dir "unused" :rpc-token "tok" :max-tool-calls 1
+                                 :dispatch (fn [_ _] (h/json-str {"ok" 1}))})
+            {"tool" "read_file" "args" {}})]
+    (is (= {"error" (str "Tool 'mystery' is not available in execute_code. Available: "
+                         "patch, read_file, search_files, terminal, web_extract, web_search, write_file")}
+           (h/json-parse r1)))
+    (is (zero? @(:counter st)))
+    (is (empty? @(:log st)))
+    (is (empty? @seen))))
+
+(deftest handle-request-budget
+  (let [st (code-rpc/make-state {:rpc-dir "unused" :rpc-token "tok" :max-tool-calls 2
+                                :dispatch (fn [name _] (h/json-str {"tool" name}))})
+        call #(code-rpc/handle-request st {"tool" "read_file" "args" {"path" "a"}})]
+    (is (not (str/includes? (call) "error")))
+    (is (not (str/includes? (call) "error")))
+    (is (= {"error" "Tool call limit reached (2). No more tool calls allowed in this execution."}
+           (h/json-parse (call))))
+    ;; the refusal is free: budget and log only count dispatched calls
+    (is (= 2 @(:counter st)))
+    (is (= 2 (count @(:log st))))))
+
+(deftest handle-request-strips-blocked-terminal-params
+  (let [[st seen] (recording-state {})]
+    (code-rpc/handle-request
+     st {"tool" "terminal"
+         "args" {"command" "echo hi" "timeout" 5 "background" true "pty" true
+                 "notify" true "notify_on_complete" true "watch_patterns" ["x"]
+                 "heartbeat" 60 "persist_on_release" true}})
+    (is (= [["terminal" {"command" "echo hi" "timeout" 5}]] @seen))))
+
+(deftest handle-request-logs-dispatch-and-errors
+  (let [st (code-rpc/make-state
+            {:rpc-dir "unused" :rpc-token "tok"
+             :dispatch (fn [_ _] (throw (js/Error. "boom")))})
+        ok-st (code-rpc/make-state
+               {:rpc-dir "unused" :rpc-token "tok"
+                :dispatch (fn [_ _] (h/json-str {"content" "x"}))})
+        r (code-rpc/handle-request ok-st {"tool" "read_file" "args" {"path" "a"}})]
+    (is (= {"content" "x"} (h/json-parse r)))
+    (is (= 1 (count @(:log ok-st))))
+    (let [e (first @(:log ok-st))]
+      (is (= "read_file" (get e "tool")))
+      (is (string? (get e "args_preview")))
+      (is (number? (get e "duration")))
+      (is (nil? (get e "error"))))
+    ;; a throwing dispatch surfaces the Python str(exc) equivalent and logs it
+    (let [r2 (code-rpc/handle-request st {"tool" "write_file" "args" {}})]
+      (is (= {"error" "boom"} (h/json-parse r2)))
+      (is (= "boom" (get (first @(:log st)) "error"))))))
+
+(defn- tool-should-not-run [] (throw (js/Error. "unexpected")))
+
+(deftest result-error-and-errors-since
+  (is (= "w" (code-rpc/result-error (h/json-str {"error" "w"}))))
+  (is (= "" (code-rpc/result-error (h/json-str {"content" "no error key"}))))
+  (is (= "" (code-rpc/result-error "plain text")))
+  (is (= "" (code-rpc/result-error "{not json")))
+  (is (= (apply str (repeat 300 "a"))
+         (code-rpc/result-error (h/json-str {"error" (apply str (repeat 400 "a"))}))))
+  (let [log [{"tool" "a" "error" "1"} {"tool" "b"} {"tool" "c" "error" "2"}
+             {"tool" "d" "error" "3"} {"tool" "e" "error" "4"}
+             {"tool" "f" "error" "5"} {"tool" "g" "error" "6"}]]
+    (is (= [{"tool" "c" "error" "2"} {"tool" "d" "error" "3"} {"tool" "e" "error" "4"}
+            {"tool" "f" "error" "5"} {"tool" "g" "error" "6"}]
+           (code-rpc/tool-errors-since log 1)))
+    (is (= [{"tool" "a" "error" "1"} {"tool" "c" "error" "2"} {"tool" "d" "error" "3"}
+            {"tool" "e" "error" "4"} {"tool" "f" "error" "5"}]
+           (code-rpc/tool-errors-since log 0)))))
+
+(deftest tool-error-bounds
+  (is (= {"error" "x"} (h/json-parse (code-rpc/tool-error "x"))))
+  (let [r (h/json-parse (code-rpc/tool-error (apply str (repeat 2100 "y"))))]
+    (is (= (str (apply str (repeat 2048 "y")) "… [truncated]") (get r "error")))))
+
+;; ---- file transport ------------------------------------------------------
+
+(deftest serve-tick-answers-requests
+  (let [dir (scratch-dir)
+        st (code-rpc/make-state
+            {:rpc-dir dir :rpc-token "secret"
+             :dispatch (fn [name args] (h/json-str {"tool" name "got" args}))})]
+    (h/spit (h/join dir "req_000001")
+            (h/json-str {"tool" "read_file" "args" {"path" "a.txt"} "seq" 1 "token" "secret"})
+            {:mode 384})
+    (is (= 1 (code-rpc/serve-tick! st)))
+    (is (h/file? (h/join dir "res_000001")))
+    (is (= {"tool" "read_file" "got" {"path" "a.txt"}}
+           (h/json-parse (h/slurp (h/join dir "res_000001")))))
+    (is (not (h/exists? (h/join dir "req_000001"))))
+    (is (not (h/exists? (h/join dir "res_000001.tmp"))))
+    (h/rm dir)))
+
+(deftest serve-tick-refuses-unauthorized-and-malformed
+  (let [dir (scratch-dir)
+        st (code-rpc/make-state
+            {:rpc-dir dir :rpc-token "secret"
+             :dispatch (fn [name _] (h/json-str {"tool" name}))})]
+    ;; wrong token, malformed JSON, non-map JSON, non-int seq: removed unanswered
+    (h/spit (h/join dir "req_000001") (h/json-str {"tool" "read_file" "args" {} "seq" 1 "token" "wrong"}) {:mode 384})
+    (h/spit (h/join dir "req_000002") "not json{{" {:mode 384})
+    (h/spit (h/join dir "req_000003") "[1, 2]" {:mode 384})
+    (h/spit (h/join dir "req_000004") (h/json-str {"tool" "read_file" "args" {} "seq" "abc" "token" "secret"}) {:mode 384})
+    (h/spit (h/join dir "req_000005.tmp") "in flight" {:mode 384})
+    (is (= 0 (code-rpc/serve-tick! st)))
+    (doseq [n ["req_000001" "req_000002" "req_000003" "req_000004"]]
+      (is (not (h/exists? (h/join dir n)))))
+    (is (h/exists? (h/join dir "req_000005.tmp"))) ;; in-flight writes are left alone
+    (is (empty? (filter #(str/starts-with? % "res_") (h/ls dir))))
+    (is (empty? @(:log st)))
+    (h/rm dir)))
+
+(deftest serve-tick-budget-refusal-is-answered-not-logged
+  (let [dir (scratch-dir)
+        st (code-rpc/make-state
+            {:rpc-dir dir :rpc-token "secret" :max-tool-calls 1
+             :dispatch (fn [name _] (h/json-str {"tool" name}))})]
+    (h/spit (h/join dir "req_000001") (h/json-str {"tool" "read_file" "args" {} "seq" 1 "token" "secret"}) {:mode 384})
+    (h/spit (h/join dir "req_000002") (h/json-str {"tool" "read_file" "args" {} "seq" 2 "token" "secret"}) {:mode 384})
+    (is (= 2 (code-rpc/serve-tick! st)))
+    (is (= {"tool" "read_file"} (h/json-parse (h/slurp (h/join dir "res_000001")))))
+    (is (= {"error" "Tool call limit reached (1). No more tool calls allowed in this execution."}
+           (h/json-parse (h/slurp (h/join dir "res_000002")))))
+    (is (= 1 @(:counter st)))
+    (is (= 1 (count @(:log st))))
+    (h/rm dir)))
+
+(deftest tool-errors-ride-into-the-result
+  ;; a script that ignores a helper's {"error"} return must not report plain
+  ;; success — Hermes ships tool_errors on the execute_code result.
+  (let [dir (scratch-dir)
+        st (code-rpc/make-state
+            {:rpc-dir dir :rpc-token "secret"
+             :dispatch (fn [_ _] (h/json-str {"error" "denied"}))})]
+    (h/spit (h/join dir "req_000001") (h/json-str {"tool" "read_file" "args" {} "seq" 1 "token" "secret"}) {:mode 384})
+    (code-rpc/serve-tick! st)
+    (is (= [{"tool" "read_file" "error" "denied"}] (code-rpc/tool-errors-since @(:log st) 0)))
+    (h/rm dir)))
