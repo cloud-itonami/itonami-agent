@@ -14,7 +14,8 @@
   (:require [itonami.tasks-state :as ts]
             [itonami.notepad :as np])
   (:export [task-create task-status task-transition task-claim task-done
-            task-get-field])
+            task-get-field task-set-block task-clear-block task-set-run
+            task-clear-run task-block-rec])
   (:capabilities #{:fs/app-data}))
 
 (defn- wire-exists [path :string] :string
@@ -98,3 +99,60 @@
                                                (ts/row-field content 3) result))]
             1)
           0)))))
+
+(defn task-set-block [base :string id :string kind :string] :i64
+  ;; the measured UPDATE: SET block_kind=?, block_recurrences=1
+  ;; WHERE id=? AND status='blocked' AND block_kind IS NULL
+  ;;   AND current_run_id IS NULL
+  (if (= 0 (string-length kind))
+    0
+    (let [p (tpath base id)]
+      (if (= 0 (exists? p))
+        0
+        (let [content (wire-read p)]
+          (if (and (= 4 (ts/row-status content))
+                   (= 0 (string-length (ts/row-field content 5)))
+                   (= 0 (string-length (ts/row-field content 3))))
+            (let [w (wire-write p (ts/row-encode7 4 (ts/row-field content 1)
+                                                  (ts/row-field content 2)
+                                                  (ts/row-field content 3)
+                                                  (ts/row-field content 4)
+                                                  kind "1"))]
+              1)
+            0))))))
+
+(defn task-clear-block [base :string id :string] :i64
+  ;; the unblock side: clear the block columns (status moves via
+  ;; task-transition).
+  (let [p (tpath base id)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (let [w (wire-write p (ts/row-encode7 (ts/row-status content)
+                                              (ts/row-field content 1)
+                                              (ts/row-field content 2)
+                                              (ts/row-field content 3)
+                                              (ts/row-field content 4)
+                                              "" ""))]
+          1)))))
+
+(defn task-set-run [base :string id :string run :string] :i64
+  (let [p (tpath base id)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (let [w (wire-write p (ts/row-encode7 (ts/row-status content)
+                                              (ts/row-field content 1)
+                                              (ts/row-field content 2)
+                                              run
+                                              (ts/row-field content 4)
+                                              (ts/row-field content 5)
+                                              (ts/row-field content 6)))]
+          1)))))
+
+(defn task-clear-run [base :string id :string] :i64
+  ;; the measured UPDATE: SET current_run_id=NULL WHERE id=?
+  (task-set-run base id ""))
+
+(defn task-block-rec [base :string id :string] :string
+  (ts/row-block-rec (wire-read (tpath base id))))
