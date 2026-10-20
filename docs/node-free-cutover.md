@@ -191,3 +191,36 @@ grants なしの同じ guest は **名前付き trap で fail-closed**。check :
 
 計測した制約: **`amu test` は capability guest を走らせられない**（internal
 compiler error）。adapter 系の検証は kexe + kexe_loader / guest VM 経路で行う。
+
+## 計測 7: promesa（effect 層）の置換設計（2026-10-20）
+
+使用面（promesa.core を p と alias する 9 モジュール: browser_cloud cron
+gateway homeassistant loop process provider quiet watcher）:
+
+- 逐次合成 **110**: resolved 37 / let 30 / then 22 / catch 13 / rejected 5 / finally 3
+- オーケストレーション **31**: loop 9 / recur 13 / delay 4 / all 3 / promise 2
+- 別 alias の混入疑い 5 程度（run names-for discover call do）
+
+置換設計（実測事実から）:
+
+1. **kexe wire は同期**（provider: request → result）。guest 内に promise の
+   基盤は無いし要らない。
+2. **promise の値は result/option に写像**: `result-ok/result-err` は
+   **:result-i64 のみ構築可**（`[:result :string :string]` の構築子は
+   `expression type mismatch: expected result-i64` で実測拒否）。guest ABI は
+   スカラー面なので、成功値は `:string`/`:document` の直接 return、失敗は
+   `:result-i64` / `[:option …]`（`option-value` に default あり）で運ぶ。
+3. **逐次 chain（let/then/catch/finally）は guest の直線的な typed-cap-call
+   群へ平坦化** — cap 呼び出しは同期なので await 不要。ここが 110 箇所の行き先。
+4. **オーケストレーション（loop/recur/delay/all/promise）は host/tender 側の
+   責務**。watcher・background process 監視・provider retry などの継続ループは
+   host が持ち、guest は 1 invocation = 1 有界ステップ（kexe-first の
+   facts-as-i64 パターン）。ここが 31 箇所の行き先。
+5. **stream/task は linear リソース**: `[:task [:stream :bytes]]` は
+   `linear resources require move-aware parameters`（実測）。真の
+   ストリーミングが必要ならこの面を使うが、CLI の port には不要
+   （非同期は 4 の host 側に寄る）。
+
+結論: promesa 壁の正体は「guest に非同期基盤が無い」ことではなく
+「**非同期は host の責務**」という分担の明示。9 モジュールの port では
+逐次 110 が直線コードに、orchestration 31 が host loop に移って壁が消える。
