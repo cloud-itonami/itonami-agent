@@ -196,7 +196,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
   [{:keys [config env] :as prof} prompt {:keys [model provider pinned? toolsets tool-names cwd roots platform
                                                 load-context? max-turns budget-s on-event peer? steer-queue cancelled?
                                                 reasoning-effort max-tokens
-                                                task-id session-key subagent
+                                                task-id session-key subagent async-delivery?
                                                 history instructions before-tool tool-overrides]
                                          :as options}]
   (let [max-turns (resolve-max-turns max-turns config (h/env "HERMES_MAX_ITERATIONS"))
@@ -244,6 +244,11 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         session-key (or session-key "")
         ctx {:cwd cwd :home (:home prof) :profile (:name prof) :roots roots :writes writes :tool-env env
              :task-id task-id :session-key session-key :subagent subagent
+             ;; Hermes `async_delivery_supported()` (gateway/session_context):
+             ;; false for cron job turns and the api_server adapter; a spawn on
+             ;; an async-unsupported turn drops notify/watch with
+             ;; `notify_unsupported` (process/spawn-notify-disposition).
+             :async-delivery? async-delivery?
              :browser-config (get config "browser" {})
              :browser-session (str "kotoba-" (h/random-hex 12))
              :browser-used? (atom false)
