@@ -490,3 +490,23 @@ node:sqlite port 最後の consumer（tools、121 SQL）の査定。正体は
 結論: tools の store 面は **port 可・既存 3 パターンの再利用で 8 割**、
 新設計は task_links グラフのみ。次スライス: task_events journal 化
 （最も自然な面から着手）。
+
+## 計測 15: task_events journal 化 — node 無しで完走（2026-10-21、boot82.log）
+
+計測 14 の port 設計第 1 スライス（tools の task_events、24 SQL）。
+
+- **length-prefix エントリ** `<runlen>,<kindlen>,<plen>,<run><kind><payload>`
+  — payload は改行を含むため行区切りを使わない（loader の実境界は
+  `_SEP` token 規則のみ = 改行は問題外）。journal 位置 = event id。
+- `tasks_core.kotoba`（pure 6/6 緑: 10 進 codec・entry encode/walk）+
+  `tasks_events.kotoba`（effect: ev-append / ev-count / ev-last-by-kind
+  = ORDER BY id DESC LIMIT 1 / ev-first-after = id > ? 走査 — 実測の
+  query 形そのものの walk 化）。
+- guest 実行（node 無し）: 3 append（payload "a\nb"）→ count **3** →
+  last-by-kind("result") = **"a\nb"**（改行往復）→ created のみ → "" →
+  after(id>1) = "a\nb" / after(id>2) = "" → `EVRESULT:3:3` /
+  `:ok :result 1`。
+- 7-module graph の native compile 成功。
+
+実装上の罠（記録）: 空 entry で substring が OOB → field-at は
+空/短小 entry を fail-closed で "" に。

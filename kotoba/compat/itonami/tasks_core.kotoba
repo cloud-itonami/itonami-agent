@@ -1,0 +1,102 @@
+(ns itonami.tasks-core
+  "The pure half of the task_events journalization (ledger 8 design A,
+  consumer 4 slice 1: tools.cljk's task_events, 24 SQL). Event payloads
+  carry newlines, so entries are LENGTH-PREFIXED rather than one line:
+  <runlen>,<kindlen>,<plen>,<run><kind><payload>. The loader's own rule is
+  only the _SEP token ban; the line discipline is the journal module's, and
+  this store walks entries by their prefixes instead of by newlines.
+
+  The measured query shapes (tools.cljk): ordered scans by id with kind
+  filters (last-by-kind = ORDER BY id DESC LIMIT 1), after-id scans
+  (id > ?), and run_id+kind filters -- all reduce to a forward walk of
+  prefix-parsed entries where journal position = event id.
+
+  Self-contained: native-qualified ops (string-from-i64 / code-point-at /
+  substring / concat / = / quot)."
+  (:export [dec-len dec-at event-encode event-len
+            event-run event-kind event-payload
+            test-dec test-event]))
+
+(defn dec-len [s :string i :i64] :i64
+  ;; how many decimal digit characters start at i.
+  (let [n (string-length s)]
+    (dec-len-run s i n)))
+
+(defn- dec-len-run [s :string i :i64 n :i64] :i64
+  (if (>= i n)
+    0
+    (let [c (string-code-point-at s i)]
+      (if (and (>= c 48) (<= c 57))
+        (+ 1 (dec-len-run s (+ i 1) n))
+        0))))
+
+(defn dec-at [s :string i :i64 len :i64] :i64
+  ;; the value of len decimal digits at i.
+  (dec-at-run s i (+ i len) 0))
+
+(defn- dec-at-run [s :string i :i64 end :i64 acc :i64] :i64
+  (if (>= i end)
+    acc
+    (dec-at-run s (+ i 1) end
+                (+ (* acc 10) (- (string-code-point-at s i) 48)))))
+
+(defn event-encode [run :string kind :string payload :string] :string
+  (string-concat (string-from-i64 (string-length run))
+                 (string-concat ","
+                 (string-concat (string-from-i64 (string-length kind))
+                 (string-concat ","
+                 (string-concat (string-from-i64 (string-length payload))
+                 (string-concat ","
+                 (string-concat run (string-concat kind payload)))))))))
+
+(defn event-len [entry :string] :i64
+  ;; total bytes of one encoded entry.
+  (let [a (dec-len entry 0)]
+    (let [b (dec-len entry (+ a 1))]
+      (let [c (dec-len entry (+ a b 2))]
+        (+ a b c 3 (dec-at entry 0 a) (dec-at entry (+ a 1) b)
+           (dec-at entry (+ a b 2) c))))))
+
+(defn- field-at [entry :string n :i64] :string
+  ;; field n (0 run, 1 kind, 2 payload) of one encoded entry. An empty or
+  ;; truncated entry answers "" (fail-closed, never a partial field).
+  (if (= 0 (string-length entry))
+    ""
+    (if (< (string-length entry) 4)
+      ""
+      (field-at-run entry n))))
+
+(defn- field-at-run [entry :string n :i64] :string
+  (let [a (dec-len entry 0)]
+    (let [b (dec-len entry (+ a 1))]
+      (let [c (dec-len entry (+ a b 2))]
+        (let [oa (+ a b c 3)]
+          (let [ra (dec-at entry 0 a)]
+            (let [rb (dec-at entry (+ a 1) b)]
+              (let [rc (dec-at entry (+ a b 2) c)]
+                (if (= n 0)
+                  (string-substring entry oa (+ oa ra))
+                  (if (= n 1)
+                    (string-substring entry (+ oa ra) (+ oa ra rb))
+                    (string-substring entry (+ oa ra rb) (+ oa ra rb rc))))))))))))
+
+(defn event-run [entry :string] :string (field-at entry 0))
+(defn event-kind [entry :string] :string (field-at entry 1))
+(defn event-payload [entry :string] :string (field-at entry 2))
+
+(defn test-dec [] :bool
+  (and (= 3 (dec-len "123x" 0))
+       (= 0 (dec-len "x" 0))
+       (= 123 (dec-at "123x" 0 3))
+       (= 7 (dec-at "007" 0 3))))
+
+(defn test-event [] :bool
+  (let [e (event-encode "r1" "result" "a
+b")]
+    (and (string=? "r1" (event-run e))
+         (string=? "result" (event-kind e))
+         (string=? "a
+b" (event-payload e))
+         (= (string-length e) (event-len e))
+         (string=? "" (event-run ""))
+         (string=? "x" (event-kind (event-encode "" "x" ""))))))

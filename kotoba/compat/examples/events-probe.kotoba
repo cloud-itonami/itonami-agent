@@ -1,0 +1,27 @@
+(ns events-probe
+  "Guest evidence for the task_events journalization: append with a
+  newline-carrying payload, count, last-by-kind, after-id scans."
+  (:require [itonami.tasks-events :as ev])
+  (:export [events-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn events-probe [] :i64
+  (let [a1 (ev/ev-append "/data/ev" "t1" "r1" "created" "")
+        a2 (ev/ev-append "/data/ev" "t1" "r1" "started" "go")
+        a3 (ev/ev-append "/data/ev" "t1" "r2" "result" "a
+b")
+        n (ev/ev-count "/data/ev" "t1")
+        last-res (ev/ev-last-by-kind "/data/ev" "t1" "result")
+        last-cre (ev/ev-last-by-kind "/data/ev" "t1" "created")
+        f1 (ev/ev-first-after "/data/ev" "t1" "result" 1)
+        f2 (ev/ev-first-after "/data/ev" "t1" "result" 2)
+        say (wire-say (string-concat "EVRESULT:" (string-concat (string-from-i64 n) (string-concat ":" (string-from-i64 (string-length last-res))))))]
+    (if (and (= 1 a1) (= 1 a2) (= 1 a3) (= 3 n)
+             (string=? "a
+b" last-res) (= 0 (string-length last-cre))
+             (string=? "a
+b" f1) (= 0 (string-length f2)))
+      1 0)))
