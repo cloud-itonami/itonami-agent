@@ -1,11 +1,15 @@
 (ns itonami.agent.gateway
-  "The live messaging-gateway adapter surface the watcher's chat push rides.
-  Verbatim contracts: gateway/delivery.py `DeliveryTransport` /
-  `resolve_delivery_transport` (transport resolution and send dispatch), the
-  base adapter send surface (gateway/platforms/base.py `BaseAdapter.send` /
-  `send_for_platform` / `fronts_platform`), gateway/run_notifications.py
-  `GatewayRunner._send_watcher_message` and gateway/run.py
-  `_gateway_platform_value` / `_non_conversational_metadata`.
+  "The live messaging-gateway adapter surface the watcher's chat push and
+  completion admission ride. Verbatim contracts: gateway/delivery.py
+  `DeliveryTransport` / `resolve_delivery_transport` (transport resolution and
+  send dispatch), the base adapter send surface (gateway/platforms/base.py
+  `BaseAdapter.send` / `send_for_platform` / `fronts_platform`),
+  gateway/run_notifications.py `GatewayRunner._send_watcher_message`,
+  `_enqueue_process_completion_notification` / `_flush_process_completion_batch`
+  / `_format_coalesced_process_completions` /
+  `_cancel_process_completion_batch_tasks` /
+  `_completion_delivery_identity` / `_event_route_key`, and
+  gateway/session_automation.py `completion_admission` / `producer_identity`.
 
   A messaging-gateway adapter is its send surface encoded as fns: `:send`
   [chat-id content metadata], `:send-for-platform` [logical-platform chat-id
@@ -14,16 +18,19 @@
   by the normalized platform value (`platform-value`); a platform config is
   one `PlatformConfig` block (gateway/config.py — `enabled: bool = False`,
   plus transport fields). `send-hook` is the live `:send!` binding for
-  `itonami.agent.watcher/run-process-watcher!`."
+  `itonami.agent.watcher/run-process-watcher!`; the admission side of the same
+  surface binds the loop's `:enqueue!` / `:admission-recheck` through
+  `enqueue-hook` / `admission-recheck-hook` over a `completion-fan-in`."
   (:require [clojure.string :as str]
-            [promesa.core :as p]))
+            [promesa.core :as p]
+            [itonami.agent.process :as process]))
 
 (def relay-platform "relay")
 
 (defn platform-value
   "Hermes gateway/run.py `_gateway_platform_value`: a normalized gateway
   platform value for enums or raw strings —
-  `str(getattr(platform, \"value\", platform) or \"\").strip().lower()`."
+  `str(getattr(platform, \\\"value\\\", platform) or \\\"\\\").strip().lower()`."
   [platform]
   (let [raw (if (map? platform) (or (:value platform) platform) platform)]
     (str/lower-case (str/trim (str (or raw ""))))))
@@ -119,7 +126,7 @@
 (defn send-watcher-message!
   "Hermes GatewayRunner._send_watcher_message, verbatim semantics: resolve the
   platform's injection adapter and, `if adapter and chat_id`, send with
-  `_non_conversational_metadata` metadata — `send_meta = {\"thread_id\" thread_id}`
+  `_non_conversational_metadata` metadata — `send_meta = {\\\"thread_id\\\" thread_id}`
   when the thread id is truthy, else nil. A missing adapter or a blank chat id
   sends nothing. Delivery errors are suppressed and logged
   `Watcher delivery error: %s` — the watcher's loop never sees the failure.
@@ -145,3 +152,284 @@
   [surface]
   (fn [platform-name chat-id thread-id message-text watcher]
     (send-watcher-message! surface platform-name chat-id thread-id message-text watcher)))
+
+;; ---------------------------------------------------------------- watcher admission
+
+(def ^:private completion-batch-key-fields
+  "Hermes GatewayRunner._COMPLETION_BATCH_KEY_FIELDS (the batch key adds
+  `parent_session_id` and `origin_session_id` on top of these)."
+  ["session_key" "platform" "chat_type" "chat_id" "thread_id" "user_id"])
+
+(defn event-route-key
+  "Hermes GatewayRunner._event_route_key: the batch key of one completion
+  event over `fields` — every field stringified, empty for a missing one. A
+  route key alone is not ownership: `/new` can leave old and new pins in the
+  same queue, which is why `parent_session_id` / `origin_session_id` join the
+  key — never settle one pin on another pin's acceptance."
+  [evt fields]
+  (mapv (fn [field] (str (or (get evt field) ""))) fields))
+
+(defn completion-delivery-identity
+  "Hermes GatewayRunner._completion_delivery_identity, verbatim: a
+  producer-stable identity when one is available. Delegation UUIDs identify one
+  producer completion (an interim per-task failure notice is its own producer
+  event); liveness/watch events ride their `event_id`; a process `completion`
+  includes the persisted spawn epoch so a reused session id is a distinct
+  incarnation; legacy events without `started_at` are delivered undeduplicated
+  (nil)."
+  [evt]
+  (let [evt-type (str (or (get evt "type") ""))]
+    (cond
+      (= evt-type "async_delegation")
+      (let [producer-id (str (or (get evt "delegation_id") ""))]
+        (cond
+          (= producer-id "") nil
+          (get evt "task_failure_notice")
+          (let [task-idx (get (or (first (get evt "results")) {}) "task_index" "")]
+            [evt-type producer-id (str "task_failure:" (if (nil? task-idx) "None" task-idx))])
+          :else [evt-type producer-id ""]))
+
+      (and (contains? #{"watch_match" "watch_disabled" "heartbeat"} evt-type)
+           (get evt "event_id"))
+      [evt-type (str (get evt "session_id")) (str (get evt "event_id"))]
+
+      (= evt-type "completion")
+      (let [producer-id (str (or (get evt "session_id") ""))
+            started-at (get evt "started_at")]
+        (when (and (not= producer-id "") (some? started-at))
+          [evt-type producer-id started-at]))
+
+      :else nil)))
+
+(defn producer-identity
+  "Hermes gateway/session_automation.producer_identity, verbatim: the
+  completion's producer-stable identity as one compact JSON string
+  (`json.dumps(identity, separators=(',', ':'))`); raises `invalid_params`
+  when the event carries none."
+  [evt]
+  (let [identity (completion-delivery-identity evt)]
+    (if (nil? identity)
+      (throw (js/Error. "invalid_params"))
+      (js/JSON.stringify (clj->js identity)))))
+
+(defn completion-admission
+  "Hermes gateway/session_automation.completion_admission, verbatim over the
+  live store seams: the active session authority (`:session-authority` — nil =
+  `active_authority` found none, and the check answers nil), the session store
+  lookup (`:lookup-session`, `lookup_by_session_key` on the event's
+  `session_key`), the admission rows of the entry's route owner
+  (`:route-owner`, `_route_owner`, and `:list-admissions`,
+  `list_session_admissions(..., pending_only=False)`) and the descriptor match:
+  the row's `payload` `local_automation_v1` (else `native_text_v1.automation`)
+  whose `identities` (else `[identity]`) contain `producer_identity`'s string.
+  Answers the matching admission row (the turn is committed — a lost ACK must
+  finish durable claims, never infer again) or nil."
+  [surface event]
+  (let [authority (:session-authority surface)]
+    (if (nil? authority)
+      nil
+      (let [entry ((:lookup-session surface) (str (or (get event "session_key") "")))]
+        (if (nil? entry)
+          nil
+          (let [identity (producer-identity event)]
+            (some (fn [row]
+                    (let [payload (get row "payload")
+                          descriptor (or (get payload "local_automation_v1")
+                                         (get-in payload ["native_text_v1" "automation"])
+                                         {})
+                          identities (get descriptor "identities" [(get descriptor "identity")])]
+                      (when (some #(= identity %) identities)
+                        row)))
+                  ((:list-admissions surface) authority ((:route-owner surface) authority entry)))))))))
+
+(defn- py-str
+  "Python `str()` as the verbatim f-strings interpolate it: nil renders `None`."
+  [v]
+  (if (nil? v) "None" (str v)))
+
+(defn format-coalesced-process-completions
+  "Hermes GatewayRunner._format_coalesced_process_completions, verbatim: one
+  bounded synthetic event built from several redacted completions. `entries`
+  are the `[synth-text evt waiter]` triples; `redact` is the live gateway's
+  `run.py _redact_gateway_user_facing_secrets` seam (an unconditional gateway
+  redaction floor). Redact BEFORE slicing: truncating first can leave a
+  credential fragment the patterns miss."
+  [redact entries]
+  (let [n (count entries)
+        shown (take 10 entries)
+        lines (atom [(str "[IMPORTANT: " n " background processes completed for this session.")
+                     (str "Treat these results as one completion batch and send at most one "
+                          "consolidated user-facing response.")])]
+    (doseq [[_text evt _waiter] shown]
+      (let [session-id (str (or (get evt "session_id") "unknown"))
+            exit-code (get evt "exit_code")
+            reason (str (or (get evt "completion_reason") "exited"))
+            raw (str/trim (str (redact (str (or (get evt "output") "")))))
+            output (if (> (count raw) 800)
+                     (str "[… truncated …]\n" (subs raw (- (count raw) 800)))
+                     raw)]
+        (swap! lines conj (str "\n- " session-id ": exit_code=" (py-str exit-code) ", reason=" reason))
+        (when (not= output "")
+          (swap! lines conj output))))
+    (let [omitted (- n (count shown))]
+      (when (pos? omitted)
+        (swap! lines conj (str "\n- … and " omitted " more completion(s); inspect them with "
+                               "the process tool if they affect the conclusion."))))
+    (swap! lines conj "If a result does not change the current conclusion, absorb it silently.]")
+    (str/join "\n" @lines)))
+
+(defn- settle-batch-waiters!
+  "Hermes GatewayRunner._settle_batch_waiters: resolve each waiter exactly once
+  — False = the watcher's retry path, None = an ordinary dedupe result."
+  [entries result]
+  (doseq [[_text _evt resolve] entries]
+    (resolve result)))
+
+(defn completion-fan-in
+  "The live completion-notification fan-in over one messaging-gateway surface:
+  Hermes GatewayRunner's `_completion_notification_batches` /
+  `_completion_notification_batch_tasks` /
+  `_completion_notification_batch_window` (default 0.1 s) /
+  `_completion_notification_batches_stopping` state, one per live runner.
+
+  The surface supplies the delivery seams on top of the `completion-admission`
+  store seams: `:deliver!` [synth-text candidate-evt] — the runner's
+  `_deliver_completion_notification` (True = adapter admission, None =
+  deduplicated or terminal, False = retryable), `:display-text` [events] —
+  `process_completion_display_text` (the default), `:redact` [text] —
+  `_redact_gateway_user_facing_secrets` (default passes text through),
+  `:record-coalesced-siblings!` [evts] — `_record_coalesced_completion_siblings`
+  (default no-op), `:surface-child?` — the profile-scoped
+  `surface_child_process_notifications` default, and `:batch-window` seconds."
+  [surface]
+  {:surface surface
+   :batches (atom {})
+   :tasks (atom {})
+   :stopping (atom false)
+   :window-ms (* 1000 (double (or (:batch-window surface) 0.1)))})
+
+(defn- deliver-entries!
+  [fan-in entries entries-to-deliver]
+  (let [surface (:surface fan-in)
+        redact (or (:redact surface) (fn [text] text))
+        synth-text (if (= 1 (count entries-to-deliver))
+                     (first (first entries-to-deliver))
+                     (format-coalesced-process-completions redact entries-to-deliver))
+        display-text ((or (:display-text surface) process/process-completion-display-text)
+                      (mapv second entries-to-deliver))
+        authority (:session-authority surface)
+        identities (when (some? authority)
+                     (mapv (fn [[_text evt]] (producer-identity evt)) entries-to-deliver))]
+    ;; A duplicate primary returns None from the dedupe seam; try the next
+    ;; identity so a fresh sibling is never discarded with it.
+    (letfn [(try-cands [cands]
+              (if (empty? cands)
+                (p/resolved nil)
+                (let [[_text evt] (first cands)
+                      candidate (cond-> (assoc evt "_display_text" display-text)
+                                  (some? authority) (assoc "_automation_identities" identities))]
+                  (p/let [delivered ((:deliver! surface) synth-text candidate)]
+                    (if (some? delivered)
+                      (p/resolved delivered)
+                      (try-cands (rest cands)))))))]
+      (try-cands (vec entries-to-deliver)))))
+
+(defn- deliver-batch!
+  [fan-in entries]
+  (let [surface (:surface fan-in)]
+    (if (some? (:session-authority surface))
+      (let [entries-to-deliver
+            (vec (remove (fn [[_text evt]] (some? (completion-admission surface evt))) entries))]
+        ;; Already-admitted events are settled True without re-delivery.
+        (if (empty? entries-to-deliver)
+          (p/resolved true)
+          (deliver-entries! fan-in entries entries-to-deliver)))
+      (deliver-entries! fan-in entries (vec entries)))))
+
+(defn- flush-process-completion-batch!
+  "Hermes GatewayRunner._flush_process_completion_batch, verbatim: deliver one
+  short-window completion batch and resolve its waiters."
+  [fan-in key token]
+  (let [{:keys [batches tasks window-ms]} fan-in
+        surface (:surface fan-in)]
+    (p/let [_ (p/delay window-ms)
+            ;; Detach before delivery so a completion arriving mid-flight can
+            ;; schedule the next flush.
+            entries (let [es (get @batches key [])]
+                      (swap! batches dissoc key)
+                      (when (identical? token (get @tasks key))
+                        (swap! tasks dissoc key))
+                      es)]
+      (when (seq entries)
+        (if @(:stopping fan-in)
+          (settle-batch-waiters! entries false)
+          (-> (deliver-batch! fan-in entries)
+              (p/then (fn [delivered]
+                        (when (and (true? delivered) (> (count entries) 1))
+                          (when-let [record (:record-coalesced-siblings! surface)]
+                            (record (mapv second entries))))
+                        (settle-batch-waiters! entries delivered)))
+              (p/catch (fn [_e]
+                         ;; Shutdown cancellation: every waiter settles as retryable.
+                         (settle-batch-waiters! entries false)))))))))
+
+(defn enqueue-process-completion-notification!
+  "Hermes GatewayRunner._enqueue_process_completion_notification, verbatim
+  control flow: fan in policy-admitted process completions with compatible
+  pinned owners — `should_surface_notification` false drops the event (None),
+  a stopping fan-in refuses (False), and every other event queues into its
+  route-key batch, whose short-window flush resolves the waiter with the
+  delivery result."
+  [fan-in synth-text evt]
+  (if-not (process/should-surface-notification evt (boolean (get-in fan-in [:surface :surface-child?])))
+    (p/resolved nil)
+    (if @(:stopping fan-in)
+      (p/resolved false)
+      (let [{:keys [batches tasks]} fan-in
+            key (event-route-key evt (into completion-batch-key-fields
+                                           ["parent_session_id" "origin_session_id"]))
+            resolve-ref (atom nil)
+            waiter (js/Promise. (fn [resolve _reject] (reset! resolve-ref resolve)))
+            entry [synth-text evt (fn [result] (@resolve-ref result))]]
+        (swap! batches update key (fnil conj []) entry)
+        (when-not (contains? @tasks key)
+          (let [token (js-obj)]
+            (swap! tasks assoc key token)
+            (flush-process-completion-batch! fan-in key token)))
+        waiter))))
+
+(defn cancel-completion-batches!
+  "Hermes GatewayRunner._cancel_process_completion_batch_tasks: settle pending
+  completion batches before adapter teardown — everything still queued settles
+  as retryable (`False`)."
+  [fan-in]
+  (reset! (:stopping fan-in) true)
+  (let [leftover (mapcat val @(:batches fan-in))]
+    (reset! (:batches fan-in) {})
+    (reset! (:tasks fan-in) {})
+    (settle-batch-waiters! leftover false)))
+
+(defn enqueue-hook
+  "The live `:enqueue!` binding for `itonami.agent.watcher/run-process-watcher!`
+  over one messaging-gateway surface: the fan-in's
+  `_enqueue_process_completion_notification`, called with the hook's
+  `[synth-text completion-evt]` shape (false = refused, anything else counts as
+  delivered — Hermes `delivered is not False`). `fan-in` is one
+  `completion-fan-in`."
+  [fan-in]
+  (fn [synth-text completion-evt]
+    (enqueue-process-completion-notification! fan-in synth-text completion-evt)))
+
+(defn admission-recheck-hook
+  "The live `:admission-recheck` binding for `itonami.agent.watcher/
+  run-process-watcher!`: `gateway/session_automation.completion_admission` —
+  truthy = the turn is committed. Returns nil when the surface has no session
+  authority, exactly as the watcher's `absent = no session authority`
+  (`getattr(self, 'session_authority', None) is not None` guard); the
+  companion identity guard (`_completion_delivery_identity(evt) is not None`)
+  is `producer-identity`'s `invalid_params` raise, which the loop already
+  treats as not committed."
+  [surface]
+  (when (some? (:session-authority surface))
+    (fn [completion-evt]
+      (completion-admission surface completion-evt))))
