@@ -331,3 +331,23 @@ amu PR #1422（`kexe_loader`: fs READ provider をヒープ排除し string pool
 `AAABB` 着地も確認）。gap 2（descendant open 分支の SIGSYS）は未修・非
 allocator 起因として切り分け済み（amu#1421 に記録）。amu PR は CI
 （adopted-seed-native 他）が required なので checks 緑待ちで open。
+
+## 計測 9 追記 2（2026-10-21）: gap 2 も修正 — 全 grant 形状で store cycle 完走
+
+gap 2 の root cause を debug マーカー付き loader で実測（boot70）:
+descendant 分支は `open(base, O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC)`
+**の中**で trap。musl の `open()` は O_CLOEXEC 指定時に
+`fcntl(fd, F_SETFD, FD_CLOEXEC)` を追加実行し（musl src/fcntl/open.c）、
+fcntl は allowlist 外（getdents64 のコメントと同じ意図の拒否）。
+exact 分支が通ったのは openat2 を raw syscall で呼ぶため。
+（計測罠: fprintf/stderr 自体が filter に当たる — musl stdio は writev で
+flush するため。マーカーは write(2) で書くこと。）
+
+修正（amu PR #1422 に追加）: O_CLOEXEC を付ける sandbox 内の open 2 箇所を
+raw `syscall(SYS_openat, ...)` に置換。kernel が O_CLOEXEC を atomic に
+設定するので意味は不変、allowlist は広げない。
+
+boot71.log — **exact / directory 両 grant で store cycle が完走**
+（EXISTS → 1 / WRITE / APPEND / READ('AAABB') / :result 1、guest の実 fs に
+AAABB 着地）。verify-loader-fuzz: PASS_LOADER_SOURCE_BOUND_FUZZ
+（floors [60 100 18]、floorsLowered false）。
