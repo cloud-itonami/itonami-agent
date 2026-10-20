@@ -449,3 +449,44 @@ finished_at は open（次スライス）。rows() は row-count のみ（render
 list 面が要る）。
 
 運用値: 3 consumer とも string pool 1MB・pairs 65536 で安定。
+
+## 計測 14: tools.cljk の store 面査定（2026-10-21）— 121 SQL の正体
+
+node:sqlite port 最後の consumer（tools、121 SQL）の査定。正体は
+**タスク/Kanban store**（tool 実装本体の一部として埋め込まれた DB）:
+
+| テーブル | SQL | 内容 |
+|---|---|---|
+| tasks | 31（SELECT 19 / UPDATE 11 / INSERT 1） | status 遷移・claim_lock・assignee・current_run_id |
+| task_events | 24（INSERT 15 / SELECT 9） | **append-only event log**（task_id, run_id, kind, payload） |
+| task_links | 14（SELECT 12 / INSERT 2） | 親子グラフ（WITH RECURSIVE descendants あり） |
+| task_runs | 10（UPDATE 6 / INSERT 2 / SELECT 2） | 実行レコード（ledger の executions と同形） |
+| messages | 2 | セッション履歴（ROW_NUMBER window あり） |
+
+グラフ/JOIN/window を含う SQL が **13 箇所**。
+
+### port 設計（計測 8 設計 A の延長、既存 3 store の再利用で大半が埋まる）
+
+- **task_events = journal そのもの**（append-only）→ journal store に直載。
+  最も相性の良い面（24 SQL が journal append/read に還元）。
+- **tasks（31）+ task_runs（10）= per-id state ファイル** — ledger /
+  delivery と同形（status 遷移 + claim_lock は clock/now wire 7 で可）。
+  既存パターンの再利用で 41 SQL 相当が埋まる。
+- **task_links（14）= グラフ**。WITH RECURSIVE descendants は links の
+  有界走査 + guest 自己再帰で表現可（O(links)、bounded step 原則）。
+  形式: per-link state ファイル or links journal（親→子の隣接走査）。
+- **messages（2）+ window（4）= per-session journal + scan**で代替可。
+
+### 縮小効果の見積
+
+- 121 SQL → guest 操作に読み替え（約 60 操作 + グラフ走査 2 系）。
+- 13 箇所の再帰 CTE/JOIN/window は「スキャンへの読み替え」＝計算量は
+  O(n) 化するが、queue/ledger の実測（1MB pool、bounded scan）で同形の
+  走査は安定運用内。
+- **削減で消えるもの**: SQL パーサ行き来・WAL/transaction 保全・index
+  管理（guest は append + 全ファイル書換で同等の fail-closed を達成、
+  3 store で実証済み）。残る固有作業は links グラフの 1 系のみ。
+
+結論: tools の store 面は **port 可・既存 3 パターンの再利用で 8 割**、
+新設計は task_links グラフのみ。次スライス: task_events journal 化
+（最も自然な面から着手）。
