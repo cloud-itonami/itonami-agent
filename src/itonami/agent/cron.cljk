@@ -851,8 +851,13 @@
   (let [home (:home prof)
         started (js/Date.)
         executor (or executor (fn [prof prompt opts]
+                                ;; Hermes binds `async_delivery=False` for cron
+                                ;; job turns (cron/scheduler.py, hermes_cli/cron.py):
+                                ;; the turn dies with the run, so a spawn cannot
+                                ;; deliver a completion later.
                                 (agent-loop/run prof prompt
-                                               (assoc opts :tool-overrides
+                                               (assoc opts :async-delivery? false
+                                                      :tool-overrides
                                                       {"cronjob_manage" (fn [_ args] (manage prof args))}))))
         monitor-error (when-not (:ok? monitor) (:error monitor))
         no-agent? (or (true? (get job "no_agent")) monitor-error)

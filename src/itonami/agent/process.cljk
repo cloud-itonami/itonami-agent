@@ -63,6 +63,92 @@
        "process_manage(action='handoff', session_id=..., data='<purpose>') so the parent receives its completion. For CI "
        "watchers prefer returning the fact (PR number, SHA) and letting the parent watch."))
 
+(def ^:private silent-background-hint
+  "Hermes tools/terminal_tool_background.py `_SILENT_BACKGROUND_HINT`, verbatim."
+  "background=true without notify_on_complete=true means this process runs SILENTLY — you will not be told when it exits. If this is a bounded task (test suite, build, CI poller, deploy, anything with a defined end), you almost certainly wanted notify_on_complete=true so the system pings you on exit. Re-launch with notify_on_complete=true, or call process(action='poll') / process(action='wait') yourself to learn the outcome. Only ignore this hint for genuine long-lived processes that never exit (servers, watchers, daemons).")
+
+(def ^:private homebrew-ci-poller-hint
+  "Hermes tools/terminal_tool_background.py `_HOMEBREW_CI_POLLER_HINT`, verbatim."
+  "This looks like a homebrewed CI poller built from `gh pr view --json statusCheckRollup` and/or `gh pr checks | jq`. That shape has burned us repeatedly in hermes-agent dev work (PRs #31329, #31448, #31695, #31709, #31745, #32264, #33131) — stdout buffering kills output capture, jq null-key edge cases silently exit the loop, conclusion-vs-status field confusion exits early with bogus all-green verdicts, TTY-only summary banners never appear when piped. Use the canonical snippets in the green-ci-policy skill instead: the exit-code-driven `gh pr checks $PR >/dev/null` (rc 0 = green, 8 = pending, else fail) for exit-on-first-fail behavior, or the column-2 awk-on-tabs poller (`awk -F\"\\t\" \"$2==\\\"pending\\\"\"`) for sharded matrices. Load skill_view(name='github/hermes-agent-dev', file_path='references/green-ci-policy.md') for the verbatim snippets. If you must roll a custom loop with rich structured output, write each tick to a known file (`tee -a $TMPDIR/ci.log`) and rely on `process(action='log')` to read THAT file — do not rely on background-process stdout capture for line-buffered shell loops.")
+
+(def ^:private async-unsupported-note
+  "Hermes tools/terminal_tool_background.py `_ASYNC_UNSUPPORTED_NOTE`, verbatim."
+  "notify_on_complete / watch_patterns are not available in this session — it cannot receive an async completion after the turn ends (a one-shot runner such as `hermes -z`, a cron job, a Kanban worker, or a stateless HTTP endpoint). The process is running in the background; retrieve its result with process(action='poll') or process(action='wait').")
+
+(def ^:private heartbeat-ignored-note
+  "Hermes tools/terminal_tool_background.spawn_background_process's
+  `heartbeat_ignored` value, verbatim."
+  "heartbeat needs notify=true delivery, which this session cannot receive")
+
+(def ^:private watch-patterns-ignored-note
+  "Hermes tools/terminal_tool._resolve_notification_flag_conflict's conflict
+  note (spawn_background_process's `watch_patterns_ignored` value), verbatim."
+  "watch_patterns ignored because notify_on_complete=True; these two flags produce duplicate notifications when combined")
+
+(defn homebrew-ci-poller?
+  "Hermes tools/terminal_tool_background.py `_looks_like_homebrew_ci_poller`,
+  verbatim (deliberately narrow: the canonical column-2 awk poller is fine)."
+  [command]
+  (let [cmd (str command)
+        has-gh (or (str/includes? cmd "gh pr view") (str/includes? cmd "gh pr checks"))
+        has-jq (or (str/includes? cmd " jq ") (str/includes? cmd "| jq") (str/includes? cmd "$(jq"))]
+    (or (str/includes? cmd "statusCheckRollup") (and has-gh has-jq))))
+
+(defn spawn-notify-disposition
+  "Hermes `tools/terminal_tool_background.spawn_background_process`'s
+  notification disposition + result notes, verbatim:
+
+  - `hint` = `_SILENT_BACKGROUND_HINT` for a spawn with no notification intent
+    (checked on the REQUESTED flags, before `_apply_async_support`), with
+    `_HOMEBREW_CI_POLLER_HINT` appended (`\\\\n\\\\n` join) for a homebrewed CI poller;
+  - `_apply_async_support`: a session that cannot receive an async completion
+    (`:async-delivery?` false — Hermes binds `async_delivery=False` for cron
+    job turns and the api_server adapter) drops a requested notify/watch:
+    `notify_on_complete` false + `notify_unsupported` = `_ASYNC_UNSUPPORTED_NOTE`,
+    and `heartbeat_ignored` replaces an armed heartbeat (Hermes' `elif
+    heartbeat_seconds` branch);
+  - `_resolve_notification_flag_conflict` (background): notify_on_complete +
+    watch_patterns together drop the patterns with `watch_patterns_ignored`;
+  - otherwise `notify_on_complete` true, or false + `subagent_note` for a
+    delegated child (`_SUBAGENT_NOTIFY_NOTE` branch).
+
+  Returns `{:notify-on-complete? bool :watch-patterns [...] :heartbeat-seconds n
+  :notes {...}}` — the effective arming and the result-note map."
+  [{:keys [command notify-on-complete? watch-patterns heartbeat-seconds async-delivery? subagent?]}]
+  (let [notify? (boolean notify-on-complete?)
+        watch-raw (vec (or watch-patterns []))
+        hb (if (and (number? heartbeat-seconds) (pos? heartbeat-seconds)) (int heartbeat-seconds) 0)
+        async? (not (false? async-delivery?))
+        intent? (or notify? (boolean (seq watch-raw)))
+        dropped? (and intent? (not async?))
+        notify1 (and notify? async?)
+        watch1 (if async? watch-raw [])
+        conflict? (and notify1 (boolean (seq watch1)))
+        watch (if conflict? [] watch1)
+        notes (cond-> {}
+                (and (not notify?) (empty? watch-raw))
+                (assoc "hint" silent-background-hint)
+                (homebrew-ci-poller? command)
+                (update "hint" #(if (string? %) (str % "\n\n" homebrew-ci-poller-hint) homebrew-ci-poller-hint))
+                dropped?
+                (assoc "notify_on_complete" false "notify_unsupported" async-unsupported-note)
+                conflict?
+                (assoc "watch_patterns_ignored" watch-patterns-ignored-note)
+                notify1
+                (assoc "notify_on_complete" (not subagent?))
+                (and notify1 subagent?)
+                (assoc "subagent_note" subagent-notify-note)
+                (and (not notify1) (pos? hb))
+                (assoc "heartbeat_ignored" heartbeat-ignored-note))]
+    {:notify-on-complete? notify1
+     :watch-patterns watch
+     ;; Hermes spawn_background_process: `arm_heartbeat` runs only in the
+     ;; `elif heartbeat_seconds` of the delegated-child branch — a subagent's
+     ;; spawn arms no heartbeat (and says nothing about it), exactly as its
+     ;; completion notice is routed away.
+     :heartbeat-seconds (if (and notify1 (not subagent?)) hb 0)
+     :notes notes}))
+
 (defonce ^:private completion-queue (atom []))
 ;; Hermes ProcessRegistry._completion_consumed: exits the agent already saw
 ;; inline (wait/log), which must not be re-injected as a notice.
@@ -672,6 +758,19 @@
       (let [id (str "proc_" (h/random-hex 6))
             raw-task (str (or (:task-id ctx) ""))
             session-key (str (or (:session-key ctx) ""))
+            ;; Hermes spawn_background_process's notification disposition +
+            ;; result notes, applied to the REQUESTED flags (the `hint` check
+            ;; precedes `_apply_async_support`, as there).
+            disp (spawn-notify-disposition {:command (str command)
+                                            :notify-on-complete? notify-requested
+                                            :watch-patterns watch-patterns
+                                            :heartbeat-seconds heartbeat-seconds
+                                            :async-delivery? (:async-delivery? ctx)
+                                            :subagent? (boolean (:subagent ctx))})
+            hb-armed (if (pos? (:heartbeat-seconds disp))
+                       ;; Hermes `arm_heartbeat` returns the floor-clamped interval
+                       (max (int (:heartbeat-seconds disp)) heartbeat-min-seconds)
+                       0)
             task-key (container-task-id session-key)
             ;; Hermes terminal_tool_background._spawn:
             ;; `owner_task_id=task_id or effective_task_id`
@@ -687,7 +786,7 @@
                      :owner-task-id (atom owner)
                      :session-key (atom session-key)
                      :handoff-note (atom "")
-                     :notify-on-complete? (atom notify-requested)
+                     :notify-on-complete? (atom (:notify-on-complete? disp))
                      ;; Hermes `ProcessSession._completion_event`: set exactly
                      ;; when the exit is booked (finish! / detached close).
                      :completion-event? (atom false)
@@ -698,10 +797,8 @@
                      ;; (spawn) so the first heartbeat carries everything
                      ;; printed since spawn, exactly as `_heartbeat_total_at_last`
                      ;; defaults to 0 in `ProcessSession`.
-                     :watch-patterns (vec (or watch-patterns []))
-                     :heartbeat-seconds (if (and (number? heartbeat-seconds) (pos? heartbeat-seconds))
-                                          (max (int heartbeat-seconds) heartbeat-min-seconds)
-                                          0)
+                     :watch-patterns (vec (:watch-patterns disp))
+                     :heartbeat-seconds hb-armed
                      :watch (atom {:hits 0 :suppressed 0 :disabled? false
                                    :cooldown-until 0.0 :strike-candidate? false
                                    :consecutive-strikes 0})
@@ -739,13 +836,18 @@
             (h/json-str (merge (result-base session)
                                {"status" "running"
                                 "note" "Use process_manage to poll, wait, read logs, send stdin, or terminate."}
-                               (cond
-                                 ;; Hermes terminal_tool_background: the session
-                                 ;; stays armed, but a delegated child's result
-                                 ;; says the notice will not reach the parent.
-                                 (and notify-requested (:subagent ctx))
-                                 {"notify_on_complete" false "subagent_note" subagent-notify-note}
-                                 notify-requested {"notify_on_complete" true})))))))))
+                               ;; Hermes spawn_background_process's result
+                               ;; notes, verbatim: `hint` (`_SILENT_BACKGROUND_HINT`
+                               ;; + `_HOMEBREW_CI_POLLER_HINT`), `notify_unsupported`
+                               ;; (`_ASYNC_UNSUPPORTED_NOTE`), `watch_patterns_ignored`,
+                               ;; `heartbeat_ignored`, `subagent_note`,
+                               ;; `notify_on_complete`.
+                               (:notes disp)
+                               (cond-> {}
+                                 ;; `arm_heartbeat`'s floor-clamped return value
+                                 (pos? hb-armed) (assoc "heartbeat_seconds" hb-armed)
+                                 ;; Hermes: only an armed (post-conflict) list is echoed
+                                 (seq (:watch-patterns disp)) (assoc "watch_patterns" (vec (:watch-patterns disp)))))))))))))
 
 (defn- resolve-session [ctx requested]
   (let [matches (filter (fn [[id s]] (and (= (:home ctx) (:home s))
