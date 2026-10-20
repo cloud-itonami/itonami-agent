@@ -649,3 +649,26 @@ amu の修正候補として記録（gap 1 と同じ runbook）。
 実装罠（この run で 2 回）: export ベクタの更新漏れ（fn 未定義エラーに
 化ける）と、置換 anchor の不一致で edit が黙って適用されないケース →
 **edit 後は必ず check で再読**する運用が効いた。
+
+## 計測 22: execution_ledger の module parity 面 — node 無しで完走（2026-10-21、boot92.log）
+
+.cljk 差し替え consumer 3（execution_ledger.cljk の残 parity 面）:
+
+- **owner-fenced handoff**（mark-handoff-pending!: claimed かつ owner のみ）/
+  **claimed→running の adoption gate**（adopt-claimed!）/
+  **recover-interrupted!**（owner gone + adoption grace 外 → unknown に
+  fenced、再送しない）— pid/grace など host facts は i64 フラグで渡す
+  kexe-first パターン。recover の error 文言は .cljk と byte 一致。
+- **failure-type の分類マップを parity**: substring マッチ（regex 不要）で
+  rate_limit/timeout/auth/delivery/config/script/agent/unknown に分類
+  （lower-ascii + includes?、7 カテゴリの優先順位も一致）。
+- guest 実行（node 無し）: claim → handoff(owner-fenced) → adopt →
+  set-outcome → finish completed / claim → **recover → unknown(4)**（再
+  recover 0）/ claim → finish failed("provider timeout") →
+  failure-type **"timeout"** → `LGMODRESULT:4:timeout` / `:ok :result 1`。
+- ledger_core 9/9 緑（failure-type 全 8 ケース + handoff フィールド）、
+  native compile 成功。
+
+実装罠（テストが捕捉）: row-handoff のフィールド index が 1 つずれ
+（5 フィールド codec で 4 が正）。加えて edit の anchor 不一致・export
+漏れは link エラーになる運用教訓を再確認。

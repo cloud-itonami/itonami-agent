@@ -7,16 +7,21 @@
   job is the SQLite claim! contract). Self-contained: native-qualified ops
   only."
   (:require [itonami.journal-core :as jc])
-  (:export [row-encode row-status row-field active-ok test-row test-active]))
+  (:export [row-encode row-encode5 row-status row-field row-handoff failure-type active-ok test-row test-active test-parity]))
 
 (defn row-encode [status :i64 source :string error :string outcome :string] :string
-  (string-concat (string-substring "0123" status (+ status 1))
+  (row-encode5 status source error outcome 0))
+
+(defn row-encode5 [status :i64 source :string error :string outcome :string handoff :i64] :string
+  (string-concat (string-substring "01234" status (+ status 1))
                  (string-concat "
 " (string-concat source
                  (string-concat "
 " (string-concat error
                  (string-concat "
-" outcome)))))))
+" (string-concat outcome
+                 (string-concat "
+" (string-substring "01" handoff (+ handoff 1)))))))))))
 
 (defn row-status [content :string] :i64
   (if (= 0 (string-length content))
@@ -31,6 +36,49 @@
 (defn active-ok [status :i64] :i64
   (if (or (= status 0) (= status 1)) 1 0))
 
+(defn- lower-ascii [s :string] :string
+  (lower-run s 0 (string-length s)))
+
+(defn- lower-run [s :string i :i64 n :i64] :string
+  (if (>= i n)
+    ""
+    (let [c (string-code-point-at s i)]
+      (let [piece (if (and (>= c 65) (<= c 90))
+                    (string-substring "abcdefghijklmnopqrstuvwxyz" (- c 65) (- c 64))
+                    (string-substring s i (+ i 1)))]
+        (string-concat piece (lower-run s (+ i 1) n))))))
+
+(defn- has-l [s :string token :string] :bool
+  (>= (string-index-of s token) 0))
+
+(defn failure-type [error :string] :string
+  ;; the measured mapping (substring match, no regex): 429/rate limit/quota ->
+  ;; rate_limit; timeout/timed out -> timeout; 401/unauthorized/authentication
+  ;; -> auth; deliver(y) -> delivery; config/validation -> config;
+  ;; script/no_agent -> script; agent/model/provider/inference -> agent.
+  (let [s (lower-ascii error)]
+    (if (or (has-l s "429") (has-l s "rate limit") (has-l s "quota"))
+      "rate_limit"
+      (if (or (has-l s "timeout") (has-l s "timed out"))
+        "timeout"
+        (if (or (has-l s "401") (has-l s "unauthorized") (has-l s "authentication"))
+          "auth"
+          (if (or (has-l s "delivery") (has-l s "deliver"))
+            "delivery"
+            (if (or (has-l s "config") (has-l s "validation"))
+              "config"
+              (if (or (has-l s "script") (has-l s "no_agent"))
+                "script"
+                (if (or (has-l s "agent") (has-l s "model")
+                        (has-l s "provider") (has-l s "inference"))
+                  "agent"
+                  "unknown")))))))))
+
+(defn row-handoff [content :string] :i64
+  ;; field 4 of the five (0 status, 1 source, 2 error, 3 outcome, 4 handoff).
+  (let [h (row-field content 4)]
+    (if (= 0 (string-length h)) 0 (- (string-code-point-at h 0) 48))))
+
 (defn test-row [] :bool
   (and (= 0 (row-status (row-encode 0 "cron" "" "")))
        (= 1 (row-status (row-encode 1 "cron" "" "")))
@@ -40,6 +88,18 @@
        (string=? "cron" (row-field (row-encode 3 "cron" "boom" "delivered") 1))
        (string=? "boom" (row-field (row-encode 3 "cron" "boom" "delivered") 2))
        (string=? "delivered" (row-field (row-encode 3 "cron" "boom" "delivered") 3))))
+
+(defn test-parity [] :bool
+  (and (string=? "rate_limit" (failure-type "HTTP 429 quota exceeded"))
+       (string=? "timeout" (failure-type "Timed Out waiting"))
+       (string=? "auth" (failure-type "401 Unauthorized"))
+       (string=? "delivery" (failure-type "delivery failed"))
+       (string=? "config" (failure-type "validation error"))
+       (string=? "script" (failure-type "no_agent"))
+       (string=? "agent" (failure-type "provider inference error"))
+       (string=? "unknown" (failure-type "boom"))
+       (= 0 (row-handoff (row-encode 0 "s" "" "")))
+       (= 1 (row-handoff (row-encode5 0 "s" "" "" 1)))))
 
 (defn test-active [] :bool
   (and (= 1 (active-ok 0))

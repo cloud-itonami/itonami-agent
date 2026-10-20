@@ -1,0 +1,30 @@
+(ns ledger-module-probe
+  "Guest evidence for the ledger module parity surface: owner-fenced
+  handoff, the claimed->running adoption gate, recover-to-unknown with the
+  byte-exact error, and the failure-type classification."
+  (:require [itonami.ledger :as l])
+  (:export [ledger-module-probe])
+  (:capabilities #{:io/write}))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn ledger-module-probe [] :i64
+  (let [c1 (l/lg-claim "/data/lg2" "job1" "ex1" "cron")
+        h1 (l/lg-mark-handoff "/data/lg2" "job1" "ex1" 1)
+        hbad (l/lg-mark-handoff "/data/lg2" "job1" "ex1" 0)
+        a1 (l/lg-adopt "/data/lg2" "job1" "ex1" 1)
+        o1 (l/lg-set-outcome "/data/lg2" "job1" "ex1" "delivered")
+        f1 (l/lg-finish "/data/lg2" "job1" "ex1" 2 "")
+        c2 (l/lg-claim "/data/lg2" "job1" "ex2" "cron")
+        r2 (l/lg-recover "/data/lg2" "job1" "ex2" 1 1)
+        r2b (l/lg-recover "/data/lg2" "job1" "ex2" 1 1)
+        st2 (l/lg-status "/data/lg2" "job1" "ex2")
+        c3 (l/lg-claim "/data/lg2" "job1" "ex3" "cron")
+        f3 (l/lg-finish "/data/lg2" "job1" "ex3" 3 "provider timeout")
+        ft3 (l/lg-failure "/data/lg2" "job1" "ex3")
+        say (wire-say (string-concat "LGMRESULT:" (string-concat (string-from-i64 st2) (string-concat ":" ft3))))]
+    (if (and (= 1 c1) (= 1 h1) (= 0 hbad) (= 1 a1) (= 1 o1) (= 1 f1)
+             (= 1 c2) (= 1 r2) (= 0 r2b) (= 4 st2)
+             (= 1 c3) (= 1 f3) (string=? "timeout" ft3))
+      1 0)))
