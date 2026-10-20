@@ -1,0 +1,110 @@
+(ns itonami.ledger
+  "The effect half of the execution ledger port (executions table slice):
+  per-execution state files (notepad's hashed naming) plus a per-job journal
+  carrying claim order. The SQLite claim! contract is kept: at most one
+  ACTIVE (claimed/running) row per job, enforced by a bounded journal scan.
+
+  Parity notes (measured scope of this slice): cron_incidents, handoff
+  transitions, recover-interrupted and finished_at timestamps stay open;
+  rows() is row-count here (a rendered rows() needs the list surface).
+
+  Shape rule measured earlier: typed-cap-call only in a typed defn's return
+  position."
+  (:require [itonami.ledger-core :as core]
+            [itonami.journal :as j]
+            [itonami.journal-core :as jc]
+            [itonami.notepad :as np])
+  (:export [lg-claim lg-mark-running lg-finish lg-active-count lg-row-count])
+  (:capabilities #{:fs/app-data}))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- exists? [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn- jpath [base :string job :string] :string
+  (np/note-path base (string-concat "j" job)))
+
+(defn- spath [base :string id :string] :string
+  (np/note-path base (string-concat "s" id)))
+
+(defn- active-run [base :string q :string i :i64 n :i64] :i64
+  (if (>= i n)
+    0
+    (let [id (j/journal-entry q i)]
+      (let [p (spath base id)]
+        (if (= 0 (exists? p))
+          (active-run base q (+ i 1) n)
+          (let [content (wire-read p)]
+            (if (= 1 (core/active-ok (core/row-status content)))
+              1
+              (active-run base q (+ i 1) n))))))))
+
+(defn- count-run [base :string q :string i :i64 n :i64 wanted :i64 acc :i64] :i64
+  ;; wanted: 1 = active rows only, 0 = all rows.
+  (if (>= i n)
+    acc
+    (let [id (j/journal-entry q i)]
+      (let [p (spath base id)]
+        (if (= 0 (exists? p))
+          (count-run base q (+ i 1) n wanted acc)
+          (let [content (wire-read p)]
+            (let [add (if (= wanted 1)
+                        (core/active-ok (core/row-status content))
+                        1)]
+              (count-run base q (+ i 1) n wanted (+ acc add)))))))))
+
+(defn lg-claim [base :string job :string id :string source :string] :i64
+  (if (= 0 (string-length id))
+    0
+    (let [q (jpath base job)]
+      (let [n (j/journal-count q)]
+        (if (= 1 (active-run base q 0 n))
+          0
+          (let [p (spath base id)]
+            (if (= 1 (exists? p))
+              0
+              (let [w (wire-write p (core/row-encode 0 source "" ""))]
+                (let [a (j/journal-append q id)]
+                  1)))))))))
+
+(defn lg-mark-running [base :string job :string id :string] :i64
+  (let [p (spath base id)]
+    (if (= 0 (exists? p))
+      0
+      (let [content (wire-read p)]
+        (if (= 0 (core/row-status content))
+          (let [w (wire-write p (core/row-encode 1 (core/row-field content 1) "" ""))]
+            1)
+          0)))))
+
+(defn lg-finish [base :string job :string id :string status :i64 error :string] :i64
+  (if (or (< status 2) (> status 3))
+    0
+    (let [p (spath base id)]
+      (if (= 0 (exists? p))
+        0
+        (let [content (wire-read p)]
+          (if (= 1 (core/active-ok (core/row-status content)))
+            (let [w (wire-write p (core/row-encode status (core/row-field content 1) error (core/row-field content 3)))]
+              1)
+            0))))))
+
+(defn lg-active-count [base :string job :string] :i64
+  (let [q (jpath base job)]
+    (count-run base q 0 (j/journal-count q) 1 0)))
+
+(defn lg-row-count [base :string job :string] :i64
+  (let [q (jpath base job)]
+    (count-run base q 0 (j/journal-count q) 0 0)))

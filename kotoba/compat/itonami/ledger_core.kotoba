@@ -1,0 +1,49 @@
+(ns itonami.ledger-core
+  "The pure half of the execution ledger port (ledger 8 design A, consumer 3:
+  execution_ledger.cljk's 32 SQL -- the executions table slice; incidents
+  stay open). Row state is four newline-separated fields: status digit,
+  source, error, delivery outcome. Status: 0 claimed / 1 running /
+  2 completed / 3 failed; claimed and running are ACTIVE (one active row per
+  job is the SQLite claim! contract). Self-contained: native-qualified ops
+  only."
+  (:require [itonami.journal-core :as jc])
+  (:export [row-encode row-status row-field active-ok test-row test-active]))
+
+(defn row-encode [status :i64 source :string error :string outcome :string] :string
+  (string-concat (string-substring "0123" status (+ status 1))
+                 (string-concat "
+" (string-concat source
+                 (string-concat "
+" (string-concat error
+                 (string-concat "
+" outcome)))))))
+
+(defn row-status [content :string] :i64
+  (if (= 0 (string-length content))
+    -1
+    (- (string-code-point-at content 0) 48)))
+
+(defn row-field [content :string n :i64] :string
+  ;; field n of the four (1 = source, 2 = error, 3 = outcome).
+  (jc/piece content "
+" n))
+
+(defn active-ok [status :i64] :i64
+  (if (or (= status 0) (= status 1)) 1 0))
+
+(defn test-row [] :bool
+  (and (= 0 (row-status (row-encode 0 "cron" "" "")))
+       (= 1 (row-status (row-encode 1 "cron" "" "")))
+       (= 2 (row-status (row-encode 2 "cron" "" "")))
+       (= 3 (row-status (row-encode 3 "cron" "boom" "delivered")))
+       (= -1 (row-status ""))
+       (string=? "cron" (row-field (row-encode 3 "cron" "boom" "delivered") 1))
+       (string=? "boom" (row-field (row-encode 3 "cron" "boom" "delivered") 2))
+       (string=? "delivered" (row-field (row-encode 3 "cron" "boom" "delivered") 3))))
+
+(defn test-active [] :bool
+  (and (= 1 (active-ok 0))
+       (= 1 (active-ok 1))
+       (= 0 (active-ok 2))
+       (= 0 (active-ok 3))
+       (= 0 (active-ok -1))))

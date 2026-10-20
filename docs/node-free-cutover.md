@@ -428,3 +428,24 @@ finished_at のみ省略。
 運用値の追加実測: **KEXE_STRING_POOL は intern の蓄積で尽きる**
 （65536 不足 → :budget/bytes trap、1MB で完走）。queue 系は
 KEXE_STRING_POOL=1048576 が目安。
+
+## 計測 13: execution ledger port — node 無しで完走（2026-10-21、boot81.log）
+
+node:sqlite port consumer 3（execution_ledger.cljk の 32 SQL のうち
+executions テーブル面）。per-execution state ファイル + per-job journal:
+
+- `ledger_core.kotoba`（pure 6/6 緑: 4 フィールド row codec・status
+  0 claimed/1 running/2 completed/3 failed・active 判定）+ `ledger.kotoba`
+  （effect: **claim! 契約「job あたり active 1 つ」を journal 走査で強制** /
+  mark-running / finish / active-count / row-count）。
+- guest 実行（node 無し）: claim ex1 → 1、重複 claim → 0、active 中の
+  claim(ex2) → 0、mark-running → 1、running 中の claim → 0、finish
+  completed → 1、claim(ex2) → 1（空き）、finish failed("boom") → 1、
+  active-count 0 / row-count 2 → `LGRESULT:2:0` / `:ok :result 1`。
+- 6-module graph の native compile 成功。
+
+parity notes: cron_incidents / handoff 遷移 / recover-interrupted /
+finished_at は open（次スライス）。rows() は row-count のみ（render 版は
+list 面が要る）。
+
+運用値: 3 consumer とも string pool 1MB・pairs 65536 で安定。
