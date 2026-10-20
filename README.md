@@ -118,9 +118,16 @@ and drained by the startup / post-turn batch detach (`run_startup` /
 `run_turn_persistence`, atomic reassign). The checkpoint round-trips the
 `watcher_*` / `watcher_interval` / `parent_session_id` fields and
 `process_registry_checkpoint`-style recovery re-enqueues the descriptor
-(`check_interval` = the stored interval). Remaining: the watcher's delivery
-loop (`_run_process_watcher`'s chat push / admission), which rides the
-messaging gateway adapter surface. Kotoba `execute_code` runs one confined, stateless Python source string and does not expose `hermes_tools` RPC. Kotoba `session_search` reads only the current profile's local `state.db` and supports bounded browse, FTS discovery, read, and scroll; cross-profile lookup and Hermes adaptive detail are not implemented. `hermes-cli`/`hermes-cron` retain Hermes' full core inventory and refuse to start when any selected tool is unsupported, rather than silently presenting a reduced bundle |
+(`check_interval` = the stored interval). The watcher's delivery loop
+(`_run_process_watcher`'s chat push / admission) is
+`itonami.agent.watcher/run-process-watcher!`, verbatim control flow — the
+silent `off` wait, the `all`-mode running updates, the agent-notify synthetic
+completion with the launching-turn-busy concise receipt, the refused-injection
+`jittered_backoff(…, jitter_ratio=0.0)` retry (8 attempts, then the
+`completion_admission` recheck's committed break or the fall-back notice) and
+the wait/log-consumed skip — its two egress calls riding the messaging gateway
+adapter surface as the `:send!` / `:enqueue!` / `:admission-recheck` hooks;
+wiring a live messaging gateway to those hooks remains. Kotoba `execute_code` runs one confined, stateless Python source string and does not expose `hermes_tools` RPC. Kotoba `session_search` reads only the current profile's local `state.db` and supports bounded browse, FTS discovery, read, and scroll; cross-profile lookup and Hermes adaptive detail are not implemented. `hermes-cli`/`hermes-cron` retain Hermes' full core inventory and refuse to start when any selected tool is unsupported, rather than silently presenting a reduced bundle |
 | `cron/jobs.json` (including `monitor_script` / `monitor_url`), 5-field cron / interval / once schedules | read and written in Hermes' format; Kotoba can create, list, and update monitor jobs, then evaluates the monitor before the agent turn |
 | Pre-run script extensions `.sh`/`.bash`, `.cljk`, `.js`/`.mjs`, `.py`, `.hy` | extension dispatch; `.hy` runs through `hy.cmdline.hy_main` with the job/config-selected Python, which must have Hy installed |
 | cron prompt: `_CRON_HINT`, `## Script Output` / `## Script Error` block, empty stdout and `{"wakeAgent": false}` skip, `[SILENT]`, `[CRON_FAILURE]` | identical text and semantics |

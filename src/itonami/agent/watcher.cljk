@@ -1,0 +1,179 @@
+(ns itonami.agent.watcher
+  "The gateway watcher's delivery loop (Hermes gateway/run_notifications.py
+  `GatewayRunner._run_process_watcher`): poll the process at `check_interval`,
+  push `display.background_process_notifications` chat updates, inject the
+  `notify_on_complete` completion (with the wait/log consumed dedup, the
+  launching-turn-busy concise receipt and the backoff retry of a refused
+  injection), and fall back to the plain notice. Its two egress calls ride the
+  messaging gateway adapter surface — the chat push (`_send_watcher_message`)
+  and the admission (`_enqueue_process_completion_notification` /
+  `completion_admission`) enter as the `:send!` / `:enqueue!` /
+  `:admission-recheck` hooks, the same seam as `set-watcher-runner!`'s arm
+  hook."
+  (:require [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.process :as process]
+            [itonami.agent.quiet :as quiet]))
+
+(defn- default-present!
+  "Hermes `gateway/warning_notifications.present_notification`, verbatim
+  policy: a diagnostic-classified send runs only when the platform policy
+  shows warning notifications; the renderer's receipt/exception is the
+  caller's to interpret."
+  [config render platform diagnostic]
+  (if (and diagnostic (not (quiet/warning-notifications-enabled? platform config)))
+    (p/resolved false)
+    (p/then (render) (fn [_] true))))
+
+(defn run-process-watcher!
+  "Hermes `GatewayRunner._run_process_watcher`, verbatim control flow. Polls
+  the registry session every `check_interval` (refusals back off) until it is
+  gone or its exit is handled:
+
+  - `should_surface_notification` false: recheck next tick (handoff retains
+    notification intent); break on exit.
+  - `display.background_process_notifications` `off` without agent notify:
+    silent — wait for the exit without pushing messages.
+  - running: `all` mode (and no agent notify) pushes the running update when
+    new output appeared.
+  - exited, agent notify and not consumed via wait/log: inject the synthetic
+    completion (`format_process_notification` text) through `:enqueue!`;
+    `delivered is not False` breaks — sending the concise receipt first while
+    the launching turn is still active (`:launching-turn-active?`) and the
+    mode fires (`concise`/`all`/`result`, or `error` with a non-zero exit).
+    A refusal retries with `jittered_backoff` (attempt-based,
+    `max(interval, 1) * 2` base, 60 s cap) for at most 8 attempts, then the
+    `:admission-recheck` receipt decides (`completion_admission`): committed
+    breaks (the last refusal was a lost ACK), otherwise the fall-back notice.
+  - fall-through (hence the consumed re-check): consumed breaks silently; a
+    firing mode sends the final message through `present_notification`'s
+    diagnostic admission.
+
+  Hooks: `:session-fn` (registry lookup, `process/get-session`), `:send!`
+  (`[platform chat-id thread-id message-text watcher]` — the messaging
+  gateway's adapter send; absent, or a blank `chat_id`, sends nothing, as
+  `_send_watcher_message`'s `if adapter and chat_id`), `:enqueue!`
+  (`[synth-text completion-evt]` — false = refused, anything else counts as
+  delivered, Hermes `delivered is not False`), `:launching-turn-active?`
+  (`[platform watcher]`), `:admission-recheck` (`[completion-evt]` — truthy =
+  the turn is committed; absent = no session authority, as Hermes' guard),
+  `:present!` (`[render platform diagnostic]`), `:sleep-fn`, `:now-fn`,
+  `:config`, `:env`, `:surface-child?` (else `delegation
+  .surface_child_process_notifications`), `:warn-fn`."
+  [watcher {:keys [config env session-fn send! enqueue! launching-turn-active?
+                   admission-recheck present! sleep-fn now-fn surface-child? warn-fn]
+            :or {session-fn process/get-session
+                 enqueue! (fn [_ _] nil)
+                 launching-turn-active? (fn [_ _] false)
+                 sleep-fn (fn [seconds] (p/delay (* 1000 (double seconds))))
+                 now-fn h/now-ms
+                 env {}
+                 warn-fn (fn [& _] nil)}
+            :as opts}]
+  (let [session-id (get watcher "session_id")
+        interval (double (get watcher "check_interval"))
+        platform-name (str (or (get watcher "platform") ""))
+        chat-id (get watcher "chat_id" "")
+        thread-id (get watcher "thread_id" "")
+        agent-notify (boolean (get watcher "notify_on_complete" false))
+        notify-mode (process/background-notifications-mode env config)
+        silent (and (= notify-mode "off") (not agent-notify))
+        surface-child (if (contains? opts :surface-child?)
+                        (boolean surface-child?)
+                        (process/surface-child-process-notifications? config))
+        present! (or present!
+                     (fn [render platform diagnostic]
+                       (default-present! config render platform diagnostic)))
+        mode-fires? (fn [exit-code]
+                      (or (contains? #{"concise" "all" "result"} notify-mode)
+                          (and (= notify-mode "error")
+                               (not (contains? #{0 nil} exit-code)))))
+        push! (fn [message-text]
+                (when (and (fn? send!) (not (= "" (str chat-id))))
+                  (send! platform-name chat-id thread-id message-text watcher)))
+        ;; Text-only notification; skip when already consumed via wait/log (the
+        ;; agent_notify branch FALLS THROUGH here, hence the re-check).
+        text-notice! (fn []
+                       (if (process/is-completion-consumed? session-id)
+                         (p/resolved :break)
+                         (p/let [_ (when (mode-fires? @(:exit-code (session-fn session-id)))
+                                     (let [message-text (process/format-process-final-message
+                                                         session-id (session-fn session-id) notify-mode (now-fn))]
+                                       (present! (fn [] (push! message-text))
+                                                 platform-name
+                                                 (not (contains? #{0 nil} @(:exit-code (session-fn session-id)))))))]
+                           (p/resolved :break))))]
+    (p/loop [retry-interval interval
+             last-output-len 0
+             completion-attempts 0]
+      (p/let [_ (sleep-fn retry-interval)
+              session (session-fn session-id)]
+        (if (nil? session)
+          (p/resolved nil)
+          (let [surface (process/should-surface-notification
+                         {"owner_task_id" @(:owner-task-id session)
+                          "task_id" @(:task-id session)}
+                         surface-child)
+                exited? (= :exited @(:state session))]
+            (cond
+              ;; Recheck live ownership next tick: handoff retains notification intent.
+              (not surface)
+              (if exited?
+                (p/resolved nil)
+                (p/recur interval last-output-len completion-attempts))
+
+              ;; Still wait for the process to exit so we can log it, but don't push any messages.
+              silent
+              (if exited?
+                (p/resolved nil)
+                (p/recur interval last-output-len completion-attempts))
+
+              :else
+              (let [current-output-len (count @(:output session))
+                    has-new-output (> current-output-len last-output-len)]
+                (if-not exited?
+                  (do
+                    ;; New output — deliver a status update (only in "all" mode;
+                    ;; agent_notify watchers only care about completion).
+                    (when (and has-new-output (= notify-mode "all") (not agent-notify))
+                      (push! (process/format-process-running-message session)))
+                    (p/recur interval current-output-len completion-attempts))
+                  (if (and agent-notify (not (process/is-completion-consumed? session-id)))
+                    (let [completion-evt (process/build-process-completion-event watcher session session-id)
+                          synth-text (process/format-completion-notification completion-evt)]
+                      (if (= synth-text "")
+                        (p/resolved nil)
+                        (p/let [turn-busy (boolean (launching-turn-active? platform-name watcher))
+                                delivered (enqueue! synth-text completion-evt)]
+                          (if (not (false? delivered))
+                            (do
+                              ;; The agent normally reports the result itself, so the chat gets no
+                              ;; separate receipt. While the launching turn is still running the
+                              ;; injection only queues a follow-up, and the chat would stay mute for
+                              ;; as long as that turn lasts: send the concise receipt now.
+                              (when (and turn-busy (mode-fires? @(:exit-code session)))
+                                (push! (process/format-process-final-message
+                                        session-id session "concise" (now-fn))))
+                              (p/resolved nil))
+                            (let [attempts (inc completion-attempts)]
+                              (if (< attempts process/max-completion-injection-attempts)
+                                ;; A refusal may clear (adapter reconnecting, store draining), so
+                                ;; retry with backoff for a few minutes, then fall through to the
+                                ;; plain notice instead of dropping it.
+                                (p/recur (process/jittered-backoff
+                                          attempts (* (max interval 1) 2)
+                                          process/completion-injection-retry-max-delay)
+                                         last-output-len
+                                         attempts)
+                                (let [committed (and (some? admission-recheck)
+                                                     (try (some? (admission-recheck completion-evt))
+                                                          (catch :default _ false)))]
+                                  (if committed
+                                    ;; The last refusal was a lost ACK: the turn is committed.
+                                    (p/resolved nil)
+                                    (do
+                                      (warn-fn (str "Process watcher: completion for " session-id
+                                                    " was refused " attempts " times; falling back to the "
+                                                    "notify_mode=" notify-mode " notice"))
+                                      (p/then (text-notice!) (fn [_] (p/resolved nil))))))))))))
+                    (p/then (text-notice!) (fn [_] (p/resolved nil)))))))))))))
