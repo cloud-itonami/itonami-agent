@@ -13,6 +13,8 @@
   (:require [itonami.tasks :as t]
             [itonami.task-comments :as cm]
             [itonami.task-attachments :as at]
+            [itonami.links :as lk]
+            [itonami.tasks-events :as te]
             [itonami.tasks-state :as ts]
             [itonami.journal-core :as jc])
   (:export [kanban-cli])
@@ -135,6 +137,56 @@
 (defn- run-finish [base :string id :string result :string] :i64
   (ok1 (t/task-done base id result)))
 
+(defn- run-review [base :string id :string] :i64
+  ;; the request-review shape: into review (5) plus the event row.
+  (let [st (t/task-status base id)]
+    (let [r (t/task-transition base id st 5)]
+      (let [ev (te/ev-append base id "" "review" "")]
+        (ok1 r)))))
+
+(defn- run-link [base :string parent :string child :string] :i64
+  (ok1 (lk/link-add base parent child)))
+
+(defn- parents-done? [base :string id :string q :string n :i64 i :i64 acc :i64] :i64
+  ;; every parent (a registry id whose children journal names id) must be
+  ;; done (6); acc counts unfinished parents. The registry walk is the
+  ;; parent scan (links are parent-keyed).
+  (if (>= i n)
+    acc
+    (let [other (tc-piece q i)]
+      (let [acc2 (if (or (= 0 (string-length other)) (string=? other id))
+                   acc
+                   (if (= 1 (lk/link-has base other id))
+                     (if (= 6 (t/task-status base other)) acc (+ acc 1))
+                     acc))]
+        (parents-done? base id q n (+ i 1) acc2)))))
+
+(defn- tc-piece [q :string i :i64] :string
+  (jc/piece q "\n" i))
+
+(defn- recompute-one [base :string id :string q :string n :i64] :i64
+  (if (= 0 (t/task-status base id))
+    (if (= 0 (parents-done? base id q n 0 0))
+      (t/task-transition base id 0 1)
+      0)
+    0))
+
+(defn- recompute-run [base :string q :string i :i64 n :i64 acc :i64] :string
+  (if (>= i n)
+    (string-from-i64 acc)
+    (let [id (tc-piece q i)]
+      (let [r (if (= 0 (string-length id)) 0 (recompute-one base id q n))]
+        (recompute-run base q (+ i 1) n (+ acc r))))))
+
+(defn- run-recompute [base :string] :i64
+  ;; kanban-recompute-ready: todo (0) tasks whose parents are all done
+  ;; flip to ready (1) -- the measured 0->1 from-conditional flip.
+  (let [q (t/task-ids base)]
+    (let [n (if (= 0 (string-length q)) 0 (jc/count-pieces q "\n"))]
+      (let [flipped (recompute-run base q 0 n 0)]
+        (let [w (wire-say (string-concat "{\"ok\":" (string-concat flipped "}")))]
+          0)))))
+
 (defn kanban-cli [] :i64
   (let [verb (wire-arg 0) base (wire-arg 1) a2 (wire-arg 2)]
     (if (string=? verb "show")
@@ -157,4 +209,10 @@
                     (run-unblock base a2)
                     (if (string=? verb "finish")
                       (run-finish base a2 (wire-arg 3))
-                      (list-entry base a2)))))))))))))
+                      (if (string=? verb "review")
+                      (run-review base a2)
+                      (if (string=? verb "link")
+                        (run-link base a2 (wire-arg 3))
+                        (if (string=? verb "recompute")
+                          (run-recompute base)
+                          (list-entry base a2))))))))))))))))
