@@ -1,0 +1,90 @@
+(ns itonami.agent.delivery-queue-test
+  "The durable handoff contract of cron/delivery_queue.py: a send is
+  persisted before the transport, claimed at most once, fenced `unknown`
+  (never retried) when the claimer dies, and terminal rows are redacted.
+  These pin the host-adapter surface that the callers (cron.cljk drain,
+  settle) depend on."
+  (:require [cljs.test :refer [deftest is testing]]
+            [itonami.agent.host :as h]
+            [itonami.agent.delivery-queue :as dq]
+            ["node:sqlite" :as sqlite]))
+
+(defn- fresh-home [name]
+  (let [home (h/join (h/tmp-dir) (str "test-delivery-queue-" name "-" (.-pid js/process)))]
+    (h/rm home)
+    (h/mkdirs home)
+    home))
+
+(deftest delivery-queue-enqueue-claim-finish
+  (let [home (fresh-home "basic")]
+    (try
+      (is (= nil (dq/get-status home "e1")) "an unknown id has no row")
+      (let [r (dq/enqueue! home "e1" {"id" "job1"} "hello" false)]
+        (is (= "e1" (get r "execution_id")))
+        (is (= "pending" (get r "status")))
+        (is (= 0 (get r "for_failure")))
+        (is (= "hello" (get r "content"))))
+      (let [r (dq/enqueue! home "e2" {"id" "job1"} "boom" true)]
+        (is (= 1 (get r "for_failure")) "the for-failure flag is persisted"))
+      (is (= "pending" (get (dq/get-status home "e1") "status"))
+          "enqueue! is idempotent (INSERT OR IGNORE): no duplicate, no re-queue")
+      (testing "claim at most once"
+        (is (true? (dq/claim-row! home "e1")))
+        (is (false? (dq/claim-row! home "e1")) "a claimed row is not claimable")
+        (is (= "delivering" (get (dq/get-status home "e1") "status"))))
+      (testing "finish is fenced: a terminal row never moves again"
+        (is (true? (dq/finish! home "e1" "delivered" nil)))
+        (is (false? (dq/finish! home "e1" "failed" "late")) "never rewrites a terminal row")
+        (let [r (dq/get-status home "e1")]
+          (is (= "delivered" (get r "status")))
+          (is (= "{}" (get r "job_json")) "terminal payloads are redacted")
+          (is (= "" (get r "content"))) ))
+      (testing "the error is kept with the outcome"
+        (dq/claim-row! home "e2")
+        (is (true? (dq/finish! home "e2" "failed" "boom")))
+        (is (= "boom" (get (dq/get-status home "e2") "error"))))
+      (finally (h/rm home)))))
+
+(deftest delivery-queue-claim-next-drains-oldest-first
+  (let [home (fresh-home "drain")]
+    (try
+      (is (= nil (dq/claim-next! home)) "an empty queue claims nothing")
+      (dq/enqueue! home "e1" {"id" "j"} "a" false)
+      (dq/enqueue! home "e2" {"id" "j"} "b" false)
+      (let [r (dq/claim-next! home)]
+        (is (= "e1" (get r "execution_id")) "oldest first (created_at, id)")
+        (is (= "delivering" (get r "status"))))
+      (is (= "e2" (get (dq/claim-next! home) "execution_id")))
+      (is (= nil (dq/claim-next! home)) "nothing pending is left")
+      (finally (h/rm home)))))
+
+(deftest delivery-queue-abandoned-claims-fence-unknown
+  (let [home (fresh-home "fence")]
+    (try
+      (dq/enqueue! home "alive" {"id" "j"} "a" false)
+      (dq/enqueue! home "dead" {"id" "j"} "b" false)
+      (dq/claim-row! home "alive")
+      (dq/claim-row! home "dead")
+      (is (= [] (dq/recover-abandoned! home))
+          "our own live claim is never fenced")
+      (let [db (sqlite/DatabaseSync. (dq/db-path home))]
+        (.run (.prepare db "UPDATE deliveries SET owner_pid=? WHERE execution_id=?")
+              999999 "dead")
+        (.close db))
+      (let [recovered (dq/recover-abandoned! home)]
+        (is (= 1 (count recovered)))
+        (is (= "dead" (get (first recovered) "execution_id")))
+        (is (= "unknown" (get (first recovered) "status"))
+            "a dead claimer's send is fenced unknown and never retried"))
+      (is (= "unknown" (get (dq/get-status home "dead") "status")))
+      (is (= [] (dq/recover-abandoned! home)) "a terminal row is not recovered twice")
+      (is (= "delivering" (get (dq/get-status home "alive") "status")))
+      (finally (h/rm home)))))
+
+(deftest delivery-queue-hermes-outcome-vocabulary
+  (is (= 1000 dq/max-terminal-deliveries))
+  (is (= #{"delivered" "failed" "unknown" "suppressed"} dq/terminal-statuses))
+  (is (= {"delivered" "delivered" "suppressed" "suppressed"
+          "failed" "failed" "unknown" "failed"}
+         dq/ledger-outcome)
+      "queue terminal status -> ledger delivery_outcome (unknown surfaces as failed)"))
