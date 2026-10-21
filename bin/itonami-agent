@@ -1,16 +1,47 @@
-#!/usr/bin/env -S kbb --backend sci
-;; itonami-agent — a Hermes-compatible agent written in kotoba. The command
-;; surface is in src/itonami/agent/main.cljk. No dependencies beyond the kbb
-;; engine: src/ is put on the classpath relative to this file, so the
-;; launcher works from any cwd and through a symlink on PATH.
-(ns itonami-agent.bin
-  (:require [nbb.classpath :as cp]
-            ["node:path" :as path]
-            ["node:fs" :as fs]))
+#!/bin/sh
+# The trench-4 flip structure (ledger measurement 51): covered routes run
+# as one-shot kexe guests through the loader -- no kbb, no node. Routes
+# not yet ported fall back to bin/itonami-agent-kbb (the old
+# `env -S kbb --backend sci` launcher) and are listed in the ledger's
+# flip inventory; when the list empties, the fallback goes away.
+#
+# Guest manifest (offset/arity/grants per guest -- from the amu build):
+#   notepad-cli   28280 0 3,34,35,37,38,39
+#   kanban-cli    (fill from its build)
+#   session-search-cli (fill from its build)
+#
+# Env: KEXE_LOADER (the loader binary), KEXE_GUESTS (dir with the .raw
+# guests), ITONAMI_ARCH (aarch64|x86_64, default from uname).
 
-(cp/add-classpath (path/resolve (path/dirname (fs/realpathSync nbb.core/*file*)) ".." "src"))
-;; peer runs re-enter through this launcher in a child process
-(aset (.-env js/process) "ITONAMI_AGENT_BIN" (fs/realpathSync nbb.core/*file*))
+set -e
+HERE=$(dirname "$0")
+LOADER=${KEXE_LOADER:-$HERE/kexe-loader}
+GUESTS=${KEXE_GUESTS:-$HERE/guests}
+ARCH=${ITONAMI_ARCH:-$(uname -m | sed 's/arm64/aarch64/;s/x86_64/x86_64/')}
 
-(require '[itonami.agent.main :as main])
-(apply (resolve (quote itonami.agent.main/-main)) *command-line-args*)
+run_guest() {
+  raw=$1; offset=$2; grants=$3; shift 3
+  # KEXE_COMMAND: the guest's return value is the process exit code and
+  # the loader prints nothing extra (the CLI's own stdout is the answer).
+  KEXE_COMMAND=1 exec "$LOADER" "$GUESTS/$raw" "$offset" 0 "$ARCH" "$grants" -- "$@"
+}
+
+case "$1" in
+  cron)
+    case "$2" in
+      notepad)
+        shift 2
+        # argv: <base> <verb> [key] [value]  (the guest's own order:
+        # verb base key value -- reordered here)
+        base=$1; verb=$2; key=$3; value=$4
+        run_guest notepad-cli.raw 28280 3,34,35,37,38,39 "$verb" "$base" "$key" "$value"
+        ;;
+      *)
+        exec "$HERE/itonami-agent-kbb" "$@"
+        ;;
+    esac
+    ;;
+  *)
+    exec "$HERE/itonami-agent-kbb" "$@"
+    ;;
+esac

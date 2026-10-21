@@ -53,7 +53,9 @@
     2))
 
 (defn- ok [line :string] :i64
-  (let [w (wire-say line)]
+  ;; println parity: the line and its newline.
+  (let [w (wire-say (string-concat line "
+"))]
     0))
 
 (defn notepad-cli [] :i64

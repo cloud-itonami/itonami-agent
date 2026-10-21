@@ -65,7 +65,8 @@
                 (let [d5 (string-concat d4 (string-from-i64 n))]
                   (let [d6 (string-concat d5 ",\"heartbeat\":")]
                     (let [d7 (string-concat d6 (if (= 0 (string-length hb)) "0" hb))]
-                      (let [w (wire-say (string-concat d7 "}"))]
+                      (let [w (wire-say (string-concat d7 (string-concat "}" "
+")))]
                         0))))))))))))
 
 (defn- run-create [base :string id :string status-s :string] :i64
@@ -87,7 +88,8 @@
                  ""
                  (walk-json base ids 0 (jc/count-pieces ids "\n") filter-s ""))]
       (let [doc (string-concat "{\"tasks\":[" (string-concat body "]}"))]
-        (let [w (wire-say doc)]
+        (let [w (wire-say (string-concat doc "
+"))]
           0)))))
 
 (defn- run-comment [base :string id :string author :string body :string] :i64
@@ -121,7 +123,8 @@
           0)))))
 
 (defn- ok1 [r :i64] :i64
-  (let [w (wire-say (if (= 1 r) "{\"ok\":1}" "{\"ok\":0}"))]
+  (let [w (wire-say (string-concat (if (= 1 r) "{\"ok\":1}" "{\"ok\":0}") "
+"))]
     0))
 
 (defn- run-claim [base :string id :string assignee :string lock :string] :i64
