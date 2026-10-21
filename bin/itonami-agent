@@ -5,10 +5,11 @@
 # `env -S kbb --backend sci` launcher) and are listed in the ledger's
 # flip inventory; when the list empties, the fallback goes away.
 #
-# Guest manifest (offset/arity/grants per guest -- from the amu build):
-#   notepad-cli   28280 0 3,34,35,37,38,39
-#   kanban-cli    (fill from its build)
-#   session-search-cli (fill from its build)
+# Guest manifest (offset/arity/grants per guest -- from the amu build;
+# one offset serves every target of one source build):
+#   notepad-cli        28280 0 3,34,35,37,38,39
+#   kanban-cli         67512 0 3,7,34,35,37,38   (7 = clock for heartbeat)
+#   session-search-cli 62564 0 3,34,35,37,38
 #
 # Env: KEXE_LOADER (the loader binary), KEXE_GUESTS (dir with the .raw
 # guests), ITONAMI_ARCH (aarch64|x86_64, default from uname).
@@ -21,8 +22,8 @@ ARCH=${ITONAMI_ARCH:-$(uname -m | sed 's/arm64/aarch64/;s/x86_64/x86_64/')}
 
 run_guest() {
   raw=$1; offset=$2; grants=$3; shift 3
-  # KEXE_COMMAND: the guest's return value is the process exit code and
-  # the loader prints nothing extra (the CLI's own stdout is the answer).
+  # KEXE_COMMAND: the guest return value is the process exit code and
+  # the loader prints nothing extra (the CLI own stdout is the answer).
   KEXE_COMMAND=1 exec "$LOADER" "$GUESTS/$raw" "$offset" 0 "$ARCH" "$grants" -- "$@"
 }
 
@@ -31,8 +32,7 @@ case "$1" in
     case "$2" in
       notepad)
         shift 2
-        # argv: <base> <verb> [key] [value]  (the guest's own order:
-        # verb base key value -- reordered here)
+        # argv: <base> <verb> [key] [value]  (guest order: verb base key value)
         base=$1; verb=$2; key=$3; value=$4
         run_guest notepad-cli.raw 28280 3,34,35,37,38,39 "$verb" "$base" "$key" "$value"
         ;;
@@ -40,6 +40,19 @@ case "$1" in
         exec "$HERE/itonami-agent-kbb" "$@"
         ;;
     esac
+    ;;
+  kanban)
+    shift
+    # argv: <base> <verb> [a2] [a3] [a4] [a5]  (guest order: verb base ...)
+    base=$1; verb=$2
+    shift 2
+    run_guest kanban-cli.raw 67512 3,7,34,35,37,38 "$verb" "$base" "$@"
+    ;;
+  session-search)
+    shift
+    # argv: <base> <query> [limit] [after] [before] [detail] [sort] [sid] [pbase]
+    base=$1; query=$2; limit=${3:-100}; after=${4:-}; before=${5:-}; detail=${6:-adaptive}; sort=${7:-}; sid=${8:-}; pbase=${9:-}
+    run_guest session-search-cli.raw 62564 3,34,35,37,38 "$base" "$query" "$limit" "$after" "$before" "$detail" "$sort" "$sid" "$pbase"
     ;;
   *)
     exec "$HERE/itonami-agent-kbb" "$@"
