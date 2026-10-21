@@ -12,6 +12,7 @@
   lives in session_search_cli and is verified there)."
   (:require [itonami.tasks :as t]
             [itonami.task-comments :as cm]
+            [itonami.task-attachments :as at]
             [itonami.tasks-state :as ts]
             [itonami.journal-core :as jc])
   (:export [kanban-cli])
@@ -83,6 +84,36 @@
         (let [w (wire-say doc)]
           0)))))
 
+(defn- run-comment [base :string id :string author :string body :string] :i64
+  (let [r (cm/cm-add base id "" author body)]
+    (let [w (wire-say (if (= 1 r) "{\"ok\":1}" "{\"ok\":0}"))]
+      0)))
+
+(defn- run-attach [base :string id :string filename :string ctype :string content :string] :i64
+  (let [r (at/at-add base id filename ctype content)]
+    (let [w (wire-say (if (= 1 r) "{\"ok\":1}" "{\"ok\":0}"))]
+      0)))
+
+(defn- cmt-json [base :string id :string k :i64] :string
+  (let [a (cm/cm-author-at base id k)]
+    (let [b (cm/cm-body-at base id k)]
+      (string-concat (string-concat "{\"author\":\"" a)
+        (string-concat "\",\"body\":\"" (string-concat b "\"}"))))))
+
+(defn- cmts-json [base :string id :string k :i64 n :i64 acc :string] :string
+  (if (>= k n)
+    acc
+    (let [item (cmt-json base id k)]
+      (let [acc2 (if (= 0 (string-length acc)) item (string-concat acc (string-concat "," item)))]
+        (cmts-json base id (+ k 1) n acc2)))))
+
+(defn- run-comments [base :string id :string] :i64
+  (let [n (cm/cm-count base id)]
+    (let [body (if (= 0 n) "" (cmts-json base id 0 n ""))]
+      (let [doc (string-concat "{\"comments\":[" (string-concat body "]}"))]
+        (let [w (wire-say doc)]
+          0)))))
+
 (defn kanban-cli [] :i64
   (let [verb (wire-arg 0) base (wire-arg 1) a2 (wire-arg 2)]
     (if (string=? verb "show")
@@ -91,4 +122,10 @@
         (run-create base a2 (wire-arg 3))
         (if (string=? verb "complete")
           (run-complete base a2)
-          (list-entry base a2))))))
+          (if (string=? verb "comment")
+            (run-comment base a2 (wire-arg 3) (wire-arg 4))
+            (if (string=? verb "attach")
+              (run-attach base a2 (wire-arg 3) (wire-arg 4) (wire-arg 5))
+              (if (string=? verb "comments")
+                (run-comments base a2)
+                (list-entry base a2)))))))))
