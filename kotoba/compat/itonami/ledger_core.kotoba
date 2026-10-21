@@ -7,7 +7,17 @@
   job is the SQLite claim! contract). Self-contained: native-qualified ops
   only."
   (:require [itonami.journal-core :as jc])
-  (:export [row-encode row-encode5 row-status row-field row-handoff failure-type active-ok test-row test-active test-parity]))
+  (:export [row-encode6 row-at row-encode row-encode5 row-status row-field row-handoff failure-type active-ok test-row test-active test-parity]))
+
+(defn row-encode6 [status :i64 source :string error :string outcome :string handoff :i64 at :string] :string
+  ;; six columns: the five measured ones plus the clock text (claimed_at /
+  ;; finished_at ride this column -- the caller reads the clock; old
+  ;; five-column rows answer "" from row-at, fail-closed).
+  (string-concat (row-encode5 status source error outcome handoff)
+                 (string-concat "\n" at)))
+
+(defn row-at [content :string] :string
+  (row-field content 5))
 
 (defn row-encode [status :i64 source :string error :string outcome :string] :string
   (row-encode5 status source error outcome 0))
