@@ -1,0 +1,33 @@
+(ns agent-cli-turn
+  "The turn pipeline as a one-shot kexe guest -- the smallest honest slice
+  of the agent body (trench 2's 逐次面): build the prompt (the notepad
+  section plus the task), ask the model through :llm/generate (wire 11,
+  the pre-started host helper), and write the generation. No node, no
+  kbb, no promesa: straight-line code.
+
+  argv: 0 base / 1 job-id / 2 task. The prompt is the measured
+  render-notepad-section shape (byte-parity header) followed by the task
+  line; the answer is the helper's generation, printed with a trailing
+  newline (println parity)."
+  (:require [itonami.notepad-render :as nr]
+            [itonami.journal-core :as jc])
+  (:export [turn-cli])
+  (:capabilities #{:cli/args :io/write :llm/generate}))
+
+(defn- wire-arg [i :i64] :string
+  (typed-cap-call :cli/args :string :string (string-from-i64 i)))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn- wire-llm [p :string] :string
+  (typed-cap-call :llm/generate :string :string p))
+
+(defn turn-cli [] :i64
+  (let [base (wire-arg 0) job (wire-arg 1) task (wire-arg 2)]
+    (let [notes (nr/render-notes base job)]
+      (let [prompt (string-concat notes (string-concat "task: " task))]
+        (let [answer (wire-llm prompt)]
+          (let [w (wire-say (string-concat answer "
+"))]
+            0))))))
