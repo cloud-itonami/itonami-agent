@@ -1,0 +1,59 @@
+(ns agent-cli-kanban
+  "The kanban-list tool handler guest (the session_search pilot's shape):
+  one-shot kexe, args on wire 38, one JSON document on wire 37.
+
+  argv: 0 base / 1 status filter (decimal, -1 = all). The document:
+
+    {tasks:[{id:t1, status:1}, ...]}
+
+  in creation order (the registry journal is the list order, the delivery
+  queue-journal shape). Task ids are [A-Za-z0-9_-], so no string escaping
+  is needed on this path (pinned here on purpose -- the escaping walk
+  lives in session_search_cli and is verified there)."
+  (:require [itonami.tasks :as t]
+            [itonami.journal-core :as jc])
+  (:export [kanban-cli])
+  (:capabilities #{:cli/args :io/write}))
+
+(defn- wire-arg [i :i64] :string
+  (typed-cap-call :cli/args :string :string (string-from-i64 i)))
+
+(defn- wire-say [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn- item-json [id :string status :i64] :string
+  (let [p1 (string-concat "{\"id\":\"" id)]
+    (let [p2 (string-concat p1 "\",\"status\":")]
+      (string-concat p2 (string-concat (string-from-i64 status) "}")))))
+
+(defn- keep? [st :i64 filter-s :string] :i64
+  ;; the filter travels as decimal text (no parse builtin): -1 or empty
+  ;; keeps everything, otherwise the status must match the text.
+  (if (= 0 (string-length filter-s))
+    1
+    (if (string=? filter-s "-1")
+      1
+      (if (string=? (string-from-i64 st) filter-s) 1 0))))
+
+(defn- walk-json [base :string ids :string i :i64 n :i64 filter-s :string acc :string] :string
+  (if (>= i n)
+    acc
+    (let [id (jc/piece ids "\n" i)]
+      (if (= 0 (string-length id))
+        (walk-json base ids (+ i 1) n filter-s acc)
+        (let [st (t/task-status base id)]
+          (if (= 0 (keep? st filter-s))
+            (walk-json base ids (+ i 1) n filter-s acc)
+            (let [item (item-json id st)]
+              (let [acc2 (if (= 0 (string-length acc)) item (string-concat acc (string-concat "," item)))]
+                (walk-json base ids (+ i 1) n filter-s acc2)))))))))
+
+(defn kanban-cli [] :i64
+  (let [base (wire-arg 0) filter-s (wire-arg 1)]
+    (let [ids (t/task-ids base)]
+      (let [body (if (= 0 (string-length ids))
+                   ""
+                   (walk-json base ids 0 (jc/count-pieces ids "\n") filter-s ""))]
+        (let [doc (string-concat "{\"tasks\":[" (string-concat body "]}"))]
+          (let [w (wire-say doc)]
+            0))))))

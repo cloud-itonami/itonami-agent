@@ -15,7 +15,7 @@
             [itonami.notepad :as np])
   (:export [task-create task-status task-transition task-claim task-done
             task-get-field task-set-block task-clear-block task-set-run
-            task-clear-run task-block-rec])
+            task-clear-run task-block-rec task-ids])
   (:capabilities #{:fs/app-data}))
 
 (defn- wire-exists [path :string] :string
@@ -37,6 +37,29 @@
 (defn- tpath [base :string id :string] :string
   (np/note-path base (string-concat "t" id)))
 
+(defn- wire-append [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "APPEND_SEP" content))))
+
+(defn- rpath [base :string] :string
+  (string-concat base "/registry.tasks"))
+
+(defn- rappend [base :string id :string] :string
+  ;; the creation registry (delivery's queue-journal shape): one id per
+  ;; line, appended when the task file is first written. Task ids are
+  ;; [A-Za-z0-9_-], so lines carry exactly one id.
+  (let [p (rpath base)]
+    (if (= 1 (exists? p))
+      (wire-append p (string-concat id "\n"))
+      (wire-write p (string-concat id "\n")))))
+
+(defn task-ids [base :string] :string
+  ;; the created ids in creation order (the kanban list order).
+  (let [p (rpath base)]
+    (if (= 0 (exists? p))
+      ""
+      (wire-read p))))
+
 (defn task-create [base :string id :string status :i64] :i64
   (if (= 0 (string-length id))
     0
@@ -48,7 +71,8 @@
           (if (= 1 (exists? p))
             0
             (let [w (wire-write p (ts/row-encode status "" "" "" ""))]
-              1)))))))
+              (let [r (rappend base id)]
+                1))))))))
 
 (defn task-status [base :string id :string] :i64
   (let [p (tpath base id)]
