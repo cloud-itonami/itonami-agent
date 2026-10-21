@@ -16,6 +16,7 @@
   `dispatch` is (fn [tool-name args-map] result-string) — the run's own tool
   handlers, so an in-script call is indistinguishable from the agent's."
   (:require [clojure.string :as str]
+            [promesa.core :as p]
             [itonami.agent.host :as h]
             ["node:crypto" :as crypto]
             ["node:fs" :as fs]))
@@ -174,10 +175,49 @@
 (defn- duration-seconds [call-start]
   (/ (js/Math.round (* 100 (/ (- (h/now-ms) call-start) 1000))) 100))
 
+(defn- thenable? [x]
+  (and (some? x) (fn? (.-then x))))
+
+(defn- message-text [e]
+  (let [m (.-message e)] (if (string? m) m (str e))))
+
+(defn- finish-call!
+  "The `_handle_rpc_request` tail after dispatch: coerce the result to its
+  response string, consume budget, and log it (with the bounded error when the
+  result carries one)."
+  [state tool-name args result call-start]
+  (let [result (try
+                 (if (string? result) result (h/json-str result))
+                 (catch :default e (tool-error (message-text e))))
+        error (result-error result)
+        entry (cond-> {"tool" tool-name
+                       "args_preview" (args-preview args)
+                       "duration" (duration-seconds call-start)}
+                (seq error) (assoc "error" error))]
+    (swap! (:counter state) inc)
+    (swap! (:log state) conj entry)
+    result))
+
+(defn- dispatch-call!
+  "Run one allowed, budgeted call. `dispatch` answers with the result string
+  directly or with a promise of it (Kotoba's tool handlers are async); the
+  response is finished only once the value is in hand. A thrown or rejected
+  dispatch surfaces `tool_error(str(exc))` and still counts, as in Hermes."
+  [state tool-name args call-start]
+  (try
+    (let [r ((:dispatch state) tool-name args)]
+      (if (thenable? r)
+        (p/then (p/catch r (fn [e] (tool-error (message-text e))))
+                (fn [v] (finish-call! state tool-name args v call-start)))
+        (finish-call! state tool-name args r call-start)))
+    (catch :default e
+      (finish-call! state tool-name args (tool-error (message-text e)) call-start))))
+
 (defn handle-request
   "code_execution_rpc/_handle_rpc_request: enforce allow-list + budget, then
   dispatch one authenticated request. Only a dispatched call consumes budget
-  and is logged; refusals are free. Returns the response string."
+  and is logged; refusals are free. Returns the response string, or a promise
+  of it when `dispatch` answers asynchronously."
   [state request]
   (let [tool-name (get request "tool" "")
         tool-args (get request "args" {})
@@ -195,21 +235,8 @@
       (let [args (if (= tool-name "terminal")
                    (into {} (remove (fn [[k _]] (contains? terminal-blocked-params k))
                                     (if (map? tool-args) tool-args {})))
-                   tool-args)
-            result (try
-                     (let [r ((:dispatch state) tool-name args)]
-                       (if (string? r) r (h/json-str r)))
-                     (catch :default e
-                       (tool-error (let [m (.-message e)]
-                                     (if (string? m) m (str e))))))
-            error (result-error result)
-            entry (cond-> {"tool" tool-name
-                           "args_preview" (args-preview args)
-                           "duration" (duration-seconds call-start)}
-                    (seq error) (assoc "error" error))]
-        (swap! (:counter state) inc)
-        (swap! (:log state) conj entry)
-        result))))
+                   tool-args)]
+        (dispatch-call! state tool-name args call-start)))))
 
 ;; ---- file transport (code_execution_rpc/_rpc_poll_loop) -------------------
 
@@ -264,4 +291,35 @@
   [state]
   (reduce (fn [answered f] (+ answered (serve-one! state f)))
           0
+          (sort (filter req-file? (h/ls (:rpc-dir state))))))
+
+(defn- serve-one-async!
+  "`serve-one!` for a possibly async dispatch: the answer is written once the
+  dispatched result is in hand. Returns a promise of 1 (answered) or 0
+  (removed unanswered)."
+  [state f]
+  (let [path (h/join (:rpc-dir state) f)
+        done (fn [] (h/rm path) 0)]
+    (if-let [request (try
+                       (let [parsed (h/json-parse (h/slurp path))]
+                         (when (map? parsed) parsed))
+                       (catch :default _ nil))]
+      (cond
+        (not (token-ok? request (:rpc-token state))) (done)
+        (not (int-seq? (get request "seq"))) (done)
+        :else (let [res-path (h/join (:rpc-dir state) (res-name (get request "seq")))]
+                (-> (let [r (handle-request state request)]
+                      (if (thenable? r) r (p/resolved r)))
+                    (p/then (fn [resp] (write-res-atomic! res-path resp) (h/rm path) 1))
+                    (p/catch (fn [_] (h/rm path) 0)))))
+      (done))))
+
+(defn serve-tick-async!
+  "One `_rpc_poll_loop` pass like `serve-tick!`, awaiting a promise-returning
+  `dispatch` before each answer — requests are answered strictly in order, as
+  the single polling thread does. Returns a promise of the answered count."
+  [state]
+  (reduce (fn [acc f]
+            (p/then acc (fn [n] (p/then (serve-one-async! state f) (fn [m] (+ n m))))))
+          (p/resolved 0)
           (sort (filter req-file? (h/ls (:rpc-dir state))))))

@@ -1,0 +1,90 @@
+(ns itonami.agent.execute-code-rpc-test
+  "execute_code exposing Hermes' in-script `hermes_tools` RPC over the file
+  transport: the generated stub, the req/res request pipeline answered by this
+  run's own tool handlers, and the `tool_calls_made` / `tool_errors` result
+  contract (tools/code_execution_tool.py + tools/code_execution_rpc.py)."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.tools :as tools]
+            [itonami.agent.code-rpc :as code-rpc]))
+
+;; ---- async dispatch (Kotoba's tool handlers answer with promises) --------
+
+(deftest handle-request-awaits-async-dispatch
+  (async done
+    (let [st (code-rpc/make-state
+              {:rpc-dir "unused" :rpc-token "tok"
+               :dispatch (fn [name _] (p/resolved (h/json-str {"tool" name})))})
+          r (code-rpc/handle-request st {"tool" "read_file" "args" {"path" "a"}})]
+      (is (fn? (.-then r)))
+      (-> r
+          (p/then (fn [resp]
+                    (is (= {"tool" "read_file"} (h/json-parse resp)))
+                    (is (= 1 @(:counter st)))
+                    (is (= "read_file" (get (first @(:log st)) "tool")))
+                    (is (nil? (get (first @(:log st)) "error")))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest handle-request-async-rejection-surfaces-tool-error
+  (async done
+    (let [st (code-rpc/make-state
+              {:rpc-dir "unused" :rpc-token "tok"
+               :dispatch (fn [_ _] (js/Promise.reject (js/Error. "boom")))})
+          r (code-rpc/handle-request st {"tool" "write_file" "args" {}})]
+      (-> r
+          (p/then (fn [resp]
+                    (is (str/includes? resp "boom"))
+                    (is (= 1 @(:counter st)))
+                    (is (= "boom" (get (first @(:log st)) "error")))
+                    (done)))
+          (p/catch (fn [e] (is (nil? e) (str e)) (done)))))))
+
+(deftest serve-tick-async-answers-every-request
+  (async done
+    (let [dir (h/mkdirs (h/join (h/tmp-dir) (str "serve-async-" (h/random-hex 6))))
+          st (code-rpc/make-state
+              {:rpc-dir dir :rpc-token "tok"
+               :dispatch (fn [name args]
+                           (p/resolved (h/json-str {"tool" name "got" (get args "n")})))})]
+      (h/spit (h/join dir "req_000002") (h/json-str {"tool" "read_file" "args" {"n" 2} "seq" 2 "token" "tok"}))
+      (h/spit (h/join dir "req_000001") (h/json-str {"tool" "read_file" "args" {"n" 1} "seq" 1 "token" "tok"}))
+      (-> (code-rpc/serve-tick-async! st)
+          (p/then (fn [n]
+                    (is (= 2 n))
+                    (is (= {"tool" "read_file" "got" 1}
+                           (h/json-parse (h/slurp (h/join dir "res_000001")))))
+                    (is (= {"tool" "read_file" "got" 2}
+                           (h/json-parse (h/slurp (h/join dir "res_000002")))))
+                    (is (= ["res_000001" "res_000002"] (h/ls dir)))
+                    (h/rm dir)
+                    (done)))
+          (p/catch (fn [e] (h/rm dir) (is (nil? e) (str e)) (done)))))))
+
+(deftest execute-code-serves-hermes-tools-rpc
+  (async done
+    (let [dir (h/mkdirs (h/join (h/tmp-dir) (str "exec-rpc-" (h/random-hex 6))))
+          ctx {:cwd dir :home dir}
+          code "from hermes_tools import read_file, write_file, terminal
+write_file('out.txt', 'hello')
+print('T', terminal('echo hi'))
+print('R', read_file('out.txt'))
+read_file('no/such/file.txt')
+print('DONE')
+"]
+      (-> (tools/execute-code ctx {"code" code})
+          (p/then (fn [r]
+                    (let [d (h/json-parse r)
+                          output (get d "output")]
+                      (is (str/includes? output "hello"))
+                      (is (str/includes? output "DONE"))
+                      (is (= 0 (get d "exit_code")))
+                      (is (true? (get d "tool_rpc")))
+                      (is (= 4 (get d "tool_calls_made")))
+                      (is (= 1 (count (get d "tool_errors"))))
+                      (is (= "read_file" (get (first (get d "tool_errors")) "tool"))))
+                    (h/rm dir)
+                    (done)))
+          (p/catch (fn [e] (h/rm dir) (is (nil? e) (str e)) (done)))))))
