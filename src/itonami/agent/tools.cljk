@@ -17,6 +17,7 @@
             [itonami.agent.confine :as confine]
             [itonami.agent.webguard :as webguard]
             [itonami.agent.process :as process]
+            [itonami.agent.code-rpc :as code-rpc]
             [itonami.agent.homeassistant :as homeassistant]
             [itonami.agent.profile :as profile]
             [itonami.agent.provider :as provider]
@@ -229,8 +230,8 @@
                "content" {"type" "string"} "old_text" {"type" "string"} "new_text" {"type" "string"}}
               ["action"])
    "execute_code"
-   (fn-schema "execute_code" "Run one Python script through this profile's OS confinement. This Kotoba implementation is stateless and does not provide Hermes tool RPC inside the script; use the normal Kotoba tools for tool calls."
-              {"code" {"type" "string" "description" "Python source to execute on stdin."}
+   (fn-schema "execute_code" "Run Python that calls Hermes tools programmatically. Use when you need 3+ tool calls with logic between them: filtering/reducing large outputs before they enter context, branching, or loops (N pages/files, retry on failure). Use normal tool calls for single calls, results you must reason over in full, or anything needing user interaction. Calls run one confined, stateless script per call (no persistent kernel): variables, imports, and loaded data do not survive across calls; a timed-out call loses its state. Available via `from hermes_tools import ...`: web_search, web_extract, read_file, write_file, search_files, patch, terminal (foreground only). Limits: timeout parameter (default 300 s), max 50 tool calls per call. Helpers require imports: `from hermes_tools import json_parse, shell_quote, retry`. json_parse(text) - tolerant json.loads for terminal() output; shell_quote(s) - shlex.quote for dynamic shell args; retry(fn, max_attempts=3, delay=2) - exponential backoff."
+             {"code" {"type" "string" "description" "Python code to execute. Import tools with `from hermes_tools import ...` and print your final result to stdout."}
                "timeout" {"type" "integer" "minimum" 1 "maximum" 300 "description" "Maximum runtime in seconds (default 300)."}}
               ["code"])
    "session_search"
@@ -2831,10 +2832,15 @@
               (err (str "kanban_comment: " (.-message e))))
             (finally (.close db))))))))
 
+(declare call)
+
 (defn execute-code
-  "Run one Python source string on stdin under the same OS confinement,
-  sanitized environment, and write-root policy as terminal. Hermes' persistent
-  kernel and in-script `hermes_tools` RPC are not emulated here."
+  "Run one Python source string under the same OS confinement, sanitized
+  environment, and write-root policy as terminal. Hermes' in-script
+  `hermes_tools` RPC is served over the file transport (code_rpc): the
+  generated hermes_tools.py stub is staged next to the script and each
+  in-script call is dispatched through this run's own tool handlers. Hermes'
+  persistent kernel is not emulated - one stateless script per call."
   [ctx {:strs [code timeout]}]
   (cond
     (not (and (string? code) (not (str/blank? code))))
@@ -2844,30 +2850,67 @@
     (err (str "execute_code refused: workdir outside this run's roots: " (:cwd ctx)))
 
     :else
-    (let [pol (policy ctx)
-          c (confine/command pol {:argv ["python3" "-"]
-                                  :write-roots (or (:roots ctx) [(:cwd ctx)])
+    (let [sandbox (h/mkdirs (h/join (h/tmp-dir) (str "hermes_exec_" (h/random-hex 6))))
+          rpc-dir (h/mkdirs (h/join sandbox "rpc"))
+          token (.toString (crypto/randomBytes 32) "base64url")
+          pol (policy ctx)
+          c (confine/command pol {:argv ["python3" (h/join sandbox "script.py")]
+                                  :write-roots (into (vec (or (:roots ctx) [(:cwd ctx)])) [sandbox])
                                   :read-roots (read-roots ctx)
                                   :tool-env (:tool-env ctx)
                                   :home (host-home ctx)
                                   :backend (backend ctx)})]
       (if-let [why (:refused c)]
-        (err (str "execute_code refused: " why))
+        (do (h/rm sandbox)
+            (err (str "execute_code refused: " why)))
         (let [timeout-s (if (number? timeout) (max 1 (min 300 timeout)) 300)
-              r (try (h/run-process (:argv c) {:cwd (:cwd ctx) :exact-env? true :env (:env c)
-                                               :input code :timeout-ms (* 1000 timeout-s)})
-                     (finally (when (:tmpdir c) (h/rm (:tmpdir c)))))
-              output (str (:stdout r) (when-not (str/blank? (:stderr r))
-                                        (str "\n[stderr]\n" (:stderr r))))]
-          (confine/audit! {:tool "execute_code" :profile (:profile ctx) :peer? (:peer? pol)
-                           :sandbox (:sandbox c) :cmd "python3 -" :exit (:exit r)
-                           :stderr (:stderr r) :timed-out? (:timed-out? r)})
-          (ok {"output" (clip output 50000)
-               "exit_code" (:exit r)
-               "sandbox" (name (:sandbox c))
-               "error" (when (:timed-out? r) "timeout")
-               "persistent" false
-               "tool_rpc" false}))))))
+              st (code-rpc/make-state
+                  {:rpc-dir rpc-dir :rpc-token token
+                   :allowed-tools (code-rpc/sandbox-tools-for (:run-tools ctx))
+                   :max-tool-calls code-rpc/default-max-tool-calls
+                   :dispatch (fn [tool-name args]
+                               (p/then (call ctx code-rpc/sandbox-allowed-tools tool-name args)
+                                       (fn [r]
+                                         (cond
+                                           (string? r) r
+                                           (and (map? r) (contains? r "$kotoba_tool_text"))
+                                           (get r "$kotoba_tool_text")
+                                           :else (h/json-str r)))))})
+              env (merge (:env c) {"HERMES_RPC_DIR" rpc-dir
+                                   "HERMES_RPC_TOKEN" token
+                                   "PYTHONDONTWRITEBYTECODE" "1"})
+              stopped? (atom false)]
+          (h/spit (h/join sandbox "script.py") code)
+          (h/spit (h/join sandbox "hermes_tools.py") (code-rpc/generate-hermes-tools (:run-tools ctx)))
+          (fs/chmodSync (h/join sandbox "script.py") 384)
+          (fs/chmodSync (h/join sandbox "hermes_tools.py") 384)
+          (fs/chmodSync rpc-dir 448)
+          (letfn [(tick! []
+                    (-> (code-rpc/serve-tick-async! st)
+                        (p/then (fn [_] (when-not @stopped? (js/setTimeout tick! 100))))
+                        (p/catch (fn [_] (when-not @stopped? (js/setTimeout tick! 100))))))]
+            (tick!)
+            (-> (h/run-process-async (:argv c) {:cwd (:cwd ctx) :exact-env? true :env env
+                                                :timeout-ms (* 1000 timeout-s)})
+                (p/then
+                 (fn [r]
+                   (reset! stopped? true)
+                   (let [output (str (:stdout r) (when-not (str/blank? (:stderr r))
+                                                   (str "\n[stderr]\n" (:stderr r))))
+                         tool-errors (code-rpc/tool-errors-since @(:log st) 0)]
+                     (confine/audit! {:tool "execute_code" :profile (:profile ctx) :peer? (:peer? pol)
+                                      :sandbox (:sandbox c) :cmd "python3 script.py" :exit (:exit r)
+                                      :stderr (:stderr r) :timed-out? (:timed-out? r)})
+                     (h/rm sandbox)
+                     (when (:tmpdir c) (h/rm (:tmpdir c)))
+                     (ok (cond-> {"output" (clip output 50000)
+                                  "exit_code" (:exit r)
+                                  "sandbox" (name (:sandbox c))
+                                  "error" (when (:timed-out? r) "timeout")
+                                  "persistent" false
+                                  "tool_rpc" true
+                                  "tool_calls_made" @(:counter st)}
+                           (seq tool-errors) (assoc "tool_errors" tool-errors)))))))))))))
 
 (defn- vault-filled? [r]
   (true? (get-in (h/json-parse r) ["result" "result" "value"])))
@@ -2995,7 +3038,7 @@
       (= args ::bad) (p/resolved (err (str "invalid JSON arguments for " name)))
       (not (some #{name} allowed)) (p/resolved (err (str "tool not available in this run: " name)))
       :else (if-let [f (or (get impls name) (get (:tool-overrides ctx) name))]
-              (-> (p/do (f ctx args))
+              (-> (p/do (f (assoc ctx :run-tools allowed) args))
                   (p/catch (fn [e] (err (str name ": " (.-message e))))))
               (p/resolved (err (str "tool executor not configured for " name)))))))
 

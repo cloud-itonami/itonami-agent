@@ -222,6 +222,35 @@
      :stderr (str (or (.-stderr r) "") (when err (str (.-message err))))
      :timed-out? (boolean (and err (= "ETIMEDOUT" (.-code err))))}))
 
+(defn run-process-async
+  "run-process without blocking the event loop, so a companion loop (the
+  execute_code hermes_tools RPC) can serve while the child runs. `:input` is
+  written to stdin and closed. Kills the child at :timeout-ms. Returns a
+  promise of {:exit :stdout :stderr :timed-out?}."
+  [cmd {:keys [cwd timeout-ms env exact-env? input]}]
+  (js/Promise.
+   (fn [resolve _]
+     (let [child (cp/spawn (first cmd) (clj->js (rest cmd))
+                           (clj->js (cond-> {:env (if exact-env? env (merge (process-env) env))}
+                                      cwd (assoc :cwd cwd))))
+           out (atom "")
+           err (atom "")
+           timed? (atom false)
+           timer (when timeout-ms
+                   (js/setTimeout (fn [] (reset! timed? true) (.kill child "SIGKILL"))
+                                  timeout-ms))
+           finish (fn [code e]
+                    (when timer (js/clearTimeout timer))
+                    (resolve {:exit (if (or @timed? e) -1 code)
+                              :stdout @out
+                              :stderr (str @err (when e (.-message e)))
+                              :timed-out? @timed?}))]
+       (.on (.-stdout child) "data" (fn [d] (swap! out str (str d))))
+       (.on (.-stderr child) "data" (fn [d] (swap! err str (str d))))
+       (.on child "error" (fn [e] (finish nil e)))
+       (.on child "close" (fn [code] (finish code nil)))
+       (if input (.end (.-stdin child) input) (.end (.-stdin child)))))))
+
 (defn json-parse [s] (js->clj (js/JSON.parse s)))
 (defn json-str
   ([x] (js/JSON.stringify (clj->js x)))
