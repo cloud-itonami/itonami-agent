@@ -21,7 +21,7 @@
   (:require [itonami.messages :as m]
             [itonami.tasks-state :as ts]
             [itonami.journal-core :as jc])
-  (:export [ss-set-parent ss-parent ss-root ss-search ss-search-bounded])
+  (:export [ss-set-parent ss-parent ss-root ss-search ss-search-bounded ss-search-sorted])
   (:capabilities #{:fs/browse :fs/app-data}))
 
 (defn- wire-exists [path :string] :string
@@ -95,17 +95,20 @@
       0
       1)))
 
-(defn- hit-line [session :string k :i64 role :string content :string] :string
+(defn- hit-line [session :string k :i64 role :string at :string content :string] :string
+  ;; fields: session / index / role / at / content (content last -- a
+  ;; content carrying a tab breaks the field walk, the same shape limit
+  ;; the earlier lines had).
   (string-concat session
     (string-concat "	" (string-concat (string-from-i64 k)
-      (string-concat "	" (string-concat role (string-concat "	" content)))))))
+      (string-concat "	" (string-concat role (string-concat "	" (string-concat at (string-concat "	" content)))))))))
 
 (defn- msg-scan [base :string session :string query :string after :string before :string k :i64 n :i64 left :i64 acc :string] :string
   (if (or (>= k n) (= 0 left))
     acc
     (let [c (m/msg-content-at base session k)]
       (if (and (>= (string-index-of c query) 0) (= 1 (in-bounds? (m/msg-at base session k) after before)))
-        (let [line (hit-line session k (m/msg-role-at base session k) c)
+        (let [line (hit-line session k (m/msg-role-at base session k) (m/msg-at base session k) c)
               acc2 (if (= 0 (string-length acc)) line (string-concat acc (string-concat "
 " line)))]
           (msg-scan base session query after before (+ k 1) n (- left 1) acc2))
@@ -146,6 +149,62 @@
       ""
       (sess-scan base listing query after before 0 (jc/count-pieces listing "
 ") limit ""))))
+
+(defn- line-at [line :string] :string
+  (jc/piece line "	" 3))
+
+(defn- append-line [acc :string line :string] :string
+  (if (= 0 (string-length acc)) line (string-concat acc (string-concat "
+" line))))
+
+(defn- find-pos [acc :string a :string n :i64 i :i64 desc :i64] :i64
+  ;; the first line index whose order breaks (asc: a <= b; desc: a >= b).
+  (if (>= i n)
+    n
+    (let [b (line-at (jc/piece acc "
+" i))]
+      (if (= 1 (if (= 1 desc) (dec-le b a) (dec-le a b)))
+        i
+        (find-pos acc a n (+ i 1) desc)))))
+
+(defn- rebuild [acc :string line :string pos :i64 i :i64 n :i64 out :string] :string
+  ;; acc with line inserted before line index pos (indices, not chars).
+  (if (>= i n)
+    (if (>= pos n) (append-line out line) out)
+    (let [cur (jc/piece acc "
+" i)]
+      (let [out1 (if (= i pos) (append-line out line) out)]
+        (let [out2 (append-line out1 cur)]
+          (rebuild acc line pos (+ i 1) n out2))))))
+
+(defn- insert-line [acc :string line :string desc :i64] :string
+  (if (= 0 (string-length acc))
+    line
+    (let [n (jc/count-pieces acc "
+")]
+      (rebuild acc line (find-pos acc (line-at line) n 0 desc) 0 n ""))))
+
+(defn- sort-pass [hits :string n :i64 i :i64 desc :i64 acc :string] :string
+  (if (>= i n)
+    acc
+    (let [line (jc/piece hits "
+" i)]
+      (sort-pass hits n (+ i 1) desc (insert-line acc line desc)))))
+
+(defn ss-search-sorted [base :string query :string limit :i64 after :string before :string sort :string] :string
+  ;; sort: 'oldest' ascending by the message clock text, 'newest'
+  ;; descending (the cljk semantics: only these two count), anything else
+  ;; keeps the store order (rank-only).
+  (let [hits (ss-search-bounded base query limit after before)]
+    (if (or (= 0 (string-length hits)) (= 0 (string-length sort)))
+      hits
+      (if (string=? sort "oldest")
+        (sort-pass hits (jc/count-pieces hits "
+") 0 0 "")
+        (if (string=? sort "newest")
+          (sort-pass hits (jc/count-pieces hits "
+") 0 1 "")
+          hits)))))
 
 (defn ss-search [base :string query :string limit :i64] :string
   (ss-search-bounded base query limit "" ""))

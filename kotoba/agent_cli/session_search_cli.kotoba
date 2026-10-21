@@ -54,12 +54,14 @@
   (let [session (jc/piece line "\t" 0)]
     (let [index (jc/piece line "\t" 1)]
       (let [role (jc/piece line "\t" 2)]
-        (let [content (if (= 1 hydrate) (jc/piece line "\t" 3) (snippet (jc/piece line "\t" 3)))]
+        (let [at (jc/piece line "\t" 3)]
+          (let [content (if (= 1 hydrate) (jc/piece line "\t" 4) (snippet (jc/piece line "\t" 4)))]
           (let [p1 (string-concat "{\"session\":" (json-str session))]
             (let [p2 (string-concat p1 (string-concat ",\"index\":" index))]
               (let [p3 (string-concat p2 (string-concat ",\"role\":" (json-str role)))]
-                (let [p4 (string-concat p3 (string-concat ",\"content\":" (json-str content)))]
-                  (string-concat p4 "}"))))))))))
+                (let [p4 (string-concat p3 (string-concat ",\"at\":" at))]
+                  (let [p5 (string-concat p4 (string-concat ",\"content\":" (json-str content)))]
+                    (string-concat p5 "}"))))))))))))
 
 (defn- hits-json [hits :string i :i64 n :i64 detail :string acc :string] :string
   (if (>= i n)
