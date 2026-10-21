@@ -15,6 +15,7 @@
             [itonami.task-attachments :as at]
             [itonami.links :as lk]
             [itonami.tasks-events :as te]
+            [itonami.task-heartbeat :as th]
             [itonami.tasks-state :as ts]
             [itonami.journal-core :as jc])
   (:export [kanban-cli])
@@ -56,13 +57,16 @@
 (defn- run-show [base :string id :string] :i64
   (let [st (t/task-status base id)]
     (let [n (cm/cm-count base id)]
-      (let [d1 (string-concat "{\"id\":\"" id)]
-        (let [d2 (string-concat d1 "\",\"status\":")]
-          (let [d3 (string-concat d2 (string-from-i64 st))]
-            (let [d4 (string-concat d3 ",\"comments\":")]
-              (let [d5 (string-concat d4 (string-from-i64 n))]
-                (let [w (wire-say (string-concat d5 "}"))]
-                  0)))))))))
+      (let [hb (th/hb-get base id)]
+        (let [d1 (string-concat "{\"id\":\"" id)]
+          (let [d2 (string-concat d1 "\",\"status\":")]
+            (let [d3 (string-concat d2 (string-from-i64 st))]
+              (let [d4 (string-concat d3 ",\"comments\":")]
+                (let [d5 (string-concat d4 (string-from-i64 n))]
+                  (let [d6 (string-concat d5 ",\"heartbeat\":")]
+                    (let [d7 (string-concat d6 (if (= 0 (string-length hb)) "0" hb))]
+                      (let [w (wire-say (string-concat d7 "}"))]
+                        0))))))))))))
 
 (defn- run-create [base :string id :string status-s :string] :i64
   (let [r (t/task-create base id (ts/status-code status-s))]
@@ -187,6 +191,9 @@
         (let [w (wire-say (string-concat "{\"ok\":" (string-concat flipped "}")))]
           0)))))
 
+(defn- run-heartbeat [base :string id :string] :i64
+  (ok1 (th/hb-set base id)))
+
 (defn kanban-cli [] :i64
   (let [verb (wire-arg 0) base (wire-arg 1) a2 (wire-arg 2)]
     (if (string=? verb "show")
@@ -215,4 +222,6 @@
                         (run-link base a2 (wire-arg 3))
                         (if (string=? verb "recompute")
                           (run-recompute base)
-                          (list-entry base a2))))))))))))))))
+                          (if (string=? verb "heartbeat")
+                            (run-heartbeat base a2)
+                            (list-entry base a2)))))))))))))))))
