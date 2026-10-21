@@ -12,7 +12,7 @@
   (:require [itonami.tasks-core :as tc]
             [itonami.tasks-state :as ts]
             [itonami.notepad :as np])
-  (:export [session-create msg-append msg-count msg-role-at msg-content-at
+  (:export [session-create msg-append msg-append-at msg-count msg-role-at msg-content-at msg-at
             session-title])
   (:capabilities #{:fs/app-data}))
 
@@ -68,6 +68,22 @@
             1)
           (let [w (wire-write p e)]
             1))))))
+
+(defn msg-append-at [base :string session :string role :string content :string at :string] :i64
+  ;; the message carrying the caller's clock text in the entry's run slot
+  ;; (the isolation rule: the clock effect stays out of this module).
+  (if (= 0 (string-length session))
+    0
+    (let [p (mpath base session)]
+      (let [e (tc/event-encode at role content)]
+        (if (= 1 (exists? p))
+          (let [a (wire-append p e)]
+            1)
+          (let [w (wire-write p e)]
+            1))))))
+
+(defn msg-at [base :string session :string k :i64] :string
+  (tc/event-run (entry-of base session k)))
 
 (defn- walk-at [content :string i :i64 k :i64 n :i64] :string
   (if (>= i (string-length content))

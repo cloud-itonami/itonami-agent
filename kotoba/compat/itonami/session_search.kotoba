@@ -21,7 +21,7 @@
   (:require [itonami.messages :as m]
             [itonami.tasks-state :as ts]
             [itonami.journal-core :as jc])
-  (:export [ss-set-parent ss-parent ss-root ss-search])
+  (:export [ss-set-parent ss-parent ss-root ss-search ss-search-bounded])
   (:capabilities #{:fs/browse :fs/app-data}))
 
 (defn- wire-exists [path :string] :string
@@ -72,21 +72,44 @@
 (defn- count-lines [s :string] :i64
   (if (= 0 (string-length s)) 0 (jc/count-pieces s "\n")))
 
+(defn- dec-le [a :string b :string] :i64
+  ;; decimal compare for non-negative integers without leading zeros (the
+  ;; clock millis text): shorter is smaller, equal length compares
+  ;; lexicographically.
+  (if (= 0 (string-length a))
+    1
+    (if (= 0 (string-length b))
+      1
+      (let [la (string-length a)]
+        (let [lb (string-length b)]
+          (if (< la lb)
+            1
+            (if (> la lb)
+              0
+              (if (<= (string-compare a b) 0) 1 0))))))))
+
+(defn- in-bounds? [at :string after :string before :string] :i64
+  (if (= 0 (dec-le after at))
+    0
+    (if (= 0 (dec-le at before))
+      0
+      1)))
+
 (defn- hit-line [session :string k :i64 role :string content :string] :string
   (string-concat session
     (string-concat "	" (string-concat (string-from-i64 k)
       (string-concat "	" (string-concat role (string-concat "	" content)))))))
 
-(defn- msg-scan [base :string session :string query :string k :i64 n :i64 left :i64 acc :string] :string
+(defn- msg-scan [base :string session :string query :string after :string before :string k :i64 n :i64 left :i64 acc :string] :string
   (if (or (>= k n) (= 0 left))
     acc
     (let [c (m/msg-content-at base session k)]
-      (if (>= (string-index-of c query) 0)
+      (if (and (>= (string-index-of c query) 0) (= 1 (in-bounds? (m/msg-at base session k) after before)))
         (let [line (hit-line session k (m/msg-role-at base session k) c)
               acc2 (if (= 0 (string-length acc)) line (string-concat acc (string-concat "
 " line)))]
-          (msg-scan base session query (+ k 1) n (- left 1) acc2))
-        (msg-scan base session query (+ k 1) n left acc)))))
+          (msg-scan base session query after before (+ k 1) n (- left 1) acc2))
+        (msg-scan base session query after before (+ k 1) n left acc)))))
 
 (defn- stored-session [base :string name :string] :string
   ;; a session state file carries its session name in row slot 2; the
@@ -99,25 +122,30 @@
       (let [content (wire-read (string-concat base (string-concat "/" name)))]
         (ts/row-field content 2)))))
 
-(defn- sess-scan [base :string listing :string query :string i :i64 ns :i64 left :i64 acc :string] :string
+(defn- sess-scan [base :string listing :string query :string after :string before :string i :i64 ns :i64 left :i64 acc :string] :string
   (if (or (>= i ns) (= 0 left))
     acc
     (let [line (jc/piece listing "
 " i)]
       (let [s (stored-session base (entry-name line))]
         (if (= 0 (string-length s))
-          (sess-scan base listing query (+ i 1) ns left acc)
-          (let [hits (msg-scan base s query 0 (m/msg-count base s) left "")]
+          (sess-scan base listing query after before (+ i 1) ns left acc)
+          (let [hits (msg-scan base s query after before 0 (m/msg-count base s) left "")]
             (let [left2 (- left (count-lines hits))]
               (let [acc2 (if (= 0 (string-length hits))
                            acc
                            (if (= 0 (string-length acc)) hits (string-concat acc (string-concat "
 " hits))))]
-                (sess-scan base listing query (+ i 1) ns left2 acc2)))))))))
+                (sess-scan base listing query after before (+ i 1) ns left2 acc2)))))))))
 
-(defn ss-search [base :string query :string limit :i64] :string
+(defn ss-search-bounded [base :string query :string limit :i64 after :string before :string] :string
+  ;; the bounds are clock millis text (the handler parses ISO and passes
+  ;; millis); empty sides are open. Decimal compare -- no parse builtin.
   (let [listing (wire-browse base)]
     (if (= 0 (string-length listing))
       ""
-      (sess-scan base listing query 0 (jc/count-pieces listing "
+      (sess-scan base listing query after before 0 (jc/count-pieces listing "
 ") limit ""))))
+
+(defn ss-search [base :string query :string limit :i64] :string
+  (ss-search-bounded base query limit "" ""))
