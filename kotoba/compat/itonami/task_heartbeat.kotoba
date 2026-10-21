@@ -1,0 +1,50 @@
+(ns itonami.task-heartbeat
+  "The kanban heartbeat store (the clock slice): one sidecar file per task
+  holding the wall-clock millis of the last heartbeat, written from the
+  guest clock (wire 7, :clock/now -- request text 'wall' answers unix
+  millis as decimal text). This is the surface kanban-heartbeat updates.
+
+  The clock lives in its own module on purpose: the :clock/now effect is
+  isolated here, so closures that never beat do not need the grant (the
+  policy must cover every effect in the require graph).
+
+  Shape rule measured earlier: typed-cap-call only in a typed defn's return
+  position."
+  (:require [itonami.notepad :as np])
+  (:export [hb-set hb-get])
+  (:capabilities #{:fs/app-data :clock/now}))
+
+(defn- wire-now [] :string
+  (typed-cap-call :clock/now :string :string "wall"))
+
+(defn- wire-exists [path :string] :string
+  (typed-cap-call :fs/app-data :string :string (string-concat path "EXISTS_SEP")))
+
+(defn- wire-read [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn- wire-write [path :string content :string] :string
+  (typed-cap-call :fs/app-data :string :string
+                  (string-concat path (string-concat "WRITE_SEP" content))))
+
+(defn- exists? [path :string] :i64
+  (let [a (wire-exists path)]
+    (if (= 0 (string-length a))
+      0
+      (if (= 49 (string-code-point-at a 0)) 1 0))))
+
+(defn- hbpath [base :string id :string] :string
+  (string-concat (np/note-path base (string-concat "t" id)) ".hb"))
+
+(defn hb-set [base :string id :string] :i64
+  (let [now (wire-now)]
+    (if (= 0 (string-length now))
+      0
+      (let [w (wire-write (hbpath base id) now)]
+        1))))
+
+(defn hb-get [base :string id :string] :string
+  (let [p (hbpath base id)]
+    (if (= 0 (exists? p))
+      ""
+      (wire-read p))))
