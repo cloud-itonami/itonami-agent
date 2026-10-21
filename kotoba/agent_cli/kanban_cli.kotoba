@@ -114,6 +114,27 @@
         (let [w (wire-say doc)]
           0)))))
 
+(defn- ok1 [r :i64] :i64
+  (let [w (wire-say (if (= 1 r) "{\"ok\":1}" "{\"ok\":0}"))]
+    0))
+
+(defn- run-claim [base :string id :string assignee :string lock :string] :i64
+  (ok1 (t/task-claim base id assignee lock)))
+
+(defn- run-block [base :string id :string kind :string] :i64
+  ;; the measured UPDATE needs the task already at status blocked (4)
+  ;; with no block and no run -- the verb walks the status there first,
+  ;; then records the kind (the tools' two-step shape).
+  (let [st (t/task-status base id)]
+    (let [t1 (if (= st 4) 1 (t/task-transition base id st 4))]
+      (ok1 (t/task-set-block base id kind)))))
+
+(defn- run-unblock [base :string id :string] :i64
+  (ok1 (t/task-clear-block base id)))
+
+(defn- run-finish [base :string id :string result :string] :i64
+  (ok1 (t/task-done base id result)))
+
 (defn kanban-cli [] :i64
   (let [verb (wire-arg 0) base (wire-arg 1) a2 (wire-arg 2)]
     (if (string=? verb "show")
@@ -128,4 +149,12 @@
               (run-attach base a2 (wire-arg 3) (wire-arg 4) (wire-arg 5))
               (if (string=? verb "comments")
                 (run-comments base a2)
-                (list-entry base a2)))))))))
+                (if (string=? verb "claim")
+                (run-claim base a2 (wire-arg 3) (wire-arg 4))
+                (if (string=? verb "block")
+                  (run-block base a2 (wire-arg 3))
+                  (if (string=? verb "unblock")
+                    (run-unblock base a2)
+                    (if (string=? verb "finish")
+                      (run-finish base a2 (wire-arg 3))
+                      (list-entry base a2)))))))))))))
