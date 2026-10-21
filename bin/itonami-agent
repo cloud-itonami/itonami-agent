@@ -10,6 +10,8 @@
 #   notepad-cli        28280 0 3,34,35,37,38,39
 #   kanban-cli         67512 0 3,7,34,35,37,38   (7 = clock for heartbeat)
 #   session-search-cli 62564 0 3,34,35,37,38
+#   turn-cli            18544 0 3,34,35,37,38,11
+#   turn-loop-cli       61004 0 3,34,35,37,38,11
 #
 # Env: KEXE_LOADER (the loader binary), KEXE_GUESTS (dir with the .raw
 # guests), ITONAMI_ARCH (aarch64|x86_64, default from uname).
@@ -53,6 +55,16 @@ case "$1" in
     # argv: <base> <query> [limit] [after] [before] [detail] [sort] [sid] [pbase]
     base=$1; query=$2; limit=${3:-100}; after=${4:-}; before=${5:-}; detail=${6:-adaptive}; sort=${7:-}; sid=${8:-}; pbase=${9:-}
     run_guest session-search-cli.raw 62564 3,34,35,37,38 "$base" "$query" "$limit" "$after" "$before" "$detail" "$sort" "$sid" "$pbase"
+    ;;
+  turn)
+    shift
+    # argv: <base> <job-id> <task>  (guest order matches)
+    run_guest turn-cli.raw 18544 3,34,35,37,38,11 "$@"
+    ;;
+  turn-loop)
+    shift
+    # argv: <base> <job-id> <task>
+    run_guest turn-loop.raw 61004 3,34,35,37,38,11 "$@"
     ;;
   *)
     exec "$HERE/itonami-agent-kbb" "$@"
