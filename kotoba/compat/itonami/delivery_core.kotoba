@@ -9,7 +9,8 @@
   Status is one of 0 pending / 1 delivering / 2 terminal. State file content
   is the status digit, a newline, then the error text. Self-contained: only
   native-qualified ops."
-  (:export [id-ok state-encode state-status state-error
+  (:require [itonami.journal-core :as jc])
+  (:export [id-ok state-encode state-encode-at state-status state-error state-at
             terminal-ok finish-from-ok ledger-outcome status-name
             test-id-ok test-state test-terminal]))
 
@@ -30,6 +31,15 @@
     0
     (if (token-in id "
 ") 0 1)))
+
+(defn state-encode-at [status :i64 error :string at :string] :string
+  ;; three columns: status digit / error / finished_at (empty when the
+  ;; caller has no clock reading -- old two-field rows answer "" from
+  ;; state-at, fail-closed).
+  (string-concat (state-encode status error) (string-concat "\n" at)))
+
+(defn state-at [content :string] :string
+  (jc/piece content "\n" 2))
 
 (defn state-encode [status :i64 error :string] :string
   (string-concat (string-substring "012345" status (+ status 1))

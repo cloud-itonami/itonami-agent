@@ -16,8 +16,8 @@
   (:require [itonami.delivery-core :as core]
             [itonami.journal :as j]
             [itonami.notepad :as np])
-  (:export [dq-enqueue dq-status dq-error dq-claim-row dq-finish dq-claim-next
-            dq-recover dq-outcome])
+  (:export [dq-enqueue dq-status dq-error dq-claim-row dq-finish dq-finish-at
+            dq-claim-next dq-recover dq-outcome dq-finished-at])
   (:capabilities #{:fs/app-data}))
 
 (defn- wire-exists [path :string] :string
@@ -89,6 +89,29 @@
               (let [w (wire-write p (core/state-encode status error))]
                 1)
               0)))))))
+
+(defn dq-finish-at [base :string id :string status :i64 error :string at :string] :i64
+  ;; the fenced finish carrying the caller's clock reading (the isolation
+  ;; rule: the clock effect stays out of this module -- the handler layer
+  ;; reads the clock and passes the text).
+  (if (= 0 (core/id-ok id))
+    0
+    (if (= 0 (core/terminal-ok status))
+      0
+      (let [p (np/note-path base id)]
+        (if (= 0 (exists? p))
+          0
+          (let [content (wire-read p)]
+            (if (= 1 (core/finish-from-ok (core/state-status content)))
+              (let [w (wire-write p (core/state-encode-at status error at))]
+                1)
+              0)))))))
+
+(defn dq-finished-at [base :string id :string] :string
+  (let [p (np/note-path base id)]
+    (if (= 0 (exists? p))
+      ""
+      (core/state-at (wire-read p)))))
 
 (defn dq-recover [base :string id :string] :i64
   ;; recover-abandoned!: a delivering row whose owner is gone is fenced
