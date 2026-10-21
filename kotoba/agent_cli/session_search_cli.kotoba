@@ -70,15 +70,34 @@
       (let [acc2 (if (= 0 (string-length acc)) h (string-concat acc (string-concat "," h)))]
         (hits-json hits (+ i 1) n detail acc2)))))
 
+(defn- sid-split [sid :string] :string
+  ;; the measured rule: a raw @session:<profile>/<id> link (or a bare
+  ;; profile/id) splits on the FIRST slash; a bare id (no slash) is used
+  ;; as-is. Returns the id part. The profile part selects the base the
+  ;; caller passes (arg 8) -- the host grants sibling roots, the guest
+  ;; never discovers them (colon-separated scopes, measured).
+  (let [t (if (= 0 (string-length sid))
+            ""
+            (if (= 64 (string-code-point-at sid 0))
+              (string-substring sid 9 (string-length sid))
+              sid))]
+    (let [i (string-index-of t "/")]
+      (if (< i 0)
+        t
+        (string-substring t (+ i 1) (string-length t))))))
+
 (defn session-search-cli [] :i64
-  (let [base (wire-arg 0) query (wire-arg 1) limit-s (wire-arg 2) detail (wire-arg 5)]
+  (let [base0 (wire-arg 0) query (wire-arg 1) limit-s (wire-arg 2) detail (wire-arg 5)
+        sid (wire-arg 7) pbase (wire-arg 8)]
+    (let [base (if (= 0 (string-length pbase)) base0 pbase)]
     (let [hits (ss/ss-search base query 100)]
       (let [body (if (= 0 (string-length hits))
                    ""
                    (hits-json hits 0 (jc/count-pieces hits "\n") detail ""))]
         (let [doc (string-concat "{\"query\":" (json-str query))]
-          (let [doc2 (string-concat doc ",\"hits\":[")]
+          (let [doc0 (string-concat doc (string-concat ",\"resolved\":" (json-str (sid-split sid))))]
+          (let [doc2 (string-concat doc0 ",\"hits\":[")]
             (let [doc3 (string-concat doc2 body)]
               (let [doc4 (string-concat doc3 "]}")]
                 (let [w (wire-say doc4)]
-                  0)))))))))
+                  0)))))))))))
