@@ -11,6 +11,8 @@
   is needed on this path (pinned here on purpose -- the escaping walk
   lives in session_search_cli and is verified there)."
   (:require [itonami.tasks :as t]
+            [itonami.task-comments :as cm]
+            [itonami.tasks-state :as ts]
             [itonami.journal-core :as jc])
   (:export [kanban-cli])
   (:capabilities #{:cli/args :io/write}))
@@ -48,12 +50,45 @@
               (let [acc2 (if (= 0 (string-length acc)) item (string-concat acc (string-concat "," item)))]
                 (walk-json base ids (+ i 1) n filter-s acc2)))))))))
 
+(defn- run-show [base :string id :string] :i64
+  (let [st (t/task-status base id)]
+    (let [n (cm/cm-count base id)]
+      (let [d1 (string-concat "{\"id\":\"" id)]
+        (let [d2 (string-concat d1 "\",\"status\":")]
+          (let [d3 (string-concat d2 (string-from-i64 st))]
+            (let [d4 (string-concat d3 ",\"comments\":")]
+              (let [d5 (string-concat d4 (string-from-i64 n))]
+                (let [w (wire-say (string-concat d5 "}"))]
+                  0)))))))))
+
+(defn- run-create [base :string id :string status-s :string] :i64
+  (let [r (t/task-create base id (ts/status-code status-s))]
+    (let [w (wire-say (if (= 1 r) "{\"ok\":1}" "{\"ok\":0}"))]
+      0)))
+
+(defn- run-complete [base :string id :string] :i64
+  ;; the kanban-complete shape: terminal done (status 6) through the
+  ;; measured from-conditional transition.
+  (let [st (t/task-status base id)]
+    (let [r (t/task-transition base id st 6)]
+      (let [w (wire-say (if (= 1 r) "{\"ok\":1}" "{\"ok\":0}"))]
+        0))))
+
+(defn- list-entry [base :string filter-s :string] :i64
+  (let [ids (t/task-ids base)]
+    (let [body (if (= 0 (string-length ids))
+                 ""
+                 (walk-json base ids 0 (jc/count-pieces ids "\n") filter-s ""))]
+      (let [doc (string-concat "{\"tasks\":[" (string-concat body "]}"))]
+        (let [w (wire-say doc)]
+          0)))))
+
 (defn kanban-cli [] :i64
-  (let [base (wire-arg 0) filter-s (wire-arg 1)]
-    (let [ids (t/task-ids base)]
-      (let [body (if (= 0 (string-length ids))
-                   ""
-                   (walk-json base ids 0 (jc/count-pieces ids "\n") filter-s ""))]
-        (let [doc (string-concat "{\"tasks\":[" (string-concat body "]}"))]
-          (let [w (wire-say doc)]
-            0))))))
+  (let [verb (wire-arg 0) base (wire-arg 1) a2 (wire-arg 2)]
+    (if (string=? verb "show")
+      (run-show base a2)
+      (if (string=? verb "create")
+        (run-create base a2 (wire-arg 3))
+        (if (string=? verb "complete")
+          (run-complete base a2)
+          (list-entry base a2))))))
