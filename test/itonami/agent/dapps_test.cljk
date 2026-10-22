@@ -1,0 +1,106 @@
+(ns itonami.agent.dapps-test
+  "The `itonami_dapps` toolset: registered dapp MCP servers added to a run's
+  effective config (never the profile), selected like other MCP servers, and
+  reachable through the ordinary MCP discover/call path."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [itonami.agent.dapps :as dapps]
+            [itonami.agent.host :as h]
+            [itonami.agent.mcp :as mcp]
+            [itonami.agent.tools :as tools]
+            ["node:fs" :as fs]
+            ["node:os" :as os]
+            ["node:path" :as path]))
+
+(defn- fake-checkout!
+  "A temp checkout holding the fixture server at bin/<name>-mcp."
+  [name]
+  (let [dir (fs/mkdtempSync (path/join (os/tmpdir) (str "itonami-dapp-" name "-")))]
+    (h/mkdirs (h/join dir "bin"))
+    (fs/copyFileSync "test/itonami_dapp_fixture_mcp.cljk" (h/join dir "bin" (str name "-mcp")))
+    dir))
+
+(defn- env-with [m] (merge (h/process-env) m))
+
+(deftest toolset-is-opt-in
+  (testing "without itonami_dapps the config is returned as it came"
+    (let [cfg {"mcp_servers" {"cloudflare" {"url" "https://example.invalid/mcp"}}}
+          r (dapps/with-servers cfg ["hermes-cli"] {})]
+      (is (= cfg (:config r)))
+      (is (= [] (:added r)))
+      (is (= [] (:errors r)))))
+  (testing "the toolset name passes the run's toolset gate"
+    (is (= [] (tools/unsupported-toolsets ["hermes-cli" "itonami_dapps"]
+                                          (conj #{} dapps/toolset))))
+    (is (= ["itonami_dappz"] (tools/unsupported-toolsets ["itonami_dappz"]
+                                                         (conj #{} dapps/toolset))))))
+
+(deftest servers-resolve-from-placeholders
+  (let [m (fake-checkout! "mihari")
+        d (fake-checkout! "dandori")
+        env (env-with {"MIHARI_REPO" m "DANDORI_REPO" d})
+        r (dapps/with-servers {} ["hermes-cli" "itonami_dapps"] env)]
+    (testing "both registered servers are added to the run config, launched with kbb"
+      (is (= ["mihari" "dandori"] (:added r)))
+      (is (= [] (:errors r)))
+      (is (= {"command" "kbb" "args" [(h/join m "bin" "mihari-mcp")] "timeout" 90}
+             (get-in r [:config "mcp_servers" "mihari"])))
+      (is (= [(h/join d "bin" "dandori-mcp")]
+             (get-in r [:config "mcp_servers" "dandori" "args"]))))
+    (testing "status reports where each resolved, without starting anything"
+      (let [rows (vec (dapps/status env))]
+        (is (= ["mihari" "dandori"] (mapv #(get % "server") rows)))
+        (is (every? #(= "MIHARI_REPO" %) (keep #(when (= "mihari" (get % "server")) (get % "resolved_from")) rows)))
+        (is (every? #(str/starts-with? (get % "registry") "cloud-itonami/itonami-registry@") rows))))
+    (testing "the servers answer through the ordinary MCP discover/call path"
+      (let [cfg (:config r)
+            servers (dapps/select-servers cfg ["hermes-cli" "itonami_dapps"] [] (:added r))
+            data (mcp/discover cfg env servers)
+            names (set (map #(get-in % ["function" "name"]) (:schemas data)))
+            out (h/json-parse (get (h/json-parse (mcp/call cfg env "dandori" "probe" {"text" "段取り"})) "result"))]
+        (is (= #{"mihari" "dandori"} (set servers)))
+        (is (= (count servers) (count (distinct servers))))
+        (is (= [] (:errors data)))
+        (is (contains? names "mcp__mihari__probe"))
+        (is (contains? names "mcp__dandori__probe"))
+        (is (= "dandori" (get out "server")))
+        (is (= {"text" "段取り"} (get out "arguments")))))))
+
+(deftest profile-and-placeholder-precedence
+  (testing "a server the profile defines is kept as written and still selected"
+    (let [own {"command" "node" "args" ["/opt/own-mihari.mjs"]}
+          r (dapps/with-servers {"mcp_servers" {"mihari" own}} ["itonami_dapps"]
+                                {"DANDORI_REPO" (fake-checkout! "dandori")})]
+      (is (= own (get-in r [:config "mcp_servers" "mihari"])))
+      (is (= ["mihari" "dandori"] (:added r)))))
+  (testing "a placeholder that does not hold the launcher is an error, with no fallback"
+    (let [empty-dir (fs/mkdtempSync (path/join (os/tmpdir) "itonami-dapp-empty-"))
+          r (dapps/with-servers {} ["itonami_dapps"]
+                                {"MIHARI_REPO" empty-dir "DANDORI_REPO" (fake-checkout! "dandori")})]
+      (is (nil? (get-in r [:config "mcp_servers" "mihari"])))
+      (is (= ["dandori"] (:added r)))
+      (is (= "mihari" (get-in r [:errors 0 "server"])))
+      (is (str/includes? (get-in r [:errors 0 "error"]) "MIHARI_REPO"))))
+  (testing "with no placeholder and no launcher path, nothing is guessed"
+    (let [r (with-redefs [h/env (fn [_] nil)]
+              (dapps/with-servers {} ["itonami_dapps"] {}))]
+      (is (= [] (:added r)))
+      (is (= ["mihari" "dandori"] (mapv #(get % "server") (:errors r)))))))
+
+(deftest selection-follows-mcp-opt-outs
+  (let [cfg {"mcp_servers" {"cloudflare" {"url" "https://example.invalid/mcp"}
+                            "mihari" {"command" "kbb" "args" ["/x/bin/mihari-mcp"]}
+                            "dandori" {"command" "kbb" "args" ["/x/bin/dandori-mcp"]}}}
+        added ["mihari" "dandori"]]
+    (testing "naming another server does not drop the dapps"
+      (is (= ["cloudflare" "mihari" "dandori"]
+             (dapps/select-servers cfg ["mcp-cloudflare" "itonami_dapps"] [] added))))
+    (testing "no_mcp starts nothing"
+      (is (= [] (dapps/select-servers cfg ["itonami_dapps" "no_mcp"] [] added))))
+    (testing "disabling the toolset or one server is honoured"
+      (is (= ["cloudflare"] (dapps/select-servers cfg ["itonami_dapps"] ["itonami_dapps"] added)))
+      (is (= ["cloudflare" "dandori"] (dapps/select-servers cfg ["itonami_dapps"] ["mihari"] added))))
+    (testing "a profile server switched off stays off"
+      (is (= ["cloudflare" "dandori"]
+             (dapps/select-servers (assoc-in cfg ["mcp_servers" "mihari" "enabled"] false)
+                                   ["itonami_dapps"] [] added))))))

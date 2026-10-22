@@ -160,7 +160,7 @@ owner and the lost-ACK `committed` break. Kotoba `execute_code` runs one confine
 | `-p`, `-z` (stdout = final text, exit 1 + `… -z: reason` on stderr), `-m`, `--provider`, `-t`, `cron list/create/run/tick/runs/status`, `profile list/show`, `chat` | same commands; `cron create` also accepts `--no-agent`, `--monitor-script`, and `--monitor-url` |
 | `cron/executions.db` | Kotoba writes Hermes-shaped claimed/running/completed/failed rows with ownership, timestamps, and delivery outcome. A later run marks attempts `unknown` only when the prior owner is provably gone; it does not retry them automatically. Handoff adoption matches Hermes: `mark-handoff-pending!` fences restart recovery while an external worker adopts a claim, `adopt-claimed!` is the single claimed-to-running adoption gate (ownership transfers exactly once), and recovery honours the 30s adoption grace |
 | `cron incidents` / `cron incidents ack <id>` | Kotoba groups failures by Hermes-compatible job/error signature, resolves them after success, and records acknowledgements and delivery outcomes. The repeat-alert gate is wired (`cron.failure_repeat_alert_hours`, default 6h: an alerted signature withholds the per-run ping until the cooldown elapses; an acked signature is silent until the error text changes; 0 re-alerts every run) |
-| configured MCP stdio and Streamable HTTP servers | discovered from `mcp_servers`, exposed as `mcp__server__tool`, and invoked with profile-scoped environment values and configured HTTP headers. Cached OAuth tokens can refresh with issuer binding and a Kotoba process lock; interactive OAuth login remains unsupported. MCP subprocesses are disabled on peer runs |
+| configured MCP stdio and Streamable HTTP servers (plus the built-in `itonami_dapps` toolset, below) | discovered from `mcp_servers`, exposed as `mcp__server__tool`, and invoked with profile-scoped environment values and configured HTTP headers. Cached OAuth tokens can refresh with issuer binding and a Kotoba process lock; interactive OAuth login remains unsupported. MCP subprocesses are disabled on peer runs |
 | browser navigation, snapshot, click, type, scroll, back, key press, image listing, screenshot vision, console | local Chrome through `agent-browser`; a Kotoba loopback proxy checks the allowlist and every DNS result for HTTP, HTTPS CONNECT, redirects, and subresources, pins the selected public IP, disables Chromium's implicit loopback proxy bypass, and closes the per-run session at loop end. Browser output is scrubbed for common credential forms. Raw CDP (`browser_cdp`) and dialog control (`browser_dialog`) run against a configured CDP endpoint (`browser.cdp_url` / `browser.cdp_endpoint` / `BROWSER_CDP_URL`): one CDP command per call over its WebSocket (target attach supported), credential-shaped strings redacted from results. The `browser_vault_*` tools run against a host-local encrypted store (`vault/vault.json.enc` + a 0600 key file; the CLI `vault add|list|remove` is the write path, as in Hermes): `browser_vault_list` returns handles and metadata only — passwords never enter the conversation — `browser_vault_fill` types the password into the page over CDP, `browser_vault_enter_code` mints the TOTP server-side (RFC 6238) when the login carries a seed and types it over CDP, `browser_vault_save_login`/`unlock` answer honestly when no interactive surface or external manager exists (the CLI is named as the write path). The cloud backend and `browser_exec` remain unsupported and readiness-blocked |
 | `cron/notepad` (`cron notepad <job-id> set\|get\|delete\|list`) | per-job durable KV notepad in profile-local `cron/notepad.db`, same schema and caps as Hermes (16 KB/value, 128-char key, 64 KB/job; refused writes leave the store untouched). Prompt-injected per run — empty renders `''` so unused jobs keep a byte-identical prompt — and cleared when the job is removed. CLI write path only, as in Hermes |
 | `cron/deliveries.db` (durable delivery handoff) | Hermes' `delivery_queue` contract: enqueue before the transport, a send claimed at most once, terminal rows fenced (never rewritten), payloads redacted and pruned to `delivery_tombstones` (bounded at 1,000). A claimer that dies mid-send is fenced `unknown` and never retried — losing a delivery beats duplicating a possibly-completed send — and `tick` surfaces it as an incident. `settle-queued-delivery!` writes a queued send's terminal outcome back onto the run that queued it (fenced on the execution id: the ledger's latest attempt for the job must still be that run, and a later run's status is never rewritten) and `drain-queued!` is the drain: each pending send is claimed at most once, delivered through its lane's adapter, and settled — `tick` drains before running due jobs. `ledger-outcome` maps queue status to the ledger (`unknown` -> `failed`) |
@@ -307,6 +307,47 @@ it discovers Hy and `funcparserlib` in the main environments under
 Python's import path. It does not download or copy packages. Direct CLI runs
 still require Hy in the selected interpreter or an explicit `KOTOBA_HY_DEPS`
 path (multiple paths may be separated with the platform path separator).
+
+## itonami dapps (`-t itonami_dapps`)
+
+`itonami_dapps` is a built-in toolset for the itonami dapps that the
+[Itonami Registry](https://github.com/cloud-itonami/itonami-registry) publishes
+as stdio MCP servers. Selecting it starts them for that run; no profile file
+changes.
+
+```
+bin/itonami-agent -p <profile> -t hermes-cli,itonami_dapps -z "…"
+bin/itonami-agent dapps        # where each server resolves on this host (starts nothing)
+```
+
+| server | registry entry | tools |
+|---|---|---|
+| `mihari` | `mcp/mihari` (cloud-itonami/app-itonami-mihari) | `mcp__mihari__mihari_ingest_events`, `mcp__mihari__mihari_decide` — Sentry-compatible error grouping and triage rules |
+| `dandori` | `mcp/dandori` (cloud-itonami/app-itonami-dandori) | `mcp__dandori__dandori_import`, `…_export`, `…_cycle_progress`, `…_check_estimate`, `…_sla_status` — Linear-compatible export conversion and planning checks |
+
+How it behaves:
+
+- The servers are added to the run's effective `mcp_servers` only. If the
+  profile already defines a server with the same name, the profile's spec is
+  used as written.
+- A checkout resolves from the registry placeholder (`MIHARI_REPO`,
+  `DANDORI_REPO`), then from this repository's west sibling
+  (`../../cloud-itonami/app-itonami-<name>`). It is launched as
+  `kbb <checkout>/bin/<name>-mcp`.
+- Nothing is cloned or fetched. A checkout that does not resolve is reported
+  under "MCP server issues" for that run, and its tools are absent. A
+  placeholder that does not hold the launcher is an error; it does not fall
+  through to another checkout.
+- `no_mcp`, `agent.disabled_toolsets: [itonami_dapps]` (or a server name), and
+  peer runs start none of them. Naming another server
+  (`-t mcp-cloudflare,itonami_dapps`) keeps them.
+- The tools are pure functions over the text passed to them. They make no
+  network calls and store nothing. The first launch of a checkout still lets
+  kbb resolve its pinned `kotoba-lang/text` git dependency.
+
+The registry and source commits the toolset was written against are recorded
+in `src/itonami/agent/dapps.cljk`. A newer checkout is used as found: the pin
+is provenance, not an admission check.
 
 ## Peer-to-peer execution
 
