@@ -1,0 +1,99 @@
+;; itonami.rail — the one check that keeps Hermes and itonami apart
+;; (com-junkawasaki/root ADR-2610222100, owner 2026-10-22).
+;;
+;;   Hermes agent  : ~/.hermes/profiles, rail config.yaml model:, NEVER
+;;                   murakumo or mishima (model, providers, fallback_providers,
+;;                   a cron job's pin)
+;;   itonami agent : ~/.itonami/profiles, rail itonami.edn :inference, ALWAYS
+;;                   on murakumo
+;;
+;; A profile is exactly one of the two: one with itonami.edn is an itonami
+;; agent, one without is a Hermes agent. The caller reads the profile and asks
+;; once per provider name it found; every registry and profile check asks the
+;; same functions, so the rule is stated once.
+;;
+;; Written in the Amu selfhost seed subset (no ns docstring, no fn literal,
+;; declared result types); README "Two CLIs, two inference rails" has the gate.
+(ns itonami.rail
+  (:export [murakumo-rail? runtime-for hermes-provider-verdict
+            itonami-rail-verdict profile-verdict
+            test-murakumo-rail test-runtime-for test-hermes test-itonami
+            test-profile]))
+
+;; ---------------------------------------------------------------------------
+;; Reason literals. Pinned contract: callers match on these exact strings.
+
+;; s begins with p (p ASCII); stops at the first byte that differs
+(defn starts-with? [s :string p :string i :i64] :bool
+  (cond (>= i (string-length p)) true
+        (>= i (string-length s)) false
+        (= (string-code-point-at s i) (string-code-point-at p i)) (recur s p (inc i))
+        :else false))
+
+;; a provider name or model id on the murakumo inference plane: murakumo,
+;; murakumo-local, murakumo/free, mishima, ...
+(defn murakumo-rail? [name :string] :bool
+  (if (starts-with? name "murakumo" 0) true (starts-with? name "mishima" 0)))
+
+;; the kind a profile is: decided by whether it carries itonami.edn
+(defn runtime-for [has-itonami-edn :bool] :string
+  (if has-itonami-edn "itonami" "hermes"))
+
+;; one provider name or model id a Hermes profile names anywhere
+(defn hermes-provider-verdict [name :string] :string
+  (if (murakumo-rail? name) "rail/hermes-on-murakumo" "rail/ok"))
+
+;; the rail an itonami profile's :inference names
+(defn itonami-rail-verdict [rail :string] :string
+  (cond (= rail "") "rail/itonami-without-rail"
+        (murakumo-rail? rail) "rail/ok"
+        :else "rail/itonami-off-murakumo"))
+
+;; the registry's runtime against the profile's own shape. RAIL is the
+;; itonami rail, or a Hermes provider name, as the caller found it.
+(defn profile-verdict [registry-runtime :string has-itonami-edn :bool rail :string] :string
+  (cond (not (= registry-runtime (runtime-for has-itonami-edn)))
+          (if (= registry-runtime "hermes") "rail/hermes-with-itonami-manifest"
+            (if (= registry-runtime "itonami") "rail/itonami-without-manifest" "rail/unknown-runtime"))
+        has-itonami-edn (itonami-rail-verdict rail)
+        :else (hermes-provider-verdict rail)))
+
+;; ---------------------------------------------------------------------------
+;; test-* : zero-arity, true when every assertion holds.
+
+(defn test-murakumo-rail [] :bool
+  (if (and (murakumo-rail? "murakumo")
+           (murakumo-rail? "murakumo/free")
+           (murakumo-rail? "murakumo-local")
+           (murakumo-rail? "mishima")
+           (not (murakumo-rail? "openrouter"))
+           (not (murakumo-rail? "kotoba"))
+           (not (murakumo-rail? "openrouter-free"))
+           (not (murakumo-rail? "muraku"))
+           (not (murakumo-rail? ""))) true false))
+
+(defn test-runtime-for [] :bool
+  (if (and (= (runtime-for true) "itonami")
+           (= (runtime-for false) "hermes")) true false))
+
+(defn test-hermes [] :bool
+  (if (and (= (hermes-provider-verdict "openrouter") "rail/ok")
+           (= (hermes-provider-verdict "kotoba") "rail/ok")
+           (= (hermes-provider-verdict "murakumo") "rail/hermes-on-murakumo")
+           (= (hermes-provider-verdict "murakumo/free") "rail/hermes-on-murakumo")
+           (= (hermes-provider-verdict "mishima") "rail/hermes-on-murakumo")) true false))
+
+(defn test-itonami [] :bool
+  (if (and (= (itonami-rail-verdict "murakumo") "rail/ok")
+           (= (itonami-rail-verdict "mishima") "rail/ok")
+           (= (itonami-rail-verdict "openrouter") "rail/itonami-off-murakumo")
+           (= (itonami-rail-verdict "") "rail/itonami-without-rail")) true false))
+
+(defn test-profile [] :bool
+  (if (and (= (profile-verdict "hermes" false "openrouter") "rail/ok")
+           (= (profile-verdict "hermes" false "murakumo/free") "rail/hermes-on-murakumo")
+           (= (profile-verdict "hermes" true "murakumo") "rail/hermes-with-itonami-manifest")
+           (= (profile-verdict "itonami" true "murakumo") "rail/ok")
+           (= (profile-verdict "itonami" true "openrouter") "rail/itonami-off-murakumo")
+           (= (profile-verdict "itonami" false "murakumo") "rail/itonami-without-manifest")
+           (= (profile-verdict "hydra" false "openrouter") "rail/unknown-runtime")) true false))

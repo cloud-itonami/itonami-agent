@@ -69,6 +69,49 @@ skips the file entirely. `profile import`/`export` move a definition between
 the two stores unchanged — the file format is the shared surface, the store
 and the rail stay separate.
 
+**One profile, one side** (com-junkawasaki/root ADR-2610222100, owner
+2026-10-22: 「hermes と itonami をまず分離する。hermes は murakumo を使わないが、
+itonami agent は murakumo を前提にする」). A profile with `itonami.edn` is an
+itonami agent and runs on murakumo; one without is a Hermes agent and never
+names murakumo or mishima. Reading one profile both ways (the additive
+manifest) is retired; `import`/`export` are migration steps, not a mode. The
+registry's `:agent/runtime` must agree with the profile.
+
+The check is one pure Kotoba module, `kotoba/itonami/rail.kotoba`:
+`profile-verdict` (registry runtime × has `itonami.edn` × rail) answers
+`rail/ok`, `rail/hermes-on-murakumo`, `rail/hermes-with-itonami-manifest`,
+`rail/itonami-without-manifest`, `rail/itonami-off-murakumo`,
+`rail/itonami-without-rail` or `rail/unknown-runtime`; the caller asks
+`hermes-provider-verdict` once per provider name a Hermes profile names
+(`model`, `providers`, `fallback_providers`, each cron pin). Its gate builds it
+with the pinned Amu selfhost root compiler (no Node.js, nbb, JVM or babashka):
+
+```bash
+AMU=../amu; G=$(mktemp -d)   # G must be under a path podman can mount
+cp "$AMU/seed/bootstrap/aarch64-linux-static-root.elf" "$G/root.elf"
+F=kotoba/itonami/rail.kotoba
+end=$(grep -n 'test-profile\]))' $F | cut -d: -f1)
+{ echo '(ns itonami-rail-gate (:export [main]))'
+  tail -n +$((end+1)) $F
+  cat <<'EOF'
+(defn main [] :i64
+  (+ (if (test-murakumo-rail) 1 0) (+ (if (test-runtime-for) 2 0)
+  (+ (if (test-hermes) 4 0) (+ (if (test-itonami) 8 0)
+  (if (test-profile) 16 0))))))
+EOF
+} > "$G/gate.kotoba"
+podman run --rm --platform linux/arm64 --network none -e KEXE_CAP_RESOURCES_35="$G" \
+  -v "$G:$G" -w "$G" docker.io/library/python:3.12-alpine sh -c \
+  "./root.elf compile $G/gate.kotoba --target aarch64-linux --output $G/gate.elf --format static \
+   && chmod +x gate.elf && KEXE_STRUCTURED_REPORT=1 ./gate.elf"
+#   → {:status :ok :result 31 ...}      (31 = all five test-* true)
+```
+
+Measured 2026-10-22 with the root of amu `f5b11a08` (sha256 `8256bfd8…dc7`):
+`:result 31`; a mutated `test-hermes` (mishima allowed) gives `27`. Receipt:
+`docs/evidence/rail-selfhost-gate-20261022.edn`. The existing `.cljk`
+`profile check` is unchanged and does not call this module yet.
+
 | Hermes surface | itonami-agent |
 |---|---|
 | `SOUL.md`, `profile.yaml`, `config.yaml`, `.env`, `secrets.command` | read the same way. YAML reader is checked against PyYAML on all 1,954 host files: 0 differences |
