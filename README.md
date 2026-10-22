@@ -540,6 +540,47 @@ over tailscale) is used as a node-owned rail, without `api.murakumo.cloud`. Maki
 murakumo job kind is a change on the murakumo side (`poll_worker.cljk`) and
 not done here.
 
+## Schedule
+
+`kotoba/itonami/schedule.kotoba` computes when a cron job is next due, as one
+pure Kotoba function (com-junkawasaki/root ADR-2610222120 decision 2; the
+gateway becomes the trigger edge that only issues murakumo agent-step jobs).
+`next-cron-ms`, `next-interval-ms`, `next-once-ms`, `due?` and `cron-problem`
+keep `cron.cljk`'s semantics (5 fields, ranges, steps, lists, one day name, 7
+= Sunday, Vixie day-of-month/day-of-week, strictly after, the 600000-step
+guard) with two deliberate differences for a network of nodes: time is epoch
+milliseconds plus an explicit UTC offset in minutes (so every node computes
+the same instant; equal to the `.cljk` for a fixed-offset zone such as
+Asia/Tokyo, +540), and a malformed expression is refused
+(`schedule/bad-cron`) rather than read leniently. Gate (no Node.js, nbb, JVM
+or babashka):
+
+```bash
+AMU=../amu; G=$(mktemp -d)   # G must be under a path podman can mount
+cp "$AMU/seed/bootstrap/aarch64-linux-static-root.elf" "$G/root.elf"
+F=kotoba/itonami/schedule.kotoba
+end=$(grep -n 'test-other\]))' $F | cut -d: -f1)
+{ echo '(ns itonami-schedule-gate (:export [main]))'
+  tail -n +$((end+1)) $F
+  cat <<'EOF'
+(defn main [] :i64
+  (+ (if (test-civil) 1 0) (+ (if (test-parse) 2 0)
+  (+ (if (test-cron) 4 0) (if (test-other) 8 0)))))
+EOF
+} > "$G/gate.kotoba"
+podman run --rm --platform linux/arm64 --network none -e KEXE_CAP_RESOURCES_35="$G" \
+  -v "$G:$G" -w "$G" docker.io/library/python:3.12-alpine sh -c \
+  "./root.elf compile $G/gate.kotoba --target aarch64-linux --output $G/gate.elf --format static \
+   && chmod +x gate.elf && KEXE_STRUCTURED_REPORT=1 ./gate.elf"
+#   → {:status :ok :result 15 ...}      (15 = all four test-* true)
+```
+
+Measured 2026-10-22 with the root of amu `f5b11a08` (sha256 `8256bfd8…dc7`):
+`:result 15`; shifting the leap-day expectation by one minute gives `11`. The
+expected instants were computed independently by a minute-by-minute brute
+force. Receipt: `docs/evidence/schedule-selfhost-gate-20261022.edn`. The Node
+gateway (`cron.cljk`) is unchanged and does not call this module.
+
 ## Resident gateway
 
 `~/Library/LaunchAgents/cloud.itonami.agent.gateway.plist` runs

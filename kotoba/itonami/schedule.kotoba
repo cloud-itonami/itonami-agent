@@ -1,0 +1,265 @@
+;; itonami.schedule — when a cron job is next due, as one pure Kotoba function
+;; (com-junkawasaki/root ADR-2610222120 decision 2; Linear JUN-307).
+;;
+;;   next-cron-ms     (expr after-ms offset-min) -> ms, or -1
+;;   next-interval-ms (after-ms minutes)          -> ms, or -1
+;;   next-once-ms     (run-at-ms after-ms)        -> ms, or -1 (spent)
+;;   due?             (active next-ms now-ms)     -> bool
+;;   cron-problem     (expr)                      -> "schedule/ok" | "schedule/bad-cron"
+;;
+;; The semantics are src/itonami/agent/cron.cljk's (next-cron, next-run, due?):
+;; 5 fields, ranges a-b, steps */n and v/n, lists, a single day name
+;; (sun..sat) in the day-of-week field, 7 = Sunday, the Vixie rule that a job
+;; whose day-of-month and day-of-week are both restricted fires when either
+;; matches, the first minute strictly after AFTER, and the same 600000-step
+;; guard. Two deliberate differences, both for a network of nodes:
+;;
+;; - Time is epoch milliseconds (UTC) and an explicit UTC offset in minutes,
+;;   not the host's local zone, so every node computes the same instant. For a
+;;   fixed-offset zone (Asia/Tokyo is +540) the result equals the .cljk's.
+;; - A malformed expression is refused ("schedule/bad-cron", next -1) instead
+;;   of being read leniently (parseInt), and a step below 1 is refused.
+;;
+;; Written in the Amu selfhost seed subset (no ns docstring, no fn literal,
+;; declared result types); README "Schedule" has the gate.
+(ns itonami.schedule
+  (:export [cron-problem next-cron-ms next-interval-ms next-once-ms due?
+            days-from-civil civil-year civil-month civil-day weekday
+            test-civil test-parse test-cron test-other]))
+
+;; ---------------------------------------------------------------------------
+;; Civil calendar (H. Hinnant's days_from_civil / civil_from_days), in days
+;; since 1970-01-01.
+
+;; floor division for b > 0 (quot truncates toward zero)
+(defn floor-div [a :i64 b :i64] :i64
+  (let [q (quot a b)] (if (> (* q b) a) (dec q) q)))
+
+(defn days-from-civil [y0 :i64 m :i64 d :i64] :i64
+  (let [y (if (<= m 2) (dec y0) y0)
+        era (quot (if (>= y 0) y (- y 399)) 400)
+        yoe (- y (* era 400))
+        doy (+ (quot (+ (* 153 (if (> m 2) (- m 3) (+ m 9))) 2) 5) (dec d))
+        doe (+ (* yoe 365) (- (+ (quot yoe 4) doy) (quot yoe 100)))]
+    (+ (* era 146097) (- doe 719468))))
+
+(defn civil-doe [z0 :i64] :i64
+  (let [z (+ z0 719468) era (quot (if (>= z 0) z (- z 146096)) 146097)]
+    (- z (* era 146097))))
+
+(defn civil-yoe [z0 :i64] :i64
+  (let [doe (civil-doe z0)]
+    (quot (- (+ doe (quot doe 36524)) (+ (quot doe 1460) (quot doe 146096))) 365)))
+
+(defn civil-mp [z0 :i64] :i64
+  (let [doe (civil-doe z0) yoe (civil-yoe z0)
+        doy (- doe (- (+ (* 365 yoe) (quot yoe 4)) (quot yoe 100)))]
+    (quot (+ (* 5 doy) 2) 153)))
+
+(defn civil-month [z :i64] :i64
+  (let [mp (civil-mp z)] (if (< mp 10) (+ mp 3) (- mp 9))))
+
+(defn civil-year [z0 :i64] :i64
+  (let [z (+ z0 719468) era (quot (if (>= z 0) z (- z 146096)) 146097)
+        y (+ (civil-yoe z0) (* era 400))]
+    (if (<= (civil-month z0) 2) (inc y) y)))
+
+(defn civil-day [z0 :i64] :i64
+  (let [doe (civil-doe z0) yoe (civil-yoe z0)
+        doy (- doe (- (+ (* 365 yoe) (quot yoe 4)) (quot yoe 100)))
+        mp (civil-mp z0)]
+    (inc (- doy (quot (+ (* 153 mp) 2) 5)))))
+
+;; 0 = Sunday; 1970-01-01 was a Thursday
+(defn weekday [z :i64] :i64
+  (let [r (- (+ z 4) (* 7 (quot (+ z 4) 7)))] (if (< r 0) (+ r 7) r)))
+
+;; ---------------------------------------------------------------------------
+;; Parsing. A field is a bit mask (bit v = value v allowed); -1 = malformed.
+
+(defn bit-of [v :i64] :i64 (if (< v 0) 0 (if (> v 62) 0 (i64-shift-left 1 v))))
+
+(defn has-bit? [mask :i64 v :i64] :bool (if (< v 0) false (if (> v 62) false (= (bit-and (u64-shift-right mask v) 1) 1))))
+
+(defn digit? [c :i64] :bool (if (< c 48) false (if (> c 57) false true)))
+
+;; s is 1..9 decimal digits: its value, else -1. Stops at the first non-digit.
+(defn digits-from [s :string i :i64 acc :i64] :i64
+  (cond (>= i (string-length s)) acc
+        (digit? (string-code-point-at s i)) (recur s (inc i) (+ (* acc 10) (- (string-code-point-at s i) 48)))
+        :else -1))
+
+(defn number-of [s :string] :i64
+  (let [n (string-length s)] (if (< n 1) -1 (if (> n 9) -1 (digits-from s 0 0)))))
+
+(defn lower [c :i64] :i64 (if (and (>= c 65) (<= c 90)) (+ c 32) c))
+
+;; s equals the lowercase ASCII word w, ignoring case
+(defn same-ci-from? [s :string w :string i :i64] :bool
+  (cond (>= i (string-length w)) true
+        (= (lower (string-code-point-at s i)) (string-code-point-at w i)) (recur s w (inc i))
+        :else false))
+
+(defn same-ci? [s :string w :string] :bool
+  (if (= (string-length s) (string-length w)) (same-ci-from? s w 0) false))
+
+;; a whole field that is one day name becomes its number, as the .cljk does
+(defn day-name [s :string] :string
+  (cond (same-ci? s "sun") "0" (same-ci? s "mon") "1" (same-ci? s "tue") "2"
+        (same-ci? s "wed") "3" (same-ci? s "thu") "4" (same-ci? s "fri") "5"
+        (same-ci? s "sat") "6" :else s))
+
+(defn add-range [mask :i64 a :i64 b :i64 step :i64 dow :bool] :i64
+  (loop [i a m mask]
+    (if (> i b) m
+      (recur (+ i step) (bit-or m (bit-of (if dow (- i (* 7 (quot i 7))) i)))))))
+
+;; one comma-separated part: rng or rng/step
+(defn part-mask [part :string lo :i64 hi :i64 dow :bool] :i64
+  (let [sl (string-index-of part "/")
+        rng (if (< sl 0) part (string-substring part 0 sl))
+        step (if (< sl 0) 1 (number-of (string-substring part (inc sl) (string-length part))))
+        dash (string-index-of rng "-")]
+    (cond (< step 1) -1
+          (= rng "*") (add-range 0 lo hi step dow)
+          (> dash 0)
+            (let [a (number-of (string-substring rng 0 dash))
+                  b (number-of (string-substring rng (inc dash) (string-length rng)))]
+              (if (or (< a 0) (< b 0)) -1 (add-range 0 a b step dow)))
+          :else (let [v (number-of rng)]
+                  (if (< v 0) -1 (add-range 0 v (if (< sl 0) v hi) step dow))))))
+
+(defn field-parts [s :string lo :i64 hi :i64 dow :bool acc :i64] :i64
+  (let [c (string-index-of s ",")
+        part (if (< c 0) s (string-substring s 0 c))
+        m (part-mask part lo hi dow)]
+    (cond (< m 0) -1
+          (< c 0) (bit-or acc m)
+          :else (recur (string-substring s (inc c) (string-length s)) lo hi dow (bit-or acc m)))))
+
+(defn field-mask [s :string lo :i64 hi :i64 dow :bool] :i64
+  (if (= (string-length s) 0) -1 (field-parts (day-name s) lo hi dow 0)))
+
+(defn space? [c :i64] :bool (if (= c 32) true (if (= c 9) true (if (= c 10) true (= c 13)))))
+
+;; the K-th (0-based) whitespace-separated field of expr, or "" past the end
+(defn field-from [e :string i :i64 k :i64 start :i64 in :bool] :string
+  (cond (>= i (string-length e))
+          (if (and in (= k 0)) (string-substring e start i) "")
+        (space? (string-code-point-at e i))
+          (if in (if (= k 0) (string-substring e start i) (recur e (inc i) (dec k) i false))
+            (recur e (inc i) k start false))
+        :else (if in (recur e (inc i) k start true) (recur e (inc i) k i true))))
+
+(defn field-at [e :string k :i64] :string (field-from e 0 k 0 false))
+
+(defn field-count [e :string i :i64 n :i64 in :bool] :i64
+  (cond (>= i (string-length e)) n
+        (space? (string-code-point-at e i)) (recur e (inc i) n false)
+        in (recur e (inc i) n true)
+        :else (recur e (inc i) (inc n) true)))
+
+(defn cron-problem [e :string] :string
+  (if (not (= (field-count e 0 0 false) 5)) "schedule/bad-cron"
+    (if (or (< (field-mask (field-at e 0) 0 59 false) 0)
+            (< (field-mask (field-at e 1) 0 23 false) 0)
+            (< (field-mask (field-at e 2) 1 31 false) 0)
+            (< (field-mask (field-at e 3) 1 12 false) 0)
+            (< (field-mask (field-at e 4) 0 7 true) 0))
+      "schedule/bad-cron" "schedule/ok")))
+
+;; ---------------------------------------------------------------------------
+;; next-cron: the first minute strictly after AFTER that matches, walked as
+;; the .cljk walks it (month, then day, then hour, then minute), in local
+;; minutes L = UTC minutes + offset.
+
+(defn day-ok? [dom :i64 dow :i64 dom-star :bool dow-star :bool d :i64 wd :i64] :bool
+  (let [a (has-bit? dom d) b (has-bit? dow wd)]
+    (cond (and dom-star dow-star) true dom-star b dow-star a :else (or a b))))
+
+(defn cron-walk [mi :i64 ho :i64 dm :i64 mo :i64 dw :i64 dms :bool dws :bool
+                 l :i64 offset :i64 guard :i64] :i64
+  (if (> guard 600000) -1
+    (let [days (floor-div l 1440) mins (- l (* days 1440))
+          y (civil-year days) m (civil-month days) d (civil-day days)
+          h (quot mins 60) mn (- mins (* 60 (quot mins 60)))]
+      (cond (not (has-bit? mo m))
+              (recur mi ho dm mo dw dms dws
+                     (* 1440 (if (= m 12) (days-from-civil (inc y) 1 1) (days-from-civil y (inc m) 1)))
+                     offset (inc guard))
+            (not (day-ok? dm dw dms dws d (weekday days)))
+              (recur mi ho dm mo dw dms dws (* 1440 (inc days)) offset (inc guard))
+            (not (has-bit? ho h))
+              (recur mi ho dm mo dw dms dws (+ (* 1440 days) (* 60 (inc h))) offset (inc guard))
+            (not (has-bit? mi mn))
+              (recur mi ho dm mo dw dms dws (inc l) offset (inc guard))
+            :else (* 60000 (- l offset))))))
+
+(defn next-cron-ms [e :string after-ms :i64 offset :i64] :i64
+  (if (not (= (cron-problem e) "schedule/ok")) -1
+    (cron-walk (field-mask (field-at e 0) 0 59 false) (field-mask (field-at e 1) 0 23 false)
+               (field-mask (field-at e 2) 1 31 false) (field-mask (field-at e 3) 1 12 false)
+               (field-mask (field-at e 4) 0 7 true)
+               (= (field-at e 2) "*") (= (field-at e 4) "*")
+               (+ (inc (floor-div after-ms 60000)) offset) offset 0)))
+
+(defn next-interval-ms [after-ms :i64 minutes :i64] :i64
+  (if (< minutes 1) -1 (+ after-ms (* 60000 minutes))))
+
+;; a one-shot fires once, strictly after AFTER; a spent one answers -1
+(defn next-once-ms [run-at-ms :i64 after-ms :i64] :i64
+  (if (> run-at-ms after-ms) run-at-ms -1))
+
+(defn due? [active :bool next-ms :i64 now-ms :i64] :bool
+  (if active (if (< next-ms 0) false (<= next-ms now-ms)) false))
+
+;; ---------------------------------------------------------------------------
+;; test-* : zero-arity, true when every assertion holds. Expected instants were
+;; computed independently by a minute-by-minute brute force (Asia/Tokyo, +540).
+
+(defn test-civil [] :bool
+  (if (and (= (days-from-civil 1970 1 1) 0)
+           (= (days-from-civil 2026 10 22) 20748)
+           (= (civil-year 20748) 2026) (= (civil-month 20748) 10) (= (civil-day 20748) 22)
+           (= (weekday 20748) 4)
+           (= (days-from-civil 2028 2 29) 21243)
+           (= (civil-month 21243) 2) (= (civil-day 21243) 29)
+           (= (weekday 0) 4)
+           (= (civil-year (days-from-civil 2000 3 1)) 2000)
+           (= (floor-div -1 1440) -1) (= (floor-div 1439 1440) 0)) true false))
+
+(defn test-parse [] :bool
+  (if (and (= (cron-problem "*/15 * * * *") "schedule/ok")
+           (= (cron-problem "30 8 * * mon") "schedule/ok")
+           (= (cron-problem "30 8 * * MON") "schedule/ok")
+           (= (cron-problem "1-5/2 3 * * *") "schedule/ok")
+           (= (cron-problem " 0  9 * *  * ") "schedule/ok")
+           (= (cron-problem "* * *") "schedule/bad-cron")
+           (= (cron-problem "* * * * * *") "schedule/bad-cron")
+           (= (cron-problem "5x * * * *") "schedule/bad-cron")
+           (= (cron-problem "*/0 * * * *") "schedule/bad-cron")
+           (= (cron-problem "mon-fri * * * *") "schedule/bad-cron")
+           (= (cron-problem "") "schedule/bad-cron")
+           (= (field-mask "1-5/2" 0 59 false) 42)
+           (= (field-mask "7" 0 7 true) 1)) true false))
+
+(defn test-cron [] :bool
+  (if (and (= (next-cron-ms "*/15 * * * *" 1792638450000 540) 1792638900000)
+           (= (next-cron-ms "0 9 * * *" 1792627200000 540) 1792713600000)
+           (= (next-cron-ms "30 8 * * mon" 1792638000000 540) 1792971000000)
+           (= (next-cron-ms "0 0 1 1 *" 1792638000000 540) 1798729200000)
+           (= (next-cron-ms "0 12 13 * 5" 1792638000000 540) 1792724400000)
+           (= (next-cron-ms "0 0 29 2 *" 1792638000000 540) 1835362800000)
+           (= (next-cron-ms "5 4 * * 7" 1792638000000 540) 1792868700000)
+           (= (next-cron-ms "1-5/2 3 * * *" 1792605780000 540) 1792605900000)
+           (= (next-cron-ms "* * *" 1792638000000 540) -1)) true false))
+
+(defn test-other [] :bool
+  (if (and (= (next-interval-ms 1792638000000 30) 1792639800000)
+           (= (next-interval-ms 1792638000000 0) -1)
+           (= (next-once-ms 1792639800000 1792638000000) 1792639800000)
+           (= (next-once-ms 1792638000000 1792638000000) -1)
+           (due? true 1792638000000 1792638000000)
+           (not (due? true 1792638000001 1792638000000))
+           (not (due? false 1792638000000 1792638000000))
+           (not (due? true -1 1792638000000))) true false))
