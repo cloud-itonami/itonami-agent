@@ -581,6 +581,64 @@ expected instants were computed independently by a minute-by-minute brute
 force. Receipt: `docs/evidence/schedule-selfhost-gate-20261022.edn`. The Node
 gateway (`cron.cljk`) is unchanged and does not call this module.
 
+## Self-organisation
+
+`kotoba/itonami/self_org.kotoba` decides how an itonami bot keeps working on
+a dandori board without a person in the loop (com-junkawasaki/root
+ADR-2610222130; Linear JUN-310). The board rules (what may be taken, in what
+order, who may move what) are dandori's (`cloud-itonami/app-itonami-dandori`
+`kotoba/dandori/work.kotoba`), and a claim is a sahai lease
+(`kotoba-lang/sahai` `kotoba/sahai/fence.kotoba`); this module holds the
+bot's side:
+
+- `wake-reason`: whether the trigger edge should issue an agent-step job for
+  this bot now. `wake/go`, or `wake/stopped` (the stop switch wins over
+  everything), `wake/lease-lapsed` (the organisation's lease was not renewed:
+  fail closed), `wake/over-budget`, `wake/busy` (at its work-in-progress
+  limit) and `wake/idle` (nothing takeable: no job, no cost).
+- `next-after` / `next-state`: what follows a turn on a claimed issue.
+  `next/complete` (done, with a receipt; state 4), `next/continue` (a step
+  made, with a receipt; keep the claim; 3), `next/retry` (failed, under the
+  attempt limit; 3) and `next/escalate` (blocked, an owner-only act, the
+  attempt limit, or an unknown outcome: back to the steward; 2). A turn that
+  says it finished or advanced but leaves no receipt counts as a failed
+  attempt, so a bot cannot spin on an issue.
+- `backoff-ms`: base * 2^(n-1) before retry n, at most the cap.
+- `staffing-reason`: what the steward proposes to the governor. `staff/add`
+  (takeable work and no worker, or more than high-per-worker per worker),
+  `staff/retire` (nothing takeable and a worker idle at least
+  retire-after-ms), `staff/hold`, or `staff/limit` (the day's change limit).
+
+Gate (no Node.js, nbb, JVM or babashka; not in CI, which is stopped):
+
+```bash
+AMU=../amu; G=$(mktemp -d)   # G must be under a path podman can mount
+cp "$AMU/seed/bootstrap/aarch64-linux-static-root.elf" "$G/root.elf"
+F=kotoba/itonami/self_org.kotoba
+end=$(grep -n 'test-staffing\]))' $F | cut -d: -f1)
+{ echo '(ns itonami-self-org-gate (:export [main]))'
+  tail -n +$((end+1)) $F
+  cat <<'EOF'
+(defn main [] :i64
+  (+ (if (test-wake) 1 0) (+ (if (test-next) 2 0)
+  (+ (if (test-backoff) 4 0) (if (test-staffing) 8 0)))))
+EOF
+} > "$G/gate.kotoba"
+podman run --rm --platform linux/arm64 --network none -e KEXE_CAP_RESOURCES_35="$G" \
+  -v "$G:$G" -w "$G" docker.io/library/python:3.12-alpine sh -c \
+  "./root.elf compile $G/gate.kotoba --target aarch64-linux --output $G/gate.elf --format static \
+   && chmod +x gate.elf && KEXE_STRUCTURED_REPORT=1 ./gate.elf"
+#   → {:status :ok :result 15 ...}      (15 = all four test-* true)
+```
+
+Measured 2026-10-22 with the root of amu `f5b11a08` (sha256 `8256bfd8…dc7`):
+`:result 15`. Counting a receipt-less "done" as complete gives `13`, and
+ignoring the stop switch gives `14`. Receipt:
+`docs/evidence/self-org-selfhost-gate-20261022.edn`. Nothing calls this module
+yet: the cell route it is for needs agent-step jobs (JUN-289), a static image
+that can reach the network (JUN-292) and a dandori board in yataverse
+(JUN-296).
+
 ## Resident gateway
 
 `~/Library/LaunchAgents/cloud.itonami.agent.gateway.plist` runs
