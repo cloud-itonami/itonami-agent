@@ -1,0 +1,163 @@
+;; itonami.self-org — how an itonami bot keeps working on a dandori board
+;; without a person in the loop, as pure Kotoba decisions (Linear JUN-310;
+;; com-junkawasaki/root ADR-2610222130, which carries ADR-2610142200's rules,
+;; floor and stop switch onto the cell route). The board rules themselves
+;; (what may be taken, in what order, who may move what) are dandori's
+;; (cloud-itonami/app-itonami-dandori kotoba/dandori/work.kotoba); a claim is a
+;; sahai lease (kotoba-lang/sahai kotoba/sahai/fence.kotoba). The caller
+;; passes counts, the clock and the outcome of a turn.
+;;
+;;   wake-reason      should the trigger edge issue an agent-step job for this
+;;                    bot now: wake/go, or wake/stopped (the stop switch),
+;;                    wake/lease-lapsed (the organisation's lease was not
+;;                    renewed: fail closed), wake/over-budget, wake/busy (at
+;;                    its work-in-progress limit), wake/idle (nothing takeable:
+;;                    no job, no cost)
+;;   next-after       what follows a turn on a claimed issue:
+;;                    next/complete  done, with a receipt
+;;                    next/continue  a step made, with a receipt; keep the claim
+;;                    next/retry     failed, or claimed progress without a
+;;                                   receipt, under the attempt limit
+;;                    next/escalate  blocked, floor (an owner-only act), the
+;;                                   attempt limit, or an unknown outcome: give
+;;                                   the issue back to the steward
+;;   next-state       the dandori state type that follows: complete 4,
+;;                    continue and retry 3, escalate 2
+;;   backoff-ms       wait before retry n: base * 2^(n-1), at most cap
+;;   staffing-reason  what the steward proposes to the governor:
+;;                    staff/add (takeable work and no worker, or more than
+;;                    high-per-worker per worker), staff/retire (nothing
+;;                    takeable and a worker idle at least retire-after-ms),
+;;                    staff/hold, staff/limit (the day's change limit reached)
+;;
+;; "No receipt, no progress": a turn that says it finished or advanced but
+;; leaves no receipt is a failed attempt, so a bot cannot spin on an issue.
+;;
+;; Written in the Amu selfhost seed subset; README "Self-organisation" has the
+;; gate.
+(ns itonami.self-org
+  (:export [wake-reason wake? next-after next-state backoff-ms staffing-reason
+            test-wake test-next test-backoff test-staffing]))
+
+;; ---------------------------------------------------------------------------
+;; Waking
+
+(defn wake-reason [stopped :bool lease-left-ms :i64 budget-left :i64
+                   takeable :i64 in-flight :i64 wip-limit :i64] :string
+  (cond stopped "wake/stopped"
+        (<= lease-left-ms 0) "wake/lease-lapsed"
+        (<= budget-left 0) "wake/over-budget"
+        (>= in-flight (if (< wip-limit 1) 1 wip-limit)) "wake/busy"
+        (<= takeable 0) "wake/idle"
+        :else "wake/go"))
+
+(defn wake? [reason :string] :bool (= reason "wake/go"))
+
+;; ---------------------------------------------------------------------------
+;; After a turn. attempts counts failed attempts on this claim, this one
+;; included.
+
+(defn failed-next [attempts :i64 max-attempts :i64] :string
+  (if (< attempts max-attempts) "next/retry" "next/escalate"))
+
+(defn next-after [outcome :string has-receipt :bool attempts :i64 max-attempts :i64] :string
+  (cond (= outcome "done") (if has-receipt "next/complete" (failed-next attempts max-attempts))
+        (= outcome "progress") (if has-receipt "next/continue" (failed-next attempts max-attempts))
+        (= outcome "failed") (failed-next attempts max-attempts)
+        :else "next/escalate"))
+
+;; -1 for an unknown next
+(defn next-state [next :string] :i64
+  (cond (= next "next/complete") 4
+        (= next "next/continue") 3
+        (= next "next/retry") 3
+        (= next "next/escalate") 2
+        :else -1))
+
+(defn backoff-at [ms :i64 k :i64 cap :i64] :i64
+  (cond (>= ms cap) cap
+        (<= k 1) ms
+        :else (backoff-at (* ms 2) (dec k) cap)))
+
+(defn backoff-ms [attempts :i64 base-ms :i64 cap-ms :i64] :i64
+  (cond (<= attempts 0) 0
+        (<= base-ms 0) 0
+        :else (backoff-at base-ms attempts cap-ms)))
+
+;; ---------------------------------------------------------------------------
+;; Staffing
+
+(defn staffing-reason [takeable :i64 workers :i64 high-per-worker :i64
+                       longest-idle-ms :i64 retire-after-ms :i64
+                       changes-today :i64 daily-limit :i64] :string
+  (cond (>= changes-today daily-limit) "staff/limit"
+        (and (> takeable 0) (<= workers 0)) "staff/add"
+        (> takeable (* workers (if (< high-per-worker 1) 1 high-per-worker))) "staff/add"
+        (and (<= takeable 0) (> workers 0) (> retire-after-ms 0)
+             (>= longest-idle-ms retire-after-ms)) "staff/retire"
+        :else "staff/hold"))
+
+;; ---------------------------------------------------------------------------
+;; test-* : zero-arity, true when every assertion holds.
+
+(defn test-wake [] :bool
+  (if (and (= (wake-reason false 1000 5 3 0 1) "wake/go")
+           (= (wake-reason true 1000 5 3 0 1) "wake/stopped")
+           ;; the stop switch wins over everything
+           (= (wake-reason true 0 0 0 9 1) "wake/stopped")
+           (= (wake-reason false 0 5 3 0 1) "wake/lease-lapsed")
+           (= (wake-reason false -1 5 3 0 1) "wake/lease-lapsed")
+           (= (wake-reason false 1000 0 3 0 1) "wake/over-budget")
+           (= (wake-reason false 1000 5 3 1 1) "wake/busy")
+           (= (wake-reason false 1000 5 3 1 2) "wake/go")
+           ;; a limit below 1 is 1
+           (= (wake-reason false 1000 5 3 1 0) "wake/busy")
+           (= (wake-reason false 1000 5 0 0 1) "wake/idle")
+           (wake? "wake/go") (not (wake? "wake/idle")))
+    true false))
+
+(defn test-next [] :bool
+  (if (and (= (next-after "done" true 0 3) "next/complete")
+           (= (next-after "progress" true 0 3) "next/continue")
+           ;; no receipt, no progress
+           (= (next-after "done" false 1 3) "next/retry")
+           (= (next-after "progress" false 2 3) "next/retry")
+           (= (next-after "progress" false 3 3) "next/escalate")
+           (= (next-after "failed" true 1 3) "next/retry")
+           (= (next-after "failed" false 3 3) "next/escalate")
+           (= (next-after "blocked" true 0 3) "next/escalate")
+           (= (next-after "floor" true 0 3) "next/escalate")
+           (= (next-after "weird" true 0 3) "next/escalate")
+           (= (next-state "next/complete") 4)
+           (= (next-state "next/continue") 3)
+           (= (next-state "next/retry") 3)
+           (= (next-state "next/escalate") 2)
+           (= (next-state "next/other") -1))
+    true false))
+
+(defn test-backoff [] :bool
+  (if (and (= (backoff-ms 0 1000 60000) 0)
+           (= (backoff-ms 1 1000 60000) 1000)
+           (= (backoff-ms 2 1000 60000) 2000)
+           (= (backoff-ms 3 1000 60000) 4000)
+           (= (backoff-ms 6 1000 60000) 32000)
+           (= (backoff-ms 7 1000 60000) 60000)
+           (= (backoff-ms 60 1000 60000) 60000)
+           (= (backoff-ms 2 0 60000) 0)
+           (= (backoff-ms 1 90000 60000) 60000))
+    true false))
+
+(defn test-staffing [] :bool
+  (if (and (= (staffing-reason 3 0 5 0 0 0 2) "staff/add")
+           (= (staffing-reason 11 2 5 0 0 0 2) "staff/add")
+           (= (staffing-reason 10 2 5 0 0 0 2) "staff/hold")
+           (= (staffing-reason 0 2 5 86400000 86400000 0 2) "staff/retire")
+           (= (staffing-reason 0 2 5 86399999 86400000 0 2) "staff/hold")
+           ;; retirement is off when retire-after-ms is 0
+           (= (staffing-reason 0 2 5 99 0 0 2) "staff/hold")
+           (= (staffing-reason 1 2 5 86400000 86400000 0 2) "staff/hold")
+           (= (staffing-reason 0 0 5 0 0 0 2) "staff/hold")
+           (= (staffing-reason 11 2 5 0 0 2 2) "staff/limit")
+           ;; a high-per-worker below 1 is 1
+           (= (staffing-reason 3 2 0 0 0 0 2) "staff/add"))
+    true false))
