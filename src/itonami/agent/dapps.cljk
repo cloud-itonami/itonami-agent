@@ -1,0 +1,145 @@
+(ns itonami.agent.dapps
+  "The `itonami_dapps` toolset: itonami dapps registered in the Itonami
+  Registry as stdio MCP servers, launched for a run without touching the
+  profile.
+
+  `-t itonami_dapps` adds the servers below to the run's effective
+  `mcp_servers` (never to the profile's config.yaml), so their tools appear as
+  `mcp__<server>__<tool>` through the ordinary MCP path (itonami.agent.mcp).
+  A server of the same name already in the profile wins: the owner's spec is
+  kept as written. `no_mcp`, a disabled `itonami_dapps` / server name, and peer
+  runs launch nothing, the same as any other MCP server.
+
+  The checkout is resolved, in order, from the registry entry's placeholder
+  variable (MIHARI_REPO, DANDORI_REPO) and then the west sibling of this
+  repository (`../../cloud-itonami/app-itonami-<name>`). Nothing is cloned or
+  fetched here: a checkout that cannot be found is reported as an MCP server
+  issue for that run, and its tools are simply absent.
+
+  The tools are pure functions over the text passed to them. They read no
+  network and store nothing (the registry entries say so and the servers'
+  tests check it); launching one still runs `kbb` from the checkout, so its
+  first start resolves the pinned kotoba-lang/text git dependency."
+  (:require [itonami.agent.host :as h]
+            [itonami.agent.mcp :as mcp]))
+
+(def toolset "itonami_dapps")
+
+(def registry
+  "Where these come from. The registry commit is the one that published the
+  entries; the source commit is what the registry pinned. A newer checkout is
+  used as found — the pin is provenance, not an admission check."
+  {:repository "cloud-itonami/itonami-registry"
+   :commit "422e10b3fe6f1261e2daf9a58ada4f2b2b489a2b"})
+
+(def servers
+  [{:name "mihari"
+    :entry "mcp/mihari"
+    :title "mihari — Sentry-compatible error grouping and triage rules"
+    :source {:repository "cloud-itonami/app-itonami-mihari"
+             :commit "8f2ec46a27910b3ccb082ec7029819e109b37949"}
+    :placeholder "MIHARI_REPO"
+    :west-path "cloud-itonami/app-itonami-mihari"
+    :launcher "bin/mihari-mcp"}
+   {:name "dandori"
+    :entry "mcp/dandori"
+    :title "dandori — Linear-compatible export conversion and planning checks"
+    :source {:repository "cloud-itonami/app-itonami-dandori"
+             :commit "dbe623ba539af93101e2b8bba1cf9b563cb0d0e8"}
+    :placeholder "DANDORI_REPO"
+    :west-path "cloud-itonami/app-itonami-dandori"
+    :launcher "bin/dandori-mcp"}])
+
+(def ^:private launch-timeout-s
+  "The first start resolves the pinned git dependency, and dandori re-executes
+  itself from its own checkout; 30 s (the MCP default) is tight for that."
+  90)
+
+(defn requested? [sets]
+  (boolean (some #{toolset} sets)))
+
+(defn- agent-root
+  "This repository's root, from the launcher (bin/itonami-agent-kbb sets
+  ITONAMI_AGENT_BIN). Nil when the library is loaded some other way — then
+  only the placeholder variables resolve."
+  []
+  (when-let [bin (h/env "ITONAMI_AGENT_BIN")]
+    (h/dirname (h/dirname bin))))
+
+(defn- candidates [{:keys [placeholder west-path]} env]
+  (let [explicit (or (get env placeholder) (h/env placeholder))
+        root (agent-root)]
+    (cond-> []
+      (seq explicit) (conj {:from placeholder :dir (h/expand explicit)})
+      root (conj {:from "west sibling" :dir (h/join root ".." ".." west-path)}))))
+
+(defn resolve-checkout
+  "{:dir d :launcher l :from how} for the first candidate whose launcher exists,
+  else {:error msg}. An explicit placeholder that does not hold the launcher is
+  an error — falling through to another checkout would run something the
+  operator did not name."
+  [server env]
+  (let [cs (candidates server env)
+        found (first (filter #(h/file? (h/join (:dir %) (:launcher server))) cs))
+        explicit (first (filter #(= (:placeholder server) (:from %)) cs))]
+    (cond
+      (and explicit (not= explicit found))
+      {:error (str toolset ": " (:placeholder server) "=" (:dir explicit)
+                   " has no " (:launcher server))}
+      found
+      (assoc found :launcher (h/join (:dir found) (:launcher server)))
+      :else
+      {:error (str toolset ": no " (:west-path server) " checkout found; set "
+                   (:placeholder server) " to its absolute path")})))
+
+(defn server-spec [launcher]
+  {"command" "kbb" "args" [launcher] "timeout" launch-timeout-s})
+
+(defn with-servers
+  "When `itonami_dapps` is requested: {:config c :added [names] :errors [...]}.
+  `c` is `config` with each resolvable dapp server added to `mcp_servers`; a
+  server the profile already defines is kept as the profile wrote it and still
+  counts as added. Otherwise the config is returned unchanged."
+  [config requested-sets env]
+  (if-not (requested? requested-sets)
+    {:config config :added [] :errors []}
+    (reduce (fn [acc {:keys [name] :as server}]
+              (if (get-in acc [:config "mcp_servers" name])
+                (update acc :added conj name)
+                (let [{:keys [error launcher]} (resolve-checkout server env)]
+                  (if error
+                    (update acc :errors conj {"server" name "error" error})
+                    (-> acc
+                        (assoc-in [:config "mcp_servers" name] (server-spec launcher))
+                        (update :added conj name))))))
+            {:config config :added [] :errors []}
+            servers)))
+
+(defn select-servers
+  "The MCP servers a run starts. `mcp/names-for` treats explicitly named
+  servers as an allowlist, which would drop the dapps whenever another server
+  is named (`-t mcp-cloudflare,itonami_dapps`); requesting the toolset names
+  its servers, so they are added back unless the run opts out."
+  [config requested disabled added]
+  (let [base (mcp/names-for config requested disabled)
+        off? (fn [s] (some #{s (str "mcp-" s)} disabled))]
+    (cond
+      (some #{"no_mcp"} requested) base
+      (some #{toolset} disabled) (vec (remove (set added) base))
+      :else (vec (distinct (concat base
+                                   (filter #(and (not (off? %))
+                                                 (mcp/enabled? (get-in config ["mcp_servers" %])))
+                                           added)))))))
+
+(defn status
+  "One row per dapp server for `itonami-agent dapps`: how it resolves on this
+  host, without starting anything."
+  [env]
+  (for [{:keys [name entry title source placeholder] :as server} servers
+        :let [{:keys [error launcher from]} (resolve-checkout server env)]]
+    (cond-> {"server" name "entry" entry "title" title
+             "registry" (str (:repository registry) "@" (subs (:commit registry) 0 12))
+             "source" (str (:repository source) "@" (subs (:commit source) 0 12))
+             "placeholder" placeholder}
+      launcher (assoc "launcher" launcher "resolved_from" from)
+      error (assoc "error" error))))

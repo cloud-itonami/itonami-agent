@@ -17,6 +17,7 @@
             [itonami.agent.computer-use :as computer-use]
             [itonami.agent.tools :as tools]
             [itonami.agent.mcp :as mcp]
+            [itonami.agent.dapps :as dapps]
             [itonami.agent.yaml :as yaml]
             [itonami.agent.confine :as confine]))
 
@@ -206,8 +207,18 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         requested-sets (when (nil? tool-names) (or toolsets ["hermes-cli"]))
         disabled (tools/execution-disabled-toolsets config platform)
         all-requested (or tool-names requested-sets)
-        mcp-servers (if (and requested-sets (not peer?)) (mcp/names-for config requested-sets disabled) [])
-        unknown-sets (tools/unsupported-toolsets requested-sets (set (keys (get config "mcp_servers" {}))))
+        ;; `itonami_dapps` adds the registered dapp MCP servers to this run's
+        ;; effective config only; the profile's config.yaml is not touched.
+        ;; Peer runs start no MCP servers, so nothing is added there.
+        dapps (if peer?
+                {:config config :added [] :errors []}
+                (dapps/with-servers config requested-sets env))
+        config (:config dapps)
+        mcp-servers (if (and requested-sets (not peer?))
+                      (dapps/select-servers config requested-sets disabled (:added dapps))
+                      [])
+        unknown-sets (tools/unsupported-toolsets requested-sets
+                                                 (conj (set (keys (get config "mcp_servers" {}))) dapps/toolset))
         _ (when (seq unknown-sets)
             (throw (ex-info (str "Kotoba agent does not recognize Hermes toolsets: "
                                  (str/join ", " unknown-sets))
@@ -220,7 +231,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         names (tools/runtime-tool-names all-requested disabled browser-cdp-configured?
                                          (browser-runtime/cli-available?)
                                          (computer-use/cli-available? env))
-        mcp-data (mcp/discover config env mcp-servers (:home prof))
+        mcp-data (update (mcp/discover config env mcp-servers (:home prof)) :errors into (:errors dapps))
         mcp-index (:index mcp-data)
         mcp-names (vec (keys mcp-index))
         names (into names mcp-names)

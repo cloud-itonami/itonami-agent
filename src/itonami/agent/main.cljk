@@ -26,6 +26,7 @@
     itonami-agent profile bundle <p>                        print the bundle CID and file list
     itonami-agent profile refresh-bundle <p>                recompute CID after profile files change
     itonami-agent gateway run [--interval 60]               tick every adopted profile (resident)
+    itonami-agent dapps                                     itonami_dapps MCP servers and how they resolve here
     itonami-agent peer id | serve [--port 7420 --url U --max-runs 2]
                        | add <url> [--did D --trust] | trust <did> | list
                        | run -p P -z PROMPT                  run one turn on a trusted peer
@@ -52,6 +53,7 @@
             [itonami.agent.vault :as vault]
             [itonami.agent.oauth :as oauth]
             [itonami.agent.mcp :as mcp]
+            [itonami.agent.dapps :as dapps]
             [itonami.agent.execution-ledger :as execution-ledger]
             [itonami.agent.p2p :as p2p]
             [itonami.agent.rails :as rails]
@@ -440,6 +442,14 @@
 
       (die 2 "usage: itonami-agent mcp login <server> [--device]"))))
 
+(defn dapps-cmd
+  "The `itonami_dapps` toolset's MCP servers and how each resolves on this
+  host (one JSON object per line). Reads only; starts nothing and changes no
+  profile."
+  [_opts _args]
+  (doseq [row (dapps/status (h/process-env))]
+    (println (h/json-str row))))
+
 ;; ---------------------------------------------------------------- profile
 
 (defn- set-hermes-parked!
@@ -484,7 +494,7 @@
                                     (not (mcp/oauth-cache-ready? (:home prof) % (get servers % {}))))
                               selected-mcp)
         bad-sets (if (true? (get job "no_agent")) []
-                   (tools/unsupported-toolsets requested (set (keys servers))))
+                   (tools/unsupported-toolsets requested (conj (set (keys servers)) dapps/toolset)))
         browser-cdp (browser-cdp-configured? prof)
         bad-tools (if (true? (get job "no_agent")) []
                     (tools/unsupported-tools (tools/runtime-tool-names requested disabled browser-cdp
@@ -1103,6 +1113,7 @@
               "chat" (chat opts)
               "vault" (vault-cmd opts (rest pos))
               "mcp" (mcp-cmd opts (rest pos))
+              "dapps" (dapps-cmd opts (rest pos))
               "cron" (cron-cmd opts (rest pos))
               "profile" (profile-cmd opts (rest pos))
               "gateway" (if (= "run" (second pos)) (gateway-run opts) (die 2 "usage: itonami-agent gateway run"))

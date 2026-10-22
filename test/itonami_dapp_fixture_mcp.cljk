@@ -1,0 +1,42 @@
+#!/usr/bin/env kbb
+;; Stand-in for an itonami dapp's bin/<name>-mcp in itonami.agent.dapps-test.
+;; dapps-test copies this file to <tmp checkout>/bin/<name>-mcp, so the agent
+;; launches it exactly as it launches the real servers (`kbb <launcher>`). It
+;; speaks the same stdio MCP lines and names itself after the file it was
+;; copied to; tools/call echoes the server name and the arguments.
+;;
+;; The shebang is load-bearing, as in the real launchers: plain `kbb <file>`
+;; takes the SCI route only for a file that declares it, and otherwise treats
+;; the file as a .kotoba guest and refuses it without a policy
+;; (:kbb/policy-required, measured 2026-10-22).
+(ns itonami-dapp-fixture-mcp
+  (:require ["node:path" :as path]
+            ["node:readline" :as readline]
+            [nbb.core :refer [*file*]]))
+
+(def server (first (.split (path/basename *file*) "-mcp")))
+
+(defn- respond [id result]
+  (.write js/process.stdout
+          (str (js/JSON.stringify (clj->js {"jsonrpc" "2.0" "id" id "result" result})) "\n")))
+
+(defn- handle [line]
+  (let [req (try (js->clj (js/JSON.parse line)) (catch :default _ nil))
+        id (get req "id")]
+    (when (and req (contains? req "id"))
+      (case (get req "method")
+        "initialize" (respond id {"protocolVersion" (get-in req ["params" "protocolVersion"])
+                                  "capabilities" {"tools" {}}
+                                  "serverInfo" {"name" server "version" "fixture"}})
+        "tools/list" (respond id {"tools" [{"name" "probe"
+                                            "description" (str "Fixture tool of " server)
+                                            "inputSchema" {"type" "object"
+                                                           "properties" {"text" {"type" "string"}}
+                                                           "required" ["text"]}}]})
+        "tools/call" (let [out {"server" server "arguments" (get-in req ["params" "arguments"])}]
+                       (respond id {"content" [{"type" "text" "text" (js/JSON.stringify (clj->js out))}]
+                                    "isError" false}))
+        (respond id {})))))
+
+(let [rl (.createInterface readline #js {:input js/process.stdin :terminal false})]
+  (.on rl "line" handle))
