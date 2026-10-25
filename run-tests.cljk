@@ -8,6 +8,14 @@
 
 (aset (.-env js/process) "ITONAMI_DIR" (path/join (os/tmpdir) (str "itonami-agent-test-" (.-pid js/process))))
 
+;; The Hermes session that runs these tests may export HERMES_SESSION_* (its
+;; own routing stamps). Several watcher tests assert the no-stamp case and
+;; pass only when those are absent -- so make the runner hermetic instead of
+;; asking every caller to clean its shell first.
+(doseq [k (js/Object.keys (.-env js/process))]
+  (when (.startsWith k "HERMES_SESSION_")
+    (js-delete (.-env js/process) k)))
+
 (require 'itonami.agent.execute-code-rpc-test 'itonami.agent.p2p-service-test 'itonami.agent.core-test 'itonami.agent.code-rpc-test 'itonami.agent.process-checkpoint-test 'itonami.agent.process-notice-test 'itonami.agent.process-watch-test 'itonami.agent.oneshot-linger-test 'itonami.agent.spawn-notes-test 'itonami.agent.watcher-register-test 'itonami.agent.watcher-delivery-test 'itonami.agent.gateway-test 'itonami.agent.gateway-admission-test 'itonami.agent.session-search-test 'itonami.agent.delivery-queue-test 'itonami.agent.dapps-test)
 
 (defmethod t/report [:cljs.test/default :end-run-tests] [m]
