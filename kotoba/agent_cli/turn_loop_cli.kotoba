@@ -3,7 +3,7 @@
   guest that asks the model, parses a tool request from the generation,
   runs the tool against the ported stores, and reports. The dispatch
   grammar is the measured minimal one -- a generation line
-  `tool:<name>:<arg>` is honored (notepad get/set, kanban show, search);
+  `tool:<name>:<arg>` is honored (notepad get, kanban show, search);
   anything else is the final answer.
 
   This pins the 逐次面 loop shape: prompt -> model -> tool -> model ...
@@ -13,7 +13,8 @@
             [itonami.notepad :as np]
             [itonami.tasks :as t]
             [itonami.session-search :as ss]
-            [itonami.journal-core :as jc])
+            [itonami.journal-core :as jc]
+            [agent-cli.turn-request :as request])
   (:export [turn-loop-cli])
   (:capabilities #{:cli/args :io/write :llm/generate}))
 
@@ -44,8 +45,8 @@
   (if (>= depth 4)
     "budget exhausted"
     (let [answer (wire-llm prompt)]
-      (if (= 116 (string-code-point-at answer 0))
-        ;; the generation opens with t = a tool request line
+      (if (request/tool-request? answer)
+        ;; Only the complete, known read-only tool grammar can invoke a tool.
         (let [observed (tool-run base answer)]
           (turn-once base job
                      (string-concat prompt
