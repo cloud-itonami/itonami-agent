@@ -1,0 +1,30 @@
+(ns itonami.agent.collect-io-test
+  "The signer is real: generate the node key, sign a canonical string, verify
+  it back through the did. The receipt mapping is fail-closed: no transfer id
+  is no receipt."
+  (:require [cljs.test :refer [deftest is testing]]
+            ["node:crypto" :as crypto]
+            [itonami.agent.collect-io :as cio]
+            [itonami.agent.p2p :as p2p]))
+
+(deftest node-signer-signs-what-verifies
+  (let [sign (cio/node-signer)
+        did (cio/node-did)
+        canonical "event/v1\nmeter-reading\nkwh=1\n"
+        sig (sign canonical)
+        k (p2p/did->public-key did)]
+    (is (string? sig))
+    (is (seq sig))
+    (is (some? k) "the did resolves to a public key")
+    (is (crypto/verify nil (js/Buffer.from canonical "utf8") k (js/Buffer.from sig "base64")))
+    (testing "a different message does not verify under the same signature"
+      (is (not (crypto/verify nil (js/Buffer.from "event/v1\nmeter-reading\nkwh=2\n" "utf8") k (js/Buffer.from sig "base64")))))))
+
+(deftest receipt-mapping-is-fail-closed
+  (is (= {:transfer-id "bafk1" :signed-by "did:key:zA" :appended-at 5}
+         (cio/receipt {:transfer-id "bafk1" :appended-at 5} "did:key:zA")))
+  (is (nil? (cio/receipt {:transfer-id ""} "did:key:zA")) "empty transfer id is not a receipt")
+  (is (nil? (cio/receipt {:appended-at 5} "did:key:zA")) "no transfer id is not a receipt")
+  (is (nil? (cio/receipt "ok" "did:key:zA")) "a bare status is not a receipt")
+  (is (nil? (cio/receipt {:transfer-id "bafk1"} "")) "an unnamed signer is not a receipt")
+  (is (nil? (cio/receipt nil "did:key:zA"))))
