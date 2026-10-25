@@ -1,0 +1,53 @@
+(ns itonami.agent.collect-test
+  "The collector core is fail-closed: no signature or no receipt means the row
+  is NOT done, refusals are named, and refused work is never dropped."
+  (:require [cljs.test :refer [deftest is testing]]
+            [itonami.agent.collect :as c]))
+
+(def row {:id "tx-1" :kind "spend" :canonical "event/v1\nx\n" :status "pending" :created-at 1})
+
+(deftest certify-row-happy-path-requires-signature-and-receipt
+  (let [opts {:sign-fn (fn [_] "sig1")
+              :append-fn (fn [_ _] {:transfer-id "bafk1" :signed-by "did:key:zA" :appended-at 7})}
+        r (c/certify-row row opts)]
+    (is (:ok r))
+    (is (= "done" (:status (:row r))))
+    (is (= "bafk1" (:transfer-id (:row r))))
+    (is (= ["did:key:zA"] (:signed-by (:row r))))))
+
+(deftest no-signature-means-not-done
+  (is (= :no-signature (:reason (c/certify-row row {:sign-fn (fn [_] "") :append-fn (fn [_ _] {:transfer-id "x"})}))))
+  (is (= :no-signature (:reason (c/certify-row row {:sign-fn (fn [_] nil) :append-fn (fn [_ _] {:transfer-id "x"})})))))
+
+(deftest no-receipt-means-not-done
+  (is (= :no-receipt (:reason (c/certify-row row {:sign-fn (fn [_] "s") :append-fn (fn [_ _] nil)}))))
+  (is (= :no-receipt (:reason (c/certify-row row {:sign-fn (fn [_] "s") :append-fn (fn [_ _] {:transfer-id ""})})))))
+
+(deftest append-failure-is-a-named-refusal-and-the-row-stays-pending
+  (let [r (c/certify-row row {:sign-fn (fn [_] "s")
+                              :append-fn (fn [_ _] (throw (js/Error. "transport down")))})]
+    (is (= :append-failed (:reason r)))
+    (is (= "pending" (:status row)))))
+
+(deftest certify-keeps-order-and-refuses-named
+  (let [rows [row (assoc row :id "tx-2") (assoc row :id "tx-3" :canonical "")]
+        out (c/certify rows {:sign-fn (fn [_] "s")
+                             :append-fn (fn [r _] (when-not (= "tx-2" (:id r)) {:transfer-id (str "t-" (:id r))}))})]
+    (is (= ["tx-1" "tx-2" "tx-3"] (mapv :id (:rows out))))
+    (is (= ["tx-1"] (mapv :id (filter #(= "done" (:status %)) (:rows out)))))
+    (is (= [{:id "tx-2" :reason :no-receipt} {:id "tx-3" :reason :bad-canonical}]
+           (:refusals out)))))
+
+(deftest reconcile-names-every-disagreement
+  (let [done (assoc row :status "done" :transfer-id "t1" :signed-by ["a"])
+        pending (assoc row :id "tx-2")]
+    (is (= [] (c/reconcile [done] [{:id "tx-1" :canonical (:canonical done) :transfer-id "t1"}])))
+    (let [p (c/reconcile [done pending]
+                         [{:id "tx-1" :canonical (:canonical done) :transfer-id "WRONG"}
+                          {:id "ghost" :canonical "x" :transfer-id "y"}])]
+      (is (= [{:id "tx-2" :refusal :still-pending}
+              {:id "tx-1" :refusal :receipt-mismatch}
+              {:id "ghost" :refusal :appended-but-unknown}]
+             p)))
+    (is (= [{:id "tx-1" :refusal :canonical-mismatch}]
+           (c/reconcile [done] [{:id "tx-1" :canonical "different" :transfer-id "t1"}])))))
