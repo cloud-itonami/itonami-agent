@@ -443,6 +443,26 @@
                 "models" (->> recs (map :service/model-id) distinct sort vec)
                 "load" 0}))))
 
+(defn overlay-service-records
+  "Merge kekkai service records into discovered peer infos. A record is the
+  offer of record for its did: when records name a did, their model list IS
+  that peer's lend list in the resolution input -- live discovery says who is
+  up and how loaded, the records say what they offer (ADR-0145). Dids with
+  no records keep their discovered infos untouched; invalid records are
+  ignored, never merged. Deterministic: dids sorted where records supply the
+  models."
+  [infos services]
+  (let [by-did (group-by :service/did (filter service-record? services))
+        merged (mapv (fn [i]
+                       (if-let [recs (get by-did (:did i))]
+                         (assoc i "models" (->> recs (map :service/model-id) distinct sort vec))
+                         i))
+                     (vec infos))]
+    ;; records for a did discovery never reached are not candidates: an
+    ;; unreachable offer is not advertised (the netmap projection filters the
+    ;; same way). So only the overlay above, no append.
+    merged))
+
 (defn- infer-peers
   "Trusted, reachable peers that lend a model for this request, least loaded first."
   [infos model]
