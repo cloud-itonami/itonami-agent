@@ -408,6 +408,41 @@
     (p/resolved (:infos @peer-cache))
     (p/let [infos (discover)] (reset! peer-cache {:at (h/now-ms) :infos infos}) infos)))
 
+;; ---------------------------------------------------------------- service records (ADR-0145)
+;; Shape contract with kekkai's :netmap/services projection
+;; (kotoba-lang/kekkai kekkai.service-record). This side stays dependency-free
+;; (AGENTS.md), so the check is a local copy of that shape: required keys,
+;; non-empty digest and model id, positive epoch. Change the two together.
+
+(def service-record-keys
+  [:service/did :service/multiaddr :service/engine :service/model-id
+   :service/digest :service/epoch])
+
+(defn- service-record? [rec]
+  (and (map? rec)
+       (every? #(contains? rec %) service-record-keys)
+       (string? (:service/did rec)) (seq (:service/did rec))
+       (string? (:service/model-id rec)) (seq (:service/model-id rec))
+       (string? (:service/digest rec)) (seq (:service/digest rec))
+       (int? (:service/epoch rec)) (pos? (:service/epoch rec))))
+
+(defn service-records->peer-infos
+  "kekkai :netmap/services entries -> peer-info fragments in the shape
+  `infer-peers` consumes (`:did` for the trust check, `\"models\"` for the
+  lend check, `\"load\"` for the least-loaded sort). Invalid records are
+  dropped, not repaired: an offer without a digest stays unverified and
+  never becomes a candidate (ADR-0145). Same-did records merge their model
+  lists; epoch ordering is the netmap projection's job, not this adapter's."
+  [services]
+  (->> services
+       (filter service-record?)
+       (group-by :service/did)
+       (sort-by key)
+       (mapv (fn [[did recs]]
+               {:did did
+                "models" (->> recs (map :service/model-id) distinct sort vec)
+                "load" 0}))))
+
 (defn- infer-peers
   "Trusted, reachable peers that lend a model for this request, least loaded first."
   [infos model]
