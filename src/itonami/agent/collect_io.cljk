@@ -1,0 +1,46 @@
+(ns itonami.agent.collect-io
+  "Thin adapters from itonami.agent.collect's injected fns to the real
+  things, and nothing more.
+
+  What is settled here (JUN-410 measurements, 2026-10-25): the collector's
+  self-sig is THIS node's own key -- p2p/node-key, the ed25519 key that never
+  leaves <ITONAMI_DIR>/node/key.json. kagi cannot be the unattended signer
+  (it unlocks only in a person's session), and engi's self-sig is the party's
+  own signature, so the bot's node key is the right subject.
+
+  What is deliberately NOT here: the kotobase wire format. The append side
+  goes through kotobase-sdk with its own auth/provenance; inventing an HTTP
+  shape here would pin a guessed API. `receipt` is the pure mapping from an
+  SDK result to collect's receipt contract -- the transport call itself is
+  injected when the SDK wiring lands."
+  (:require [itonami.agent.p2p :as p2p]
+            ["node:crypto" :as crypto]))
+
+(defn node-signer
+  "A sign-fn over the raw canonical bytes: ed25519, base64. Unattended-safe --
+  the key is the node's own and needs no human session."
+  []
+  (let [{:keys [private]} (p2p/node-key)]
+    (fn [canonical]
+      (.toString (crypto/sign nil (js/Buffer.from (str canonical) "utf8") private) "base64"))))
+
+(defn node-did
+  "The did:key whose signature this signer produces -- what a receipt's
+  :signed-by must name."
+  []
+  (:did (p2p/node-key)))
+
+(defn receipt
+  "Map an SDK append result to collect.cljk's receipt contract, or nil on any
+  doubt (collect treats nil as :no-receipt and keeps the row pending).
+  A result is a receipt only when it names a transfer id; anything else --
+  partial, unknown, or errored -- is not evidence of an append."
+  [result signed-by]
+  (when (and (map? result)
+             (string? (:transfer-id result))
+             (seq (:transfer-id result))
+             (string? signed-by)
+             (seq signed-by))
+    {:transfer-id (:transfer-id result)
+     :signed-by signed-by
+     :appended-at (:appended-at result)}))
