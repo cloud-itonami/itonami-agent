@@ -38,3 +38,42 @@
 (deftest empty-in-empty-out
   (is (= [] (p2p/service-records->peer-infos [])))
   (is (= [] (p2p/service-records->peer-infos nil))))
+
+;; ── overlay: records are the offer of record, discovery is liveness ─────────
+
+(def live-infos
+  [{:did "did:key:zServer" "models" ["stale-name"] "load" 2}
+   {:did "did:key:zOther" "models" ["qwen3.8"] "load" 5}
+   {:did "did:key:zDown" :error "unreachable" "models" []}])
+
+(deftest overlay-lets-records-name-the-lend-list
+  (let [got (p2p/overlay-service-records live-infos [ok-rec])]
+    (is (= ["mishima"] (get (first (filter #(= "did:key:zServer" (:did %)) got)) "models")))
+    (testing "load and liveness come from discovery, not from records"
+      (is (= 2 (get (first (filter #(= "did:key:zServer" (:did %)) got)) "load"))))))
+
+(deftest overlay-leaves-recordless-dids-untouched
+  (let [got (p2p/overlay-service-records live-infos [ok-rec])]
+    (is (= ["qwen3.8"] (get (first (filter #(= "did:key:zOther" (:did %)) got)) "models")))
+    (is (= 3 (count got)))))
+
+(deftest overlay-ignores-invalid-records
+  (let [got (p2p/overlay-service-records live-infos [(dissoc ok-rec :service/digest)])]
+    (is (= ["stale-name"] (get (first (filter #(= "did:key:zServer" (:did %)) got)) "models")))))
+
+(deftest overlay-does-not-append-unreachable-offers
+  ;; zGhost has a valid record but discovery never reached it: not a candidate.
+  (let [got (p2p/overlay-service-records live-infos [(assoc ok-rec :service/did "did:key:zGhost")])]
+    (is (= 3 (count got)))
+    (is (nil? (some #(= "did:key:zGhost" (:did %)) got)))))
+
+(deftest overlay-honors-everything-at-once
+  (let [got (p2p/overlay-service-records
+             live-infos
+             [ok-rec
+              (assoc ok-rec :service/model-id "qwen3.8" :service/epoch 9)
+              (assoc ok-rec :service/did "did:key:zDown" :service/model-id "mishima")
+              (dissoc ok-rec :service/digest)])]
+    (is (= ["mishima" "qwen3.8"]
+           (get (first (filter #(= "did:key:zServer" (:did %)) got)) "models")))
+    (is (= ["mishima"] (get (first (filter #(= "did:key:zDown" (:did %)) got)) "models")))))
