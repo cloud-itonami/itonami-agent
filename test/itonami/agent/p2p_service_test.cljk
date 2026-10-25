@@ -1,0 +1,40 @@
+(ns itonami.agent.p2p-service-test
+  "ADR-0145 P1's client adapter: kekkai :netmap/services records become the
+  peer-info fragments infer-peers resolves against. The fail-closed rule is
+  the point -- an offer without a digest is unverified and never a candidate."
+  (:require [cljs.test :refer [deftest is testing]]
+            [itonami.agent.p2p :as p2p]))
+
+(def ok-rec
+  {:service/did "did:key:zServer"
+   :service/multiaddr "/ip4/127.0.0.1/tcp/41643"
+   :service/engine "kotoba-inference"
+   :service/model-id "mishima"
+   :service/digest "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+   :service/epoch 7})
+
+(deftest valid-records-become-peer-infos
+  (is (= [{:did "did:key:zServer" "models" ["mishima"] "load" 0}]
+         (p2p/service-records->peer-infos [ok-rec]))))
+
+(deftest same-did-merges-model-lists
+  (let [got (p2p/service-records->peer-infos
+             [ok-rec (assoc ok-rec :service/model-id "qwen3.8" :service/epoch 2)])]
+    (is (= 1 (count got)))
+    (is (= ["mishima" "qwen3.8"] (get (first got) "models")))))
+
+(deftest invalid-records-are-dropped-not-repaired
+  (testing "no digest -> unverified -> never a candidate"
+    (is (= [] (p2p/service-records->peer-infos [(dissoc ok-rec :service/digest)]))))
+  (testing "bad epoch / missing keys / wrong shapes drop individually"
+    (is (= [] (p2p/service-records->peer-infos [(assoc ok-rec :service/epoch 0)])))
+    (is (= [] (p2p/service-records->peer-infos [{:service/did "did:key:zX"}])))
+    (is (= [] (p2p/service-records->peer-infos ["not-a-map"]))))
+  (testing "a mixed batch keeps only the valid entries"
+    (is (= ["did:key:zServer"]
+           (mapv :did (p2p/service-records->peer-infos
+                       [ok-rec (dissoc ok-rec :service/model-id)]))))))
+
+(deftest empty-in-empty-out
+  (is (= [] (p2p/service-records->peer-infos [])))
+  (is (= [] (p2p/service-records->peer-infos nil))))
