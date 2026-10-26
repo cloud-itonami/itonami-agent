@@ -1,0 +1,44 @@
+(ns agent-cli.turn-request
+  "Parse the bounded, read-only tool request grammar used by the native turn
+  loop. A model answer is a tool request only when the entire line has the
+  exact shape tool:<known-name>:<nonempty-arg>. Everything else is an answer,
+  so a generated sentence beginning with t cannot cause a tool call."
+  (:export [tool-request? test-tool-request]))
+
+(defn- known-tool? [name :string] :bool
+  (or (string=? name "notepad-get")
+      (or (string=? name "kanban-show")
+          (string=? name "search"))))
+
+(defn tool-request? [answer :string] :bool
+  (let [n (string-length answer)]
+    (if (< n 7)
+      false
+      (if (not (string=? (string-substring answer 0 5) "tool:"))
+        false
+        (let [tail (string-substring answer 5 n)]
+          (let [separator (string-index-of tail ":")]
+            (if (< separator 1)
+              false
+              (let [name (string-substring tail 0 separator)
+                    arg (string-substring tail (+ separator 1)
+                                          (string-length tail))]
+                (and (known-tool? name)
+                     (> (string-length arg) 0)
+                     (< (string-index-of arg ":") 0)
+                     (< (string-index-of arg "\n") 0)
+                     (< (string-index-of arg "\r") 0))))))))))
+
+(defn test-tool-request [] :bool
+  (and (tool-request? "tool:notepad-get:key")
+       (tool-request? "tool:kanban-show:job-1")
+       (tool-request? "tool:search:日本語")
+       (not (tool-request? ""))
+       (not (tool-request? "today is done"))
+       (not (tool-request? "tool:"))
+       (not (tool-request? "tool:search"))
+       (not (tool-request? "tool:unknown:key"))
+       (not (tool-request? "tool:notepad-get:"))
+       (not (tool-request? "tool:notepad-get:a:b"))
+       (not (tool-request? "tool:notepad-get:a\nb"))
+       (not (tool-request? "tool:search:a\rb"))))
