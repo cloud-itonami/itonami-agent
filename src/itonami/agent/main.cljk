@@ -1085,7 +1085,7 @@
         db-path (h/join (:home prof) "state.db")
         limit (or (some-> (:limit opts) (js/parseInt 10)) 20)]
     (case (str sub)
-      ("list" "nil")
+      ("" "list")
       (let [rows (tools/sessions-browse db-path limit)]
         (if (seq rows)
           (doseq [r rows]
