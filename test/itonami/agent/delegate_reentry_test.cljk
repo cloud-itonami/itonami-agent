@@ -57,6 +57,29 @@
     (loop/persist-delegate-state!))
   (is (= "newer on disk" (get-in (get (loop/load-delegate-state) "children") ["kid" "summary"]))))
 
+(deftest lock-contention-is-transient-not-fatal
+  ;; the R8 gate: the busy sentinel is the HOST namespace's keyword — the
+  ;; old comparison never matched (silent persist skips; a raw keyword
+  ;; crashing (seq pending)). Both paths are now tested against the REAL
+  ;; sentinel value.
+  (with-redefs [h/with-lock (fn [_ _] :itonami.agent.host/busy)]
+    ;; persist: busy is retried then loudly logged — never silent (the
+    ;; outcome is invisible here; the contract is no-throw)
+    (loop/persist-delegate-state!)
+    ;; fetch: transient contention yields empty, never a crash
+    (is (= [] (vec (loop/delegate-pending-results! ""))))))
+
+(deftest same-millisecond-ties-prefer-the-owner
+  ;; the R8 tie gate: wall-clock stamps are 1ms-granular — a finished record
+  ;; stamped in the same ms as its running record must win
+  (h/spit-atomic (loop/delegate-state-file)
+                 (h/json-str {"children" {"kid" {"goal" "g" "status" "running" "session_key" "" "updated_at" 2000}}
+                              "delivered" []}))
+  (with-redefs [loop/delegate-children (atom {"kid" {"goal" "g" "status" "completed" "summary" "same ms" "session_key" "" "updated_at" 2000}})
+                loop/delegate-delivered (atom #{})]
+    (loop/persist-delegate-state!))
+  (is (= "completed" (get-in (get (loop/load-delegate-state) "children") ["kid" "status"]))))
+
 (deftest failure-records-survive-the-merge
   ;; the R7 gate: EVERY record is stamped, so a completed/failed record can
   ;; never tie-lose to an older on-disk 'running' one (an unstamped failure

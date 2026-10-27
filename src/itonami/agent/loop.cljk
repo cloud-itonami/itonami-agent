@@ -431,7 +431,10 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
   a stale in-memory record must never mask a newer on-disk one anywhere).
   Higher updated_at wins; ties keep the ON-DISK record."
   [on-disk mem]
-  (merge-with (fn [a b] (if (> (or (get b "updated_at") 0) (or (get a "updated_at") 0)) b a))
+  ;; ties prefer the in-MEMORY record: a done/failed stamped in the same
+  ;; millisecond as its running record must not tie-lose to it (the R8 gate
+  ;; — wall-clock stamps are 1ms-granular; memory is the owner's live state)
+  (merge-with (fn [a b] (if (>= (or (get b "updated_at") 0) (or (get a "updated_at") 0)) b a))
               on-disk mem))
 
 (defn- write-merged-registry!
@@ -456,7 +459,10 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
   ([attempts]
    (try
      (let [r (h/with-lock (str (delegate-state-file) ".lock") write-merged-registry!)]
-       (when (= r ::busy)
+       ;; h/with-lock returns the HOST namespace's ::busy — loop's own
+       ;; ::busy is a different keyword and the comparison never matched
+       ;; (the R8 gate: the retry/log path was dead code)
+       (when (= r :itonami.agent.host/busy)
          (if (pos? attempts)
            (do (js/Atomics.wait (js/Int32Array. (js/SharedArrayBuffer. 4)) 0 0 50)
                (persist-delegate-state! (dec attempts)))
@@ -509,7 +515,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                      ;; (the R7 gate) — loud log, empty result, next poll
                      (js/console.error (str "delegate registry fetch failed: " (or (.-message e) e)))
                     []))]
-     (if (= outcome ::busy)
+     (if (= outcome :itonami.agent.host/busy)
        ;; TRANSIENT contention must not kill the interactive loop: return
        ;; empty and let the next poll pick the results up (delivery stays
        ;; atomic; the R6 escalation note)
