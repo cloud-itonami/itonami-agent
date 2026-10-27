@@ -356,6 +356,38 @@
     (step)
     {:stop (fn [] (reset! stopped true)) :done done}))
 
+(defn prepare-send-profile
+  "Shape a profile for an EXPLICIT-target send (the `send` command). Per-chat
+  families (telegram/slack/matrix, discord-bot) take the requested chat as the
+  target, so a missing default is filled from it (some send adapters refuse to
+  construct without one). Webhook-style sends have ONE fixed target whose
+  served chat is the configured anchor — filling that anchor from the request
+  would defeat the misdirection refusal, so an undeclared anchor is REFUSED
+  (fail closed) instead. Returns {:prof ...} or {:error ...}."
+  [prof platform chat-id]
+  (let [c (get-in prof [:config "delivery" platform])
+        webhook? (or (= "mattermost" platform)
+                     (and (= "discord" platform)
+                          (not (str/blank? (str (get c "webhook_url"))))))
+        bot-channel? (and (= "discord" platform) (not webhook?))]
+    (cond
+      webhook?
+      (if (str/blank? (str (get c "chat_id")))
+        {:error (str platform " webhook lane must declare delivery." platform
+                     ".chat_id (the one chat it serves) before an explicit send")}
+        {:prof prof})
+
+      (contains? #{"telegram" "slack" "matrix" "discord"} platform)
+      {:prof (update-in prof [:config "delivery" platform]
+                        (fn [c]
+                          (cond-> (or c {})
+                            (and (not bot-channel?) (str/blank? (str (get c "chat_id"))))
+                            (assoc "chat_id" (str chat-id))
+                            (and bot-channel? (str/blank? (str (get c "channel_id"))))
+                            (assoc "channel_id" (str chat-id)))))}
+
+      :else {:error (str platform " is not implemented for send (telegram/slack/matrix/discord/mattermost)")})))
+
 (defn send-reply!
   "The reply through the platform's existing send adapter (the same one the
   cron delivery queue uses), addressed to the MESSAGE'S chat — a
