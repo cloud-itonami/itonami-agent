@@ -45,11 +45,14 @@
 
 (defn home-in
   "Profile name -> its home directory in an explicit store root. `default` is
-  the root itself, as in the Hermes layout."
+  the root itself, as in the Hermes layout. A non-default name MUST satisfy
+  `valid-name?` — this join is the one place a name becomes a path, so
+  `-p ../..` cannot escape the store (defense in depth; `-main` gates too)."
   [root name]
-  (if (or (nil? name) (= name "default"))
-    root
-    (h/join root "profiles" name)))
+  (cond
+    (or (nil? name) (= name "default")) root
+    (valid-name? name) (h/join root "profiles" name)
+    :else (throw (js/Error. (str "invalid profile name: " (pr-str name))))))
 
 (defn home
   "Profile name -> its home directory in the itonami store. `default` is the
