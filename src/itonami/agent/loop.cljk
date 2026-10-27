@@ -426,26 +426,35 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
     (atom (get st "children")))
   (def delegate-delivered (atom (get st "delivered"))))
 
+(defn- write-merged-registry!
+  "The MERGED write itself — caller must hold the lock."
+  []
+  (let [on-disk (load-delegate-state)
+        merged-children (merge (get on-disk "children") @delegate-children)
+        merged-delivered (into (set (get on-disk "delivered")) @delegate-delivered)]
+    (h/spit-atomic (delegate-state-file)
+                   (h/json-str {"children" merged-children
+                                "delivered" (vec merged-delivered)}))))
+
 (defn persist-delegate-state!
   "Persist the registry after every mutation (the cross-run re-entry
   record). Under the registry LOCK and MERGED with what is already on disk:
   a blind full-snapshot overwrite would erase a concurrent process's
   finished children (lost forever) and delivered marks (duplicate
-  re-delivery) — the R3 gate. Merge: the file's records survive, this
-  process's overlay them, delivered sets union."
-  []
-  (try
-    (h/with-lock (str (delegate-state-file) ".lock")
-      (fn []
-        (let [on-disk (load-delegate-state)
-              merged-children (merge (get on-disk "children") @delegate-children)
-              merged-delivered (into (set (get on-disk "delivered")) @delegate-delivered)]
-          (h/spit-atomic (delegate-state-file)
-                         (h/json-str {"children" merged-children
-                                      "delivered" (vec merged-delivered)})))))
-    (catch :default e
-      ;; a silently failed write would void the re-entry guarantee
-      (js/console.error (str "delegate registry persist failed: " (or (.-message e) e))))))
+  re-delivery) — the R3 gate. A BUSY lock is RETRIED and, if still held,
+  loudly logged: with-lock returns ::busy without throwing, and a silently
+  skipped write would void the guarantee (the R5 gate)."
+  ([] (persist-delegate-state! 3))
+  ([attempts]
+   (try
+     (let [r (h/with-lock (str (delegate-state-file) ".lock") write-merged-registry!)]
+       (when (= r ::busy)
+         (if (pos? attempts)
+           (do (js/Atomics.wait (js/Int32Array. (js/SharedArrayBuffer. 4)) 0 0 50)
+               (persist-delegate-state! (dec attempts)))
+           (js/console.error "delegate registry persist skipped: lock held by another process"))))
+     (catch :default e
+       (js/console.error (str "delegate registry persist failed: " (or (.-message e) e)))))))
 
 (defn delegate-pending-results!
   "Finished background children not yet delivered TO THIS SESSION — one
@@ -460,16 +469,28 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
   ([session-key]
    (when-not (string? session-key)
      (throw (js/Error. "delegate-pending-results! requires a session key")))
+   ;; READ-FILTER-MARK all under the lock against a FRESH on-disk state:
+   ;; deciding from in-memory atoms lets two concurrent processes both
+   ;; deliver the same finished child before either write lands (the R5
+   ;; double-delivery gate)
    (let [sk (str session-key)
-         pending (vec (for [[id c] @delegate-children
-                            :when (and (not= "running" (get c "status"))
-                                       (not (contains? @delegate-delivered id))
-                                       (= sk (str (get c "session_key" ""))))]
-                        (assoc c "subagent_id" id)))]
-    (when (seq pending)
-      (swap! delegate-delivered into (map #(get % "subagent_id") pending))
-      (persist-delegate-state!))
-pending)))
+         outcome (h/with-lock (str (delegate-state-file) ".lock")
+                   (fn []
+                     (let [on-disk (load-delegate-state)
+                           children (merge (get on-disk "children") @delegate-children)
+                           delivered (into (set (get on-disk "delivered")) @delegate-delivered)
+                           pending (vec (for [[id c] children
+                                              :when (and (not= "running" (get c "status"))
+                                                         (not (contains? delivered id))
+                                                         (= sk (str (get c "session_key" ""))))]
+                                          (assoc c "subagent_id" id)))]
+                       (when (seq pending)
+                         (swap! delegate-delivered into (map #(get % "subagent_id") pending))
+                         (write-merged-registry!))
+                       pending)))]
+     (if (= outcome ::busy)
+       (throw (js/Error. "delegate registry busy — cannot fetch pending results safely"))
+       outcome))))
 
 (def delegate-ctl
   "subagent_id -> {:steer (atom [message]) :cancel (atom bool)}. steer queues

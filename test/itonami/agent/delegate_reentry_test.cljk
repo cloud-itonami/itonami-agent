@@ -1,9 +1,10 @@
 (ns itonami.agent.delegate-reentry-test
   "Hermes delegate cross-run re-entry: pending background results PERSIST
   across a run ending and re-enter as delegated-results on the next run.
-  Every test works against a throwaway registry: this ns rebinds
-  ITONAMI_DIR before loop loads state, so running it under ANY harness can
-  never touch a real ~/.itonami registry (the R3 test-hygiene note)."
+  Every test resets the registry to a throwaway state first. (The
+  ITONAMI_DIR rebind below only guards WRITES — loop's namespace load has
+  already read whatever registry was current at require time, so tests must
+  reset the atoms/registry rather than trust load order — the R5 note.)"
   (:require [cljs.test :refer [deftest is testing]]
             ["node:os" :as os]
             ["node:path" :as path]
@@ -14,6 +15,8 @@
       (path/join (os/tmpdir) (str "itonami-delegate-reentry-test-" (.-pid js/process) "-" (random-uuid))))
 
 (deftest pending-results-survive-a-run-ending
+  ;; per-test registry isolation: tests share one process-wide file
+  (h/spit-atomic (loop/delegate-state-file) (h/json-str {"children" {} "delivered" []}))
   (let [saved-children (atom {"kid1" {"goal" "g" "status" "completed" "summary" "done here"}})
         saved-delivered (atom #{})]
     (with-redefs [loop/delegate-children saved-children
@@ -29,6 +32,7 @@
         (is (= [] (vec (loop/delegate-pending-results! ""))))))))
 
 (deftest results-are-session-scoped
+  (h/spit-atomic (loop/delegate-state-file) (h/json-str {"children" {} "delivered" []}))
   ;; the R2 security gate: a delegated result belongs to the session that
   ;; spawned its child and is NEVER injected into another session's prompt
   (with-redefs [loop/delegate-children (atom {"kidA" {"goal" "g" "status" "completed" "summary" "for A" "session_key" "sess-A"}
@@ -43,6 +47,7 @@
       (is (= [] (vec (loop/delegate-pending-results! "sess-A")))))))
 
 (deftest the-session-key-is-asserted-not-assumed
+  (h/spit-atomic (loop/delegate-state-file) (h/json-str {"children" {} "delivered" []}))
   ;; kbb/SCI binds missing args to nil — the requirement must be RUNTIME
   ;; checked, not left to arity (the R4 gate)
   (is (thrown-with-msg? js/Error #"requires a session key"
@@ -66,8 +71,12 @@
         "the other process's child survives our write")
     (is (= "mine" (get-in (get loaded "children") ["mine" "summary"])))
     (is (= #{"already" "mine"} (set (get loaded "delivered"))))
-    ;; and nothing is re-delivered: both sessions' results stay delivered
-    (is (= [] (vec (loop/delegate-pending-results! ""))))))
+    ;; the merged foreign child is still UNDELIVERED — it belongs to the
+    ;; root session and re-enters exactly once (then never again)
+    (let [first-run (vec (loop/delegate-pending-results! ""))]
+      (is (= ["foreign"] (mapv #(get % "subagent_id") first-run)))
+      (is (= "from the other process" (get (first first-run) "summary"))))
+    (is (= [] (vec (loop/delegate-pending-results! ""))) "exactly once — never re-delivered")))
 
 (deftest joined-children-are-never-re-delivered
   ;; foreground children return INLINE — without a delivered mark the
