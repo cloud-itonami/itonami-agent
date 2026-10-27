@@ -1,0 +1,43 @@
+(ns itonami.agent.args-test
+  "CLI argument parsing: a value is a value — including negative numbers,
+  which are Telegram group chat ids."
+  (:require [cljs.test :refer [deftest is testing]]
+            [itonami.agent.main :as main]))
+
+(deftest parse-args-values
+  (testing "a negative number is a VALUE, not a boolean flag"
+    (let [[opts pos] (main/parse-args ["send" "--chat-id" "-100123" "hi"])]
+      (is (= "-100123" (:chat-id opts)))
+      (is (= ["send" "hi"] pos))))
+  (testing "--flag=value carries the whole value"
+    (let [[opts _] (main/parse-args ["send" "--chat-id=-100123" "hi"])]
+      (is (= "-100123" (:chat-id opts))))
+    (let [[opts pos] (main/parse-args ["send" "--text=hello world"])]
+      (is (= "hello world" (:text opts)))
+      (is (= ["send"] pos))))
+  (testing "a bare dash-prefixed flag is boolean"
+    (let [[opts _] (main/parse-args ["cron" "tick" "--force"])]
+      (is (true? (:force opts)))))
+  (testing "a non-numeric dash token is not eaten as a value"
+    (let [[opts pos] (main/parse-args ["x" "--verbose" "-other"])]
+      (is (true? (:verbose opts)))
+      (is (= ["x" "-other"] pos))))
+  (testing "--toolsets=a,b splits exactly like --toolsets a,b"
+    (is (= ["a" "b"] (:toolsets (first (main/parse-args ["--toolsets=a,b"])))))
+    (is (= ["a" "b"] (:toolsets (first (main/parse-args ["--toolsets" "a,b"])))))
+    (is (= ["a" "b"] (:toolsets (first (main/parse-args ["-t" "a,b"]))))))
+  (testing "literal true/false values become booleans"
+    (is (false? (:force (first (main/parse-args ["--force=false"])))))
+    (is (true? (:force (first (main/parse-args ["--force=true"])))))
+    (is (true? (:force (first (main/parse-args ["--force"]))))))
+  (testing "named value flags take values verbatim — in BOTH spellings"
+    (is (= "false" (:oneshot (first (main/parse-args ["-z" "false"])))))
+    (is (= "false" (:oneshot (first (main/parse-args ["--oneshot=false"])))))
+    (is (= "true" (:profile (first (main/parse-args ["-p" "true"])))))
+    (is (= "false" (:profile (first (main/parse-args ["--profile=false"])))))
+    (is (= "x" (:model (first (main/parse-args ["--model=x"])))))
+    (is (= "false" (:chat-id (first (main/parse-args ["--chat-id=false"]))))))
+  (testing "short value flags accept negative values too"
+    (let [[opts _] (main/parse-args ["-p" "-weird-profile" "-z" "go"])]
+      (is (= "-weird-profile" (:profile opts)))
+      (is (= "go" (:oneshot opts))))))

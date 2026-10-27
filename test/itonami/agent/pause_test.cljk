@@ -1,0 +1,26 @@
+(ns itonami.agent.pause-test
+  "Hermes `hermes pause` / `resume` — the store-wide emergency stop."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [itonami.agent.pause :as pause]))
+
+(deftest emergency-stop-round-trip
+  (testing "starts lifted"
+    (is (false? (pause/active?)))
+    (is (nil? (pause/since))))
+  (testing "pause! records the reason with the timestamp and is idempotent"
+    (is (true? (pause/pause! "maintenance window")))
+    (is (true? (pause/active?)))
+    (is (str/includes? (str (pause/since)) "maintenance window"))
+    (is (true? (pause/pause!)))
+    (is (true? (pause/active?))))
+  (testing "resume! lifts exactly once and is idempotent"
+    (is (true? (pause/resume!)))
+    (is (false? (pause/active?)))
+    (is (false? (pause/resume!)))
+    (is (nil? (pause/since))))
+  (testing "a blank reason records the timestamp alone"
+    (pause/pause! "  ")
+    (is (true? (pause/active?)))
+    (is (not (str/includes? (str (pause/since)) "  ")))
+    (pause/resume!)))

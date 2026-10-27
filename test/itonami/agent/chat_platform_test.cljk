@@ -348,6 +348,50 @@
                        (done)))
           (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
 
+(deftest prepare-send-profile-targeting
+  (let [prof (fn [c] {:name "alpha" :config {"delivery" c} :home "/tmp"})]
+    (testing "per-chat families fill a missing default in the key that adapter constructs from"
+      (is (= "req-chat"
+             (get-in (:prof (chat/prepare-send-profile (prof {"telegram" {}}) "telegram" "req-chat"))
+                     [:config "delivery" "telegram" "chat_id"])))
+      (is (= "req-ch"
+             (get-in (:prof (chat/prepare-send-profile (prof {"discord" {}}) "discord" "req-ch"))
+                     [:config "delivery" "discord" "channel_id"])))
+      (is (= "req-slack"
+             (get-in (:prof (chat/prepare-send-profile (prof {"slack" {}}) "slack" "req-slack"))
+                     [:config "delivery" "slack" "channel"])))
+      (is (= "!room:example"
+             (get-in (:prof (chat/prepare-send-profile (prof {"matrix" {}}) "matrix" "!room:example"))
+                     [:config "delivery" "matrix" "room_id"]))))
+    (testing "webhook lanes refuse an undeclared served chat (fail closed)"
+      (is (:error (chat/prepare-send-profile (prof {"mattermost" {"webhook_url" "https://mm/h"}}) "mattermost" "req")))
+      (is (:error (chat/prepare-send-profile (prof {"discord" {"webhook_url" "https://d/h"}}) "discord" "req"))))
+    (testing "a missing webhook_url is named before the served chat"
+      (is (re-find #"webhook_url" (str (:error (chat/prepare-send-profile (prof {"mattermost" {}}) "mattermost" "req"))))))
+    (testing "a declared webhook anchor is never overwritten by the request"
+      (let [r (chat/prepare-send-profile (prof {"mattermost" {"webhook_url" "https://mm/h" "chat_id" "served"}})
+                                         "mattermost" "req")]
+        (is (= "served" (get-in (:prof r) [:config "delivery" "mattermost" "chat_id"])))))
+    (testing "unknown platforms name their refusal"
+      (is (:error (chat/prepare-send-profile (prof {"feishu" {}}) "feishu" "x"))))))
+
+(deftest reply-without-a-chat-is-refused
+  (async done
+    ;; regression (Code first): the docstring forbids falling back to the
+    ;; profile's configured delivery chat — a chat-less message must be
+    ;; refused, never sent to the configured target
+    (let [called (atom false)
+          fake-fetch (fn [_ _] (reset! called true) (p/resolved #js {:ok true :status 200}))
+          prof {:name "alpha"
+                :config {"delivery" {"telegram" {"chat_id" "configured-chat"}}}
+                :home "/tmp"}]
+      (-> (chat/send-reply! prof {"platform" "telegram"} "hi" fake-fetch)
+          (p/then (fn [res]
+                    (is (re-find #"refusing" (str res)))
+                    (is (false? @called))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
 (deftest webhook-platforms-refuse-misdirected-replies
   (async done
     ;; regression: a webhook has one fixed target — a reply for another chat

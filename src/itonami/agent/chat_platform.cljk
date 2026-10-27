@@ -356,22 +356,66 @@
     (step)
     {:stop (fn [] (reset! stopped true)) :done done}))
 
+(defn prepare-send-profile
+  "Shape a profile for an EXPLICIT-target send (the `send` command). Per-chat
+  families (telegram/slack/matrix, discord-bot) take the requested chat as the
+  target, so a missing default is filled from it, in the key that adapter
+  actually constructs from (telegram `chat_id`, slack `channel`, matrix
+  `room_id`, discord-bot `channel_id`). Webhook-style sends have ONE fixed target whose
+  served chat is the configured anchor — filling that anchor from the request
+  would defeat the misdirection refusal, so an undeclared anchor is REFUSED
+  (fail closed) instead. Returns {:prof ...} or {:error ...}."
+  [prof platform chat-id]
+  (let [c (get-in prof [:config "delivery" platform])
+        webhook? (or (= "mattermost" platform)
+                     (and (= "discord" platform)
+                          (not (str/blank? (str (get c "webhook_url"))))))
+        bot-channel? (and (= "discord" platform) (not webhook?))]
+    (cond
+      webhook?
+      (cond
+        (str/blank? (str (get c "webhook_url")))
+        {:error (str platform " webhook lane needs delivery." platform ".webhook_url configured")}
+        (str/blank? (str (get c "chat_id")))
+        {:error (str platform " webhook lane must declare delivery." platform
+                     ".chat_id (the one chat it serves) before an explicit send")}
+        :else {:prof prof})
+
+      (contains? #{"telegram" "slack" "matrix" "discord"} platform)
+      ;; the key each adapter actually constructs from (for-lane):
+      ;; telegram chat_id, slack channel, matrix room_id, discord-bot channel_id
+      (let [fill-key (if bot-channel?
+                       "channel_id"
+                       ({"telegram" "chat_id" "slack" "channel" "matrix" "room_id"} platform))]
+        {:prof (update-in prof [:config "delivery" platform]
+                          (fn [c]
+                            (cond-> (or c {})
+                              (str/blank? (str (get c fill-key)))
+                              (assoc fill-key (str chat-id)))))})
+
+      :else {:error (str platform " is not implemented for send (telegram/slack/matrix/discord/mattermost)")})))
+
 (defn send-reply!
   "The reply through the platform's existing send adapter (the same one the
   cron delivery queue uses), addressed to the MESSAGE'S chat — a
   `gateway.routes`-routed chat must never leak into the profile's configured
-  delivery chat. Webhook-style sends have one fixed target, so the adapter
-  REFUSES a chat it does not serve rather than posting into the configured
-  channel. The message's `thread_id` rides along as the platform's thread
+  delivery chat: a message that names no chat is refused outright, and
+  webhook-style sends (one fixed target) refuse a chat they do not serve
+  rather than post into the configured channel. The message's `thread_id` rides along as the platform's thread
   target where one exists (telegram: message_thread_id). `prof` is the owning
   profile (same position as `send!`'s first argument). Resolves to nil on
   success or the adapter's error string."
   ([prof msg text] (send-reply! prof msg text nil))
   ([prof msg text fetch]
    (let [platform (get msg "platform")
+         chat (str (get msg "chat_id"))
          adapter (platforms/for-lane platform (:config prof))]
-     (if adapter
-       (adapter nil platform text (cond-> {:chat-id (get msg "chat_id")
+     (cond
+       (str/blank? chat)
+       (p/resolved (str platform " reply names no chat — refusing to fall back to the configured delivery chat"))
+       (nil? adapter)
+       (p/resolved (str platform " send adapter not configured"))
+       :else
+       (adapter nil platform text (cond-> {:chat-id chat
                                           :thread-id (get msg "thread_id")}
-                                    fetch (assoc :fetch fetch)))
-       (p/resolved (str platform " send adapter not configured"))))))
+                                    fetch (assoc :fetch fetch)))))))
