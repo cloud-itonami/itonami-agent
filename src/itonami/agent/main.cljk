@@ -1306,6 +1306,7 @@
         (h/spit (h/join (p2p/itonami-dir) "gateway-serve.pid") (str (.-pid js/process)))
         (chat/serve! {:fetch (fn [url o] (js/fetch url o))
                       :token token
+                      :offset-file (h/join (p2p/itonami-dir) "gateway-serve-offset.json")
                       :dispatch (fn [raw]
                                   ;; Hermes pause: no new gateway turns while
                                   ;; the emergency stop is set
