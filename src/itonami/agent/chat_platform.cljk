@@ -38,12 +38,33 @@
        "message_id" (str (get m "message_id"))
        "text" (get m "text")})))
 
+(defn feishu-normalize
+  "Feishu im.message.receive_v1 webhook event -> the platform-agnostic
+  inbound message, or nil when the event carries no turn (other event
+  types, non-text messages). The text content is a JSON string."
+  [raw]
+  (let [m (get-in raw ["event" "message"])]
+    (when (and (= "im.message.receive_v1" (get-in raw ["header" "event_type"]))
+               m
+               (= "text" (get m "message_type")))
+      (let [content (try (h/json-parse (str (get m "content"))) (catch :default _ nil))]
+        (when (string? (get content "text"))
+          {"update_id" (str (or (get-in raw ["header" "event_id"]) (get m "message_id")))
+           "platform" "feishu"
+           "chat_id" (str (get m "chat_id"))
+           "user_id" (str (get-in raw ["event" "sender" "sender_id" "open_id"]))
+           "user_name" (str (or (get-in raw ["event" "sender" "sender_id" "open_id"]) ""))
+           "thread_id" (str (or (get m "thread_id") ""))
+           "message_id" (str (get m "message_id"))
+           "text" (get content "text")})))))
+
 (def platform-adapters
   "One entry per platform. `:normalize` turns one raw transport update into
   the inbound message map above (nil = carries no turn). The send half lives
   in `itonami.agent.platform-adapters/for-lane`. A second platform is one
   entry here — nothing else changes."
-  {"telegram" {:normalize telegram-normalize}})
+  {"telegram" {:normalize telegram-normalize}
+   "feishu" {:normalize feishu-normalize}})
 
 (defn normalize
   "The inbound message in `raw` for `platform`, or nil."

@@ -148,7 +148,8 @@
    "slack" "SLACK_BOT_TOKEN"
    "discord" "DISCORD_BOT_TOKEN"
    "mattermost" nil
-   "matrix" "MATRIX_ACCESS_TOKEN"})
+   "matrix" "MATRIX_ACCESS_TOKEN"
+   "feishu" "FEISHU_TENANT_ACCESS_TOKEN"})
 
 (defn token-env-name
   "The env var that carries this lane's token, or nil when the lane needs no
@@ -163,6 +164,67 @@
                   (and (= "discord" lane)
                        (not (str/blank? (str (get c "webhook_url"))))))
       (or (get c "token_env") (get token-env-defaults lane)))))
+
+
+;; ---------------------------------------------------------------- feishu
+
+(defn feishu-token-request
+  "The Feishu tenant_access_token exchange (the lane's AUTH transport). Pure.
+  A send exchanges app credentials for a short-lived token; a configured
+  token_env on the lane skips the exchange entirely."
+  [app-id app-secret]
+  {:url "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+   :headers {"Content-Type" "application/json; charset=utf-8"}
+   :body (h/json-str {"app_id" (str app-id) "app_secret" (str app-secret)})})
+
+(defn feishu-request
+  "The Feishu im/v1/messages send request (bot token). Pure. The text
+  content is a JSON string, as the API requires."
+  [token chat-id text]
+  {:url "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id"
+   :headers {"Authorization" (str "Bearer " token) "Content-Type" "application/json; charset=utf-8"}
+   :body (h/json-str {"receive_id" (str chat-id)
+                      "msg_type" "text"
+                      "content" (h/json-str {"text" (str text)})})})
+
+(defn- feishu-send! [fetch-fn token chat-id content]
+  (let [r (feishu-request token chat-id content)]
+    (-> (fetch-fn (:url r) #js {:method "POST"
+                                :headers (clj->js (:headers r))
+                                :body (:body r)})
+        (.then (fn [res]
+                 (if (.-ok res)
+                   (.then (.json res)
+                          (fn [j]
+                            (if (zero? (or (aget j "code") -1))
+                              nil
+                              (str "feishu im/v1/messages failed: "
+                                   (or (aget j "msg") "unknown error")))))
+                   (str "feishu im/v1/messages failed: HTTP " (.-status res)))))
+        (.catch (fn [e] (str "feishu im/v1/messages failed: " (.-message e)))))))
+
+(defn- feishu-adapter
+  "delivery.feishu: direct token (token_env, default
+  FEISHU_TENANT_ACCESS_TOKEN) or an app-credential exchange per send when
+  app_id/app_secret are configured (the JUN-471 auth transport)."
+  [token app-id app-secret chat-id]
+  (fn [_job _lane content opts]
+    (let [fetch-fn (or (:fetch opts) js/fetch)
+          chat (str (or (:chat-id opts) chat-id))
+          send (fn [tok] (feishu-send! fetch-fn tok chat content))]
+      (if (not (str/blank? (str token)))
+        (send token)
+        (let [r (feishu-token-request app-id app-secret)]
+          (-> (fetch-fn (:url r) #js {:method "POST" :headers (clj->js (:headers r)) :body (:body r)})
+              (.then (fn [res]
+                       (if (.-ok res)
+                         (.then (.json res)
+                                (fn [j]
+                                  (if (zero? (or (aget j "code") -1))
+                                    (send (aget j "tenant_access_token"))
+                                    (str "feishu token exchange failed: " (or (aget j "msg") "unknown error")))))
+                         (str "feishu token exchange failed: HTTP " (.-status res)))))
+              (.catch (fn [e] (str "feishu token exchange failed: " (.-message e))))))))))
 
 (defn for-lane
   "The built-in adapter for a deliver lane, or nil when this lane has no
@@ -207,4 +269,17 @@
                  (not (str/blank? (str token)))
                  (not (str/blank? (str room-id))))
         (matrix-adapter (str homeserver) token room-id)))
+    "feishu"
+    ;; direct token OR the app-credential exchange (the JUN-471 auth
+    ;; transport); a lane with none of the three has no adapter
+    (let [c (get-in config ["delivery" "feishu"])
+          token (h/env (token-env-name "feishu" config))
+          app-id (get c "app_id")
+          app-secret (get c "app_secret")
+          chat-id (get c "chat_id")]
+      (when (and (not (str/blank? (str chat-id)))
+                 (or (not (str/blank? (str token)))
+                     (and (not (str/blank? (str app-id)))
+                          (not (str/blank? (str app-secret))))))
+        (feishu-adapter token app-id app-secret chat-id)))
     nil))
