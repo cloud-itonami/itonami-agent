@@ -1090,22 +1090,28 @@
         limit (or limit 20)]
     (case (str sub)
       ("" "list")
-      (let [rows (tools/sessions-browse db-path limit)]
-        (if (seq rows)
-          (doseq [r rows]
-            (println (str (.padEnd (str (get r "session_id")) 40)
-                          (.padEnd (str (or (get r "started_at") "")) 24)
-                          (.padEnd (str (get r "message_count") " msgs") 9)
-                          (or (get r "title") ""))))
-          (println "no sessions")))
+      (let [res (tools/sessions-browse db-path limit)]
+        (if-let [e (:error res)]
+          (die 1 (str "sessions: " e))
+          (let [rows (:rows res)]
+            (if (seq rows)
+              (doseq [r rows]
+                (println (str (.padEnd (str (get r "session_id")) 40)
+                              (.padEnd (str (or (get r "started_at") "")) 24)
+                              (.padEnd (str (get r "message_count") " msgs") 9)
+                              (or (get r "title") ""))))
+              (println "no sessions")))))
 
       "show"
       (let [id (first args)]
         (when-not id (die 2 "sessions show: a session id is required"))
-        (let [rows (tools/session-latest-messages db-path id (min limit 50))]
-          (if (seq rows)
-            (doseq [m rows] (println (str "[" (get m "role") "] " (get m "content"))))
-            (die 1 (str "session not found: " id)))))
+        (let [res (tools/session-latest-messages db-path id (min limit 50))]
+          (if-let [e (:error res)]
+            (die 1 (str "sessions show: " e))
+            (let [rows (:rows res)]
+              (if (seq rows)
+                (doseq [m rows] (println (str "[" (get m "role") "] " (get m "content"))))
+                (die 1 (str "session not found: " id)))))))
 
       "resume"
       (die 2 "sessions resume: not implemented yet (lands with history re-entry)")

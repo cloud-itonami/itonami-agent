@@ -14,6 +14,7 @@
     (is (nil? (tools/bounded-limit "abc" 200)))
     (is (nil? (tools/bounded-limit "-3" 200)))
     (is (nil? (tools/bounded-limit "42abc" 200)))
+    (is (nil? (tools/bounded-limit (apply str (repeat 400 "9")) 200)))
     (is (nil? (tools/bounded-limit "0" 200)))
     (is (nil? (tools/bounded-limit nil 200)))))
 
@@ -32,17 +33,23 @@
                    "INSERT INTO messages VALUES ('m2','s1','assistant','hi','2026-10-27T10:01:00Z');"))
     (.close db)
     (testing "browse lists only visible sessions (hidden and tool rows filtered)"
-      (let [rows (tools/sessions-browse db-path 10)]
+      (let [rows (:rows (tools/sessions-browse db-path 10))]
         (is (= 1 (count rows)))
         (is (= "s1" (get (first rows) "session_id")))
         (is (= "one" (get (first rows) "title")))
         (is (= 2 (get (first rows) "message_count")))))
     (testing "show returns the session's messages oldest-first"
-      (let [rows (tools/session-latest-messages db-path "s1" 10)]
+      (let [rows (:rows (tools/session-latest-messages db-path "s1" 10))]
         (is (= ["hello" "hi"] (map #(get % "content") rows)))
         (is (= ["user" "assistant"] (map #(get % "role") rows)))))
-    (testing "an unknown session answers empty, not a guess"
-      (is (= [] (tools/session-latest-messages db-path "nope" 10))))
-    (testing "a missing state.db answers nil, not a crash"
-      (is (nil? (tools/sessions-browse (h/join dir "no.db") 10)))
-      (is (nil? (tools/session-latest-messages (h/join dir "no.db") "s1" 10))))))
+    (testing "an unknown session answers empty rows, not a guess"
+      (is (= [] (:rows (tools/session-latest-messages db-path "nope" 10))))
+      (is (nil? (:error (tools/session-latest-messages db-path "nope" 10)))))
+    (testing "a missing state.db is a named error, not a crash"
+      (is (= "state.db missing" (:error (tools/sessions-browse (h/join dir "no.db") 10))))
+      (is (= "state.db missing" (:error (tools/session-latest-messages (h/join dir "no.db") "s1" 10)))))
+    (testing "a corrupt state.db is a named error — the session_search read-path contract"
+      (let [bad (h/join dir "bad.db")]
+        (h/spit bad "this is not a database")
+        (is (re-find #"state.db unreadable" (str (:error (tools/sessions-browse bad 10)))))
+        (is (re-find #"state.db unreadable" (str (:error (tools/session-latest-messages bad "s1" 10)))))))))
