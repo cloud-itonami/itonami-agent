@@ -26,7 +26,9 @@
     itonami-agent profile bundle <p>                        print the bundle CID and file list
     itonami-agent profile refresh-bundle <p>                recompute CID after profile files change
     itonami-agent gateway run [--interval 60]               tick every adopted profile (resident)
-    itonami-agent gateway serve [--platform telegram]        poll the platform and run inbound turns
+    itonami-agent gateway serve [--platform telegram] [--interval seconds]
+                                        poll the platform and run inbound turns
+                                        (--interval = the poll-error backoff)
     itonami-agent dapps                                     itonami_dapps MCP servers and how they resolve here
     itonami-agent peer id | serve [--port 7420 --url U --max-runs 2]
                        | add <url> [--did D --trust] | trust <did> | list
@@ -1156,7 +1158,7 @@
               "gateway" (case (second pos)
                           "run" (gateway-run opts)
                           "serve" (gateway-serve opts)
-                          (die 2 "usage: itonami-agent gateway run | serve [--platform telegram]"))
+                          (die 2 "usage: itonami-agent gateway run | serve [--platform telegram] [--interval seconds]"))
               "peer" (peer-cmd opts (rest pos))
               ("help" "--help" nil) (println (:doc (meta #'itonami.agent.main/-main)) (-> 'itonami.agent.main find-ns meta :doc))
               (die 2 (str "unknown command: " (first pos))))))
