@@ -60,11 +60,15 @@
 
 (defn dingtalk-normalize
   "DingTalk robot callback event -> the platform-agnostic inbound message,
-  or nil when the event carries no turn (non-text messages)."
+  or nil when the event carries no turn (non-text messages). The dedup key
+  needs a UNIQUE id: msgId, else createAt — and with neither, the turn is
+  REFUSED (the R1 gate: a type-string fallback like msgtype collides and
+  the intake guard silently drops distinct turns)."
   [raw]
-  (let [m (get raw "text")]
-    (when (and m (string? (get m "content")))
-      {"update_id" (str (or (get raw "msgId") (get raw "msgtype")))
+  (let [m (get raw "text")
+        uid (let [a (get raw "msgId")] (if (str/blank? (str a)) (get raw "createAt") a))]
+    (when (and m (string? (get m "content")) (not (str/blank? (str uid))))
+      {"update_id" (str uid)
        "platform" "dingtalk"
        "chat_id" (str (get raw "conversationId"))
        "user_id" (str (or (get raw "senderStaffId") ""))

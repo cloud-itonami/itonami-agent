@@ -35,6 +35,9 @@
         (is (= "u1" (get m "user_id")))))
     (testing "non-text messages carry no turn"
       (is (nil? (chat/dingtalk-normalize (dissoc event "text")))))
+    (testing "the dedup id is msgId, then createAt — never the msgtype string"
+      (is (= "t100" (get (chat/dingtalk-normalize (-> event (dissoc "msgId") (assoc "createAt" "t100"))) "update_id")))
+      (is (nil? (chat/dingtalk-normalize (-> event (dissoc "msgId")))) "no id at all refuses the turn"))
     (testing "the platform entry wires normalize"
       (is (fn? (get-in chat/platform-adapters ["dingtalk" :normalize]))))))
 
