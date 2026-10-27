@@ -26,6 +26,7 @@
     itonami-agent profile bundle <p>                        print the bundle CID and file list
     itonami-agent profile refresh-bundle <p>                recompute CID after profile files change
     itonami-agent gateway run [--interval 60]               tick every adopted profile (resident)
+    itonami-agent gateway serve [--platform telegram]        poll the platform and run inbound turns
     itonami-agent dapps                                     itonami_dapps MCP servers and how they resolve here
     itonami-agent peer id | serve [--port 7420 --url U --max-runs 2]
                        | add <url> [--did D --trust] | trust <did> | list
@@ -58,6 +59,7 @@
             [itonami.agent.p2p :as p2p]
             [itonami.agent.rails :as rails]
             [itonami.agent.provider :as provider]
+            [itonami.agent.chat-platform :as chat]
             ["node:readline" :as readline]
             ["node:crypto" :as crypto]))
 
@@ -1039,6 +1041,32 @@
     (h/spit (h/join (p2p/itonami-dir) "gateway.pid") (str (.-pid js/process)))
     (cycle)))
 
+(defn gateway-serve
+  "The gateway's messaging surface (JUN-465): poll the platform, dispatch each
+  update through the inbound pipeline (normalize -> guards -> routing -> turn),
+  and reply to the chat it came from. One bot token per serve process."
+  [opts]
+  (let [platform (or (:platform opts) "telegram")]
+    (when-not (= "telegram" platform)
+      (die 2 (str "gateway serve: platform " platform " not implemented (telegram only)")))
+    (let [profiles (mapv profile/load-profile (profile/names))
+          token (some chat/telegram-token (map :config profiles))]
+      (when (str/blank? (str token))
+        (die 2 "gateway serve: no telegram token configured (delivery.telegram.token_env / TELEGRAM_BOT_TOKEN)"))
+      (let [d (chat/make-dispatcher
+               {:profiles profiles
+                :executor (executor opts)
+                :run-opts (fn [prof msg] (assoc (run-opts opts prof) :platform (get msg "platform")))
+                :send! (fn [prof msg text] (chat/send-reply! prof msg text))
+                :on-event log-event})]
+        (println (str "itonami-agent gateway serve: " platform " -> " (count profiles) " profiles"))
+        (h/spit (h/join (p2p/itonami-dir) "gateway-serve.pid") (str (.-pid js/process)))
+        (chat/serve! {:fetch (fn [url o] (js/fetch url o))
+                      :token token
+                      :dispatch (fn [raw] (d platform raw))
+                      :on-error (fn [e] (println (str (h/iso-local) " gateway serve: " e)))
+                      :interval (some-> (:interval opts) (js/parseInt 10))})))))
+
 ;; ---------------------------------------------------------------- peer
 
 (defn peer-cmd [opts [sub & args]]
@@ -1116,7 +1144,10 @@
               "dapps" (dapps-cmd opts (rest pos))
               "cron" (cron-cmd opts (rest pos))
               "profile" (profile-cmd opts (rest pos))
-              "gateway" (if (= "run" (second pos)) (gateway-run opts) (die 2 "usage: itonami-agent gateway run"))
+              "gateway" (case (second pos)
+                          "run" (gateway-run opts)
+                          "serve" (gateway-serve opts)
+                          (die 2 "usage: itonami-agent gateway run | serve [--platform telegram]"))
               "peer" (peer-cmd opts (rest pos))
               ("help" "--help" nil) (println (:doc (meta #'itonami.agent.main/-main)) (-> 'itonami.agent.main find-ns meta :doc))
               (die 2 (str "unknown command: " (first pos))))))

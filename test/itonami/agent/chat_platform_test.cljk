@@ -5,6 +5,7 @@
   (:require [cljs.test :refer [deftest is testing async]]
             [promesa.core :as p]
             [itonami.agent.host :as h]
+            [itonami.agent.platform-adapters :as platforms]
             [itonami.agent.chat-platform :as chat]))
 
 (defn- tmp-home [tag]
@@ -160,6 +161,47 @@
                     (is (= ["A" "A"] @sent))
                     (done)))
           (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
+
+(deftest telegram-request-thread-id
+  (testing "a forum-topic reply carries message_thread_id"
+    (is (re-find #"message_thread_id\":42" (:body (platforms/telegram-request "TOK" "c1" "hi" "42")))))
+  (testing "absent or unparseable thread ids add no field"
+    (is (not (re-find #"message_thread_id" (:body (platforms/telegram-request "TOK" "c1" "hi")))))
+    (is (not (re-find #"message_thread_id" (:body (platforms/telegram-request "TOK" "c1" "hi" "abc")))))))
+
+(deftest serve-loop-dispatches-and-bounds
+  (async done
+    (let [tick (atom 0)
+          dispatched (atom [])
+          fake-fetch (fn [_url _opts]
+                       (swap! tick inc)
+                       (let [body (if (= 1 @tick)
+                                    (h/json-str {"ok" true "result" [(tg-update 4 "c1" "one")
+                                                                     (tg-update 5 "c1" "two")]})
+                                    (h/json-str {"ok" true "result" []}))]
+                         (p/resolved #js {:ok true :text (fn [] (p/resolved body))})))
+          srv (chat/serve! {:fetch fake-fetch :token "T" :poll-timeout 0 :max-ticks 2
+                            :dispatch (fn [u]
+                                        (swap! dispatched conj (get-in u ["message" "text"]))
+                                        (p/resolved nil))})]
+      (-> (:done srv)
+          (p/then (fn [why]
+                    (is (= :max-ticks why))
+                    (is (= ["one" "two"] @dispatched))
+                    (is (= 2 @tick))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
+(deftest serve-loop-stop-ends-the-loop
+  (async done
+    (let [srv (chat/serve! {:fetch (fn [_ _] (p/resolved #js {:ok true :text (fn [] (p/resolved (h/json-str {"ok" true "result" []})))}))
+                            :token "T" :poll-timeout 0
+                            :dispatch (fn [_] (p/resolved nil))})]
+      ((:stop srv))
+      (-> (:done srv)
+          (p/then (fn [why] (is (= :stopped why))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
 
 (deftest telegram-poll-advances-the-offset
   (async done

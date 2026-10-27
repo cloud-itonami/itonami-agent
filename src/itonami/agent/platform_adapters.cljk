@@ -12,16 +12,20 @@
 
 (defn telegram-request
   "The Telegram Bot API sendMessage request this adapter makes. Pure: the
-  caller owns transport and secrets."
-  [token chat-id text]
-  {:url (str "https://api.telegram.org/bot" token "/sendMessage")
-   :body (h/json-str {"chat_id" chat-id "text" (str text)})})
+  caller owns transport and secrets. `thread-id` (a forum topic) rides as
+  message_thread_id when it parses as a number."
+  ([token chat-id text] (telegram-request token chat-id text nil))
+  ([token chat-id text thread-id]
+   (let [tid (js/parseInt (str thread-id) 10)]
+     {:url (str "https://api.telegram.org/bot" token "/sendMessage")
+      :body (h/json-str (cond-> {"chat_id" chat-id "text" (str text)}
+                          (not (js/isNaN tid)) (assoc "message_thread_id" tid)))})))
 
 (defn- telegram-adapter [token chat-id]
   ;; `opts :chat-id` overrides the configured target — a reply must reach the
   ;; chat it answers, never the profile's default delivery chat
   (fn [_job _lane content opts]
-    (let [req (telegram-request token (or (:chat-id opts) chat-id) content)]
+    (let [req (telegram-request token (or (:chat-id opts) chat-id) content (:thread-id opts))]
     (-> ((or (:fetch opts) js/fetch) (:url req)
                   #js {:method "POST"
                        :headers #js {"Content-Type" "application/json"}
