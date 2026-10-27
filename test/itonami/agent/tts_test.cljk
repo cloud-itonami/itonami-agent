@@ -31,6 +31,74 @@
       (is (= "hi" (get body "input")))
       (is (= "mp3" (get body "response_format"))))))
 
+(deftest synthesize-fails-named-on-every-branch
+  ;; async: the assertions ride the promise chain and the test awaits them
+  (async done
+    (let [cfg {"tts" {"provider" "x" "model" "m"} "providers" {"x" {"kind" "send_json_base" "base_url" "https://api.x/v1" "model" "m"}}}]
+      (-> (tts/synthesize! cfg "/tmp/tts-no-home" {"text" "hi" "format" "mp3"}
+                           (fn [_ _] (js/Promise.reject (js/Error. "ECONNRESET")))
+                           (constantly true))
+          (promesa.core/then (fn [r]
+                               (is (re-find #"speech request failed: ECONNRESET" (str (get r "error"))))))
+          (promesa.core/then (fn [_]
+                               (tts/synthesize! cfg "/tmp/tts-no-home" {"text" "hi" "format" "mp3"}
+                                                (fn [_ _] (js/Promise.resolve #js {:ok false :status 502}))
+                                                (constantly true))))
+          (promesa.core/then (fn [r]
+                               (is (= "speech request failed: HTTP 502" (get r "error")))))
+          (promesa.core/then (fn [_] (done)))
+          (promesa.core/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
+(deftest synthesize-refuses-a-path-outside-roots
+  ;; the roots gate runs BEFORE the write and refuses it — like write-file
+  (async done
+    (let [cfg {"tts" {"provider" "x" "model" "m"} "providers" {"x" {"kind" "send_json_base" "base_url" "https://api.x/v1" "model" "m"}}}
+          ;; a FRESH home per run: a fixed path accumulates stale artifacts
+          ;; that make the no-file assertion lie (it did)
+          home (h/join (h/tmp-dir) (str "test-tts-refuse-" (.-pid js/process) "-" (h/random-hex 4)))
+          fake-fetch (fn [_ _] (js/Promise.resolve #js {:ok true :status 200
+                                                        :arrayBuffer (fn [] (js/Promise.resolve (js/Buffer.from "abc")))}))]
+      (-> (tts/synthesize! cfg home {"text" "hi" "format" "mp3"} fake-fetch (constantly false))
+          (promesa.core/then (fn [r]
+                               (is (= "speech write refused: outside the permitted roots" (get r "error")))
+                               (is (nil? (get r "path")))
+                               ;; and NO file was created — the gate runs before
+                               ;; the write. The out-path is DERIVED with the
+                               ;; repo's own hash functions: a hardcoded hex
+                               ;; would silently go vacuous (a prior round's
+                               ;; did — it matched no cache key variant)
+                               (let [voice (get (tts/configured cfg) :voice)
+                                     model (get (tts/configured cfg) :model)
+                                     out-path (h/join home "workspace" "tts"
+                                                      (str (h/sha256-hex (h/json-str ["hi" voice model "mp3" "x" "https://api.x/v1"])) ".mp3"))]
+                                 (is (not (h/file? out-path))))))
+          (promesa.core/then (fn [_] (done)))
+          (promesa.core/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
+(deftest synthesize-fails-named-on-read-and-write
+  (async done
+    (let [cfg {"tts" {"provider" "x" "model" "m"} "providers" {"x" {"kind" "send_json_base" "base_url" "https://api.x/v1" "model" "m"}}}]
+      (-> (tts/synthesize! cfg "/tmp/tts-no-home" {"text" "hi" "format" "mp3"}
+                           (fn [_ _] (js/Promise.resolve #js {:ok true :status 200
+                                                              :arrayBuffer (fn [] (js/Promise.reject (js/Error. "body EOF")))}))
+                           (constantly true))
+          (p/then (fn [r] (is (re-find #"speech read failed: body EOF" (str (get r "error"))))))
+          (p/then (fn [_]
+                    ;; deterministic write failure: workspace/tts pre-created
+                    ;; as a REGULAR FILE, so h/mkdirs cannot make the dir
+                    (let [home "/tmp/tts-nowrite-home"]
+                      (h/mkdirs home)
+                      (h/spit (h/join home "workspace-file-keeper") "x")
+                      (h/mkdirs (h/join home "workspace"))
+                      (h/spit (h/join home "workspace" "tts") "not a directory")
+                      (tts/synthesize! cfg home {"text" "hi" "format" "mp3"}
+                                       (fn [_ _] (js/Promise.resolve #js {:ok true :status 200
+                                                                          :arrayBuffer (fn [] (js/Promise.resolve (js/Buffer.from "abc")))}))
+                                       (constantly true)))))
+          (p/then (fn [r] (is (re-find #"speech write failed" (str (get r "error"))))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
 (deftest synthesize-writes-the-audio
   (async done
     (let [home (h/join (h/tmp-dir) (str "test-tts-" (.-pid js/process) "-" (h/random-hex 4)))

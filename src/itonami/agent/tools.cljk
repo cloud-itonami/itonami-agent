@@ -3037,11 +3037,16 @@
   (-> (tts/synthesize! (:config ctx) (:home ctx)
                        {"text" text "voice" voice "model" model
                         "format" (get args "format")}
-                       js/fetch)
+                       js/fetch
+                       (fn [p] (writable? ctx p)))
       (p/then (fn [r]
                 (if-let [e (get r "error")]
                   (err e)
-                  (ok (assoc r "success" true)))))))
+                  (do ;; the audio file is a run write like any other; tts
+                      ;; already gated the path, so record UNCONDITIONALLY —
+                      ;; an unrecorded on-disk write is the worse outcome
+                      (when-let [abs (get r "path")] (record-write! ctx abs))
+                      (ok (assoc r "success" true))))))))
 
 (defn browser-vault-list [ctx _args]
   (let [home (:home ctx)
