@@ -1078,9 +1078,9 @@
              "nothing to resume (not paused)")))
 
 (defn model-cmd
-  "Hermes `hermes model` (show): the effective model/provider resolution and
-  the hop chain, each with the config layer it came from. The setter lands
-  with config writing."
+  "Hermes `hermes model` (show): the effective model/provider resolution with
+  the config layer each came from, and the hop chain. The setter lands with
+  config writing."
   [opts _]
   (p/let [prof (profile/load-profile (or (:profile opts) "default") {:secrets? false})
           r (provider/resolution (:config prof) {:model (:model opts) :provider (:provider opts)})]
@@ -1094,7 +1094,8 @@
   "Hermes `hermes fallback` (show): the providers tried when the primary model
   fails. A pinned run disables fallback (Hermes: 'job pin disables fallback').
   The setter lands with config writing."
-  [opts _]
+  [opts args]
+  (when (seq args) (die 2 "usage: itonami-agent fallback [--profile P] [-m model]"))
   (p/let [prof (profile/load-profile (or (:profile opts) "default") {:secrets? false})
           r (provider/resolution (:config prof) {:model (:model opts) :provider (:provider opts)})]
     (if (seq (drop 1 (:hops r)))

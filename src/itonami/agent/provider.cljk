@@ -70,8 +70,8 @@
   model` / `hermes fallback` show). Sources follow `chain` verbatim: run
   override (a job's pin, or the CLI's -m/--provider) -> cron.model ->
   model.default, override -> cron.model_provider -> model.provider. An
-  override is a PIN (`:pinned? (boolean (:model opts))`, exactly as run-opts
-  and cron compute it): the chain keeps only the primary. `:hops` is the chain as provider/model pairs (primary
+  override is a PIN — `:pinned? (boolean (or (:pinned? opts) (:model opts)))`,
+  matching run-opts and cron, which both pin on any model override — so the chain keeps only the primary. `:hops` is the chain as provider/model pairs (primary
   first; a pinned run keeps only the primary)."
   [config opts]
   ;; a run override IS a pin — run-opts sets :pinned? (boolean (:model opts))
