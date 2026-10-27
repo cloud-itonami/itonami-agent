@@ -149,7 +149,8 @@
    "discord" "DISCORD_BOT_TOKEN"
    "mattermost" nil
    "matrix" "MATRIX_ACCESS_TOKEN"
-   "feishu" "FEISHU_TENANT_ACCESS_TOKEN"})
+   "feishu" "FEISHU_TENANT_ACCESS_TOKEN"
+   "dingtalk" "DINGTALK_ACCESS_TOKEN"})
 
 (defn token-env-name
   "The env var that carries this lane's token, or nil when the lane needs no
@@ -233,6 +234,68 @@
                          (str "feishu token exchange failed: HTTP " (.-status res)))))
               (.catch (fn [e] (str "feishu token exchange failed: " (.-message e))))))))))
 
+
+;; ---------------------------------------------------------------- dingtalk
+
+(defn dingtalk-token-request
+  "The DingTalk oauth2/accessToken exchange (the lane's AUTH transport).
+  Pure. Credentials are env-only (DINGTALK_APP_KEY / DINGTALK_APP_SECRET),
+  per this ns's contract."
+  [app-key app-secret]
+  {:url "https://api.dingtalk.com/v1.0/oauth2/accessToken"
+   :headers {"Content-Type" "application/json; charset=utf-8"}
+   :body (h/json-str {"appKey" (str app-key) "appSecret" (str app-secret)})})
+
+(defn dingtalk-request
+  "The DingTalk robot oToMessages/batchSend request (robot access token).
+  Pure. The text rides in msgParam as a JSON string, as the API requires."
+  [token robot-code user-id text]
+  {:url "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend"
+   :headers {"Authorization" (str "Bearer " token) "Content-Type" "application/json; charset=utf-8"}
+   :body (h/json-str {"robotCode" (str robot-code)
+                      "userIds" [(str user-id)]
+                      "msgKey" "sampleText"
+                      "msgParam" (h/json-str {"text" (str text)})})})
+
+(defn- dingtalk-send! [fetch-fn token robot-code chat content]
+  (let [r (dingtalk-request token robot-code chat content)]
+    (-> (fetch-fn (:url r) #js {:method "POST"
+                                :headers (clj->js (:headers r))
+                                :body (:body r)})
+        (.then (fn [res]
+                 (if (.-ok res)
+                   (js/Promise.resolve nil)
+                   (str "dingtalk batchSend failed: HTTP " (.-status res)))))
+        (.catch (fn [e] (str "dingtalk batchSend failed: " (.-message e)))))))
+
+(defn- dingtalk-adapter
+  "delivery.dingtalk: auth via direct token (token_env default
+  DINGTALK_ACCESS_TOKEN) OR the app-credential exchange per send (the
+  JUN-471 auth transport); the robot identity (robotCode = the app key) is
+  ALWAYS required — batchSend rejects a body without it. ALL credentials
+  are env-only — never config."
+  [token app-key app-secret chat-id]
+  (fn [_job _lane content opts]
+    (let [fetch-fn (or (:fetch opts) js/fetch)
+          override (str (:chat-id opts))
+          chat (if (str/blank? override) (str chat-id) override)
+          ;; the enterprise robot's robotCode IS its app key
+          send (fn [tok] (dingtalk-send! fetch-fn tok (str app-key) chat content))]
+      (if (not (str/blank? (str token)))
+        (send token)
+        (let [r (dingtalk-token-request app-key app-secret)]
+          (-> (fetch-fn (:url r) #js {:method "POST" :headers (clj->js (:headers r)) :body (:body r)})
+              (.then (fn [res]
+                       (if (.-ok res)
+                         (.then (.json res)
+                                (fn [j]
+                                  (let [tok (aget j "accessToken")]
+                                    (if (str/blank? (str tok))
+                                      "dingtalk token exchange failed: response carried no accessToken"
+                                      (send tok)))))
+                         (str "dingtalk token exchange failed: HTTP " (.-status res)))))
+              (.catch (fn [e] (str "dingtalk token exchange failed: " (.-message e))))))))))
+
 (defn for-lane
   "The built-in adapter for a deliver lane, or nil when this lane has no
   configured platform. `config` is the profile's config.yaml map.
@@ -291,4 +354,21 @@
                      (and (not (str/blank? (str app-id)))
                           (not (str/blank? (str app-secret))))))
         (feishu-adapter token app-id app-secret chat-id)))
+    "dingtalk"
+    ;; direct token OR the app-credential exchange; credentials ENV-ONLY
+    ;; (DINGTALK_APP_KEY / DINGTALK_APP_SECRET — never config)
+    (let [c (get-in config ["delivery" "dingtalk"])
+          token (h/env (token-env-name "dingtalk" config))
+          app-key (h/env "DINGTALK_APP_KEY")
+          app-secret (h/env "DINGTALK_APP_SECRET")
+          chat-id (get c "chat_id")]
+      ;; batchSend REQUIRES robotCode (= the app key) on every request —
+      ;; a direct token alone builds a body that cannot succeed (the R2
+      ;; gate). Auth needs token OR the exchange (app-secret); the robot
+      ;; identity needs the app key either way.
+      (when (and (not (str/blank? (str chat-id)))
+                 (not (str/blank? (str app-key)))
+                 (or (not (str/blank? (str token)))
+                     (not (str/blank? (str app-secret)))))
+        (dingtalk-adapter token app-key app-secret chat-id)))
     nil))
