@@ -31,6 +31,22 @@
       (is (= "hi" (get body "input")))
       (is (= "mp3" (get body "response_format"))))))
 
+(deftest timeout-clamp-floors-and-caps
+  (testing "the floor: tiny values cannot abort instantly"
+    (is (= 1 (tts/clamp-timeout-s 0.001)))
+    (is (= 1 (tts/clamp-timeout-s 0.5))))
+  (testing "the cap: huge values cannot collapse Node's setTimeout"
+    (is (= 600 (tts/clamp-timeout-s 2147484)))
+    (is (= 600 (tts/clamp-timeout-s 1e12))))
+  (testing "numeric strings coerce; unusable values land on the cap"
+    (is (= 30 (tts/clamp-timeout-s "30")))
+    (is (= 600 (tts/clamp-timeout-s "abc")))
+    (is (= 600 (tts/clamp-timeout-s nil)))
+    (is (= 600 (tts/clamp-timeout-s -5))))
+  (testing "in range, unchanged; the hop's 900 s default is capped"
+    (is (= 300 (tts/clamp-timeout-s 300)))
+    (is (= 600 (tts/clamp-timeout-s 900)))))
+
 (deftest synthesize-fails-named-on-every-branch
   ;; async: the assertions ride the promise chain and the test awaits them
   (async done

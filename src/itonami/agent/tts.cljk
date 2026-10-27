@@ -47,6 +47,17 @@
   (let [s (str f)]
     (when (re-matches #"[A-Za-z0-9]+" s) s)))
 
+(defn clamp-timeout-s
+  "The abort delay in seconds, floor AND cap (backoff-ms is
+  (min 600000 (max 1000 ...)) in ms): below the floor a tiny timeout would
+  abort instantly; above the cap Node collapses the setTimeout delay to
+  ~1 ms. Numeric strings coerce; unusable values land on the cap (everything
+  is bounded — the hop's own 900 s default is capped here too)."
+  [t0]
+  (let [t (if (string? t0) (js/Number t0) t0)
+        t (if (and (number? t) (js/isFinite t) (pos? t)) t 600)]
+    (min 600 (max 1 t))))
+
 (defn synthesize!
   "Run one synthesis and write the audio into <home>/workspace/tts/<sha>.<format>,
   where the hash covers text+voice+model+format+provider+base_url (same
@@ -109,17 +120,18 @@
                   ;; uncapped large request_timeout_seconds (a plausible
                   ;; ms/s unit mix-up) would abort every request instantly.
                   ;; 600000 ms is backoff-ms' ceiling.
-                  timeout-s (let [t (:timeout-s hop)
-                                  t (cond
-                                      (string? t) (js/Number t)
-                                      :else t)
-                                  t (if (and (number? t) (js/isFinite t) (pos? t)) t 900)]
-                              (min 600 t))
+                  timeout-s (clamp-timeout-s (:timeout-s hop))
                   timer (js/setTimeout (fn [] (.abort ctl)) (* 1000 timeout-s))]
-              (-> (fetch (:url req) (clj->js {:method "POST"
-                                              :headers (clj->js (:headers req))
-                                              :body (:body req)
-                                              :signal (.-signal ctl)}))
+              (-> (try
+                    (fetch (:url req) (clj->js {:method "POST"
+                                                :headers (clj->js (:headers req))
+                                                :body (:body req)
+                                                :signal (.-signal ctl)}))
+                    (catch :default e
+                      ;; a synchronously-throwing injected fetch must not
+                      ;; escape with the timer armed
+                      (js/clearTimeout timer)
+                      (js/Promise.reject e)))
                   (p/catch (fn [e]
                              (js/clearTimeout timer)
                              {"error" (str "speech request failed: " (or (.-message e) e))}))
