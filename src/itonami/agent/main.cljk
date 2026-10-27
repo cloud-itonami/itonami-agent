@@ -273,6 +273,14 @@
           (js/Promise.
            (fn [resolve]
              (let [answers (atom {})
+                   settled (atom false)
+                   close-handler (atom nil)
+                   ;; settle exactly once, dropping the close listener so a
+                   ;; long chat never stacks them (Hermes' CLI modal too)
+                   settle (fn [reply]
+                            (when (compare-and-set! settled false true)
+                              (when-let [h @close-handler] (.removeListener rl "close" h))
+                              (resolve reply)))
                    qs (vec questions)
                    ask-at (fn ask-at [i]
                             (if-let [q (get qs i)]
@@ -298,10 +306,15 @@
                                                               :else (pick1 line))]
                                                  (swap! answers assoc (get q "qid") picked)
                                                  (ask-at (inc i))))))
-                              (resolve {"answers" @answers "outcome" "submitted"})))]
+                              (settle {"answers" @answers "outcome" "submitted"})))]
                ;; stdin closing must SETTLE the promise — a dropped
                ;; .question callback would wedge the whole run mid-tool
-               ;; (the close listener above is the cancelled path)
+               ;; (Hermes' CLI modal keeps the answers already locked in)
+               (reset! close-handler
+                       (fn [] (settle {"answers" @answers
+                                       "outcome" "cancelled"
+                                       "notice" "input closed before the questions were answered"})))
+               (.on rl "close" @close-handler)
                (ask-at 0)))))
         ask-before-tool (fn [{:keys [name arguments]}]
                           (let [arguments (if (map? arguments) arguments
