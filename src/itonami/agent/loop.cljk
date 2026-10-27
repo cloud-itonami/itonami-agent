@@ -426,17 +426,19 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
     (atom (get st "children")))
   (def delegate-delivered (atom (get st "delivered"))))
 
+(defn- merge-children
+  "MERGE BY recency — shared by the write AND the fetch paths (the R7 gate:
+  a stale in-memory record must never mask a newer on-disk one anywhere).
+  Higher updated_at wins; ties keep the ON-DISK record."
+  [on-disk mem]
+  (merge-with (fn [a b] (if (> (or (get b "updated_at") 0) (or (get a "updated_at") 0)) b a))
+              on-disk mem))
+
 (defn- write-merged-registry!
   "The MERGED write itself — caller must hold the lock."
   []
   (let [on-disk (load-delegate-state)
-        ;; MERGE BY recency: a stale in-memory record must never overwrite a
-        ;; newer on-disk one (the R6 gate) — higher updated_at wins; records
-        ;; without a stamp lose to any stamped one
-        newer? (fn [a b] (>= (or (get a "updated_at") 0) (or (get b "updated_at") 0)))
-        merged-children (merge-with (fn [a b] (if (newer? a b) a b))
-                                    (get on-disk "children")
-                                    @delegate-children)
+        merged-children (merge-children (get on-disk "children") @delegate-children)
         merged-delivered (into (set (get on-disk "delivered")) @delegate-delivered)]
     (h/spit-atomic (delegate-state-file)
                    (h/json-str {"children" merged-children
@@ -480,10 +482,11 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
    ;; deliver the same finished child before either write lands (the R5
    ;; double-delivery gate)
    (let [sk (str session-key)
-         outcome (h/with-lock (str (delegate-state-file) ".lock")
+         outcome (try
+                   (h/with-lock (str (delegate-state-file) ".lock")
                    (fn []
                      (let [on-disk (load-delegate-state)
-                           children (merge (get on-disk "children") @delegate-children)
+                           children (merge-children (get on-disk "children") @delegate-children)
                            delivered (into (set (get on-disk "delivered")) @delegate-delivered)
                            pending (vec (for [[id c] children
                                               :when (and (not= "running" (get c "status"))
@@ -500,7 +503,12 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                          (try (write-merged-registry!)
                               (catch :default e
                                 (js/console.error (str "delegate delivery ack failed: " (or (.-message e) e))))))
-                       pending)))]
+                       pending)))
+                   (catch :default e
+                     ;; lock-acquire IO errors must not crash ask either
+                     ;; (the R7 gate) — loud log, empty result, next poll
+                     (js/console.error (str "delegate registry fetch failed: " (or (.-message e) e)))
+                    []))]
      (if (= outcome ::busy)
        ;; TRANSIENT contention must not kill the interactive loop: return
        ;; empty and let the next poll pick the results up (delivery stays
@@ -638,6 +646,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                          (swap! delegate-children assoc id {"goal" goal
                                                                             "status" (get base "status")
                                                                             "summary" (get base "summary")
+                                                                            "error" (get base "error")
                                                                             "session_key" (str (or (:session-key parent-options) ""))
                                                                             ;; per-record stamp: the merge
                                                                             ;; keeps the NEWER record (the
@@ -654,7 +663,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                          (proc/unregister-subagent-attribution! id)
                                          base))]
                             (swap! delegate-children assoc id {"goal" goal "status" "running"
-                                                               "session_key" (str (or (:session-key parent-options) ""))})
+                                                               "session_key" (str (or (:session-key parent-options) ""))
+                                                               "updated_at" (h/now-ms)})
                             (persist-delegate-state!)
                             (swap! delegate-ctl assoc id ctl)
                             ;; Hermes tools/delegate_tool_registry._register_child:
@@ -678,7 +688,13 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                     (p/catch (fn [_] (done result v)))))))))
                                 (p/catch (fn [e]
                                            (swap! delegate-children assoc id {"goal" goal "status" "failed"
-                                                                              "session_key" (str (or (:session-key parent-options) ""))})
+                                                                              "error" (str (or (.-message e) ""))
+                                                                              "session_key" (str (or (:session-key parent-options) ""))
+                                                                              ;; EVERY record is stamped (the R7
+                                                                              ;; gate): an unstamped failure tie-loses
+                                                                              ;; to the on-disk running record and
+                                                                              ;; vanishes across runs
+                                                                              "updated_at" (h/now-ms)})
                                            (persist-delegate-state!)
                                            (proc/unregister-subagent-attribution! id)
                                            {"subagent_id" id "goal" goal "status" "failed" "error" (.-message e)})))))

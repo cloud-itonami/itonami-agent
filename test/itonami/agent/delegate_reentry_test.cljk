@@ -57,6 +57,20 @@
     (loop/persist-delegate-state!))
   (is (= "newer on disk" (get-in (get (loop/load-delegate-state) "children") ["kid" "summary"]))))
 
+(deftest failure-records-survive-the-merge
+  ;; the R7 gate: EVERY record is stamped, so a completed/failed record can
+  ;; never tie-lose to an older on-disk 'running' one (an unstamped failure
+  ;; used to vanish across runs)
+  (h/spit-atomic (loop/delegate-state-file)
+                 (h/json-str {"children" {"kid" {"goal" "g" "status" "running" "session_key" "" "updated_at" 1000}}
+                              "delivered" []}))
+  (with-redefs [loop/delegate-children (atom {"kid" {"goal" "g" "status" "failed" "error" "boom" "session_key" "" "updated_at" 2000}})
+                loop/delegate-delivered (atom #{})]
+    (loop/persist-delegate-state!))
+  (let [kid (get (get (loop/load-delegate-state) "children") "kid")]
+    (is (= "failed" (get kid "status")))
+    (is (= "boom" (get kid "error")))))
+
 (deftest the-session-key-is-asserted-not-assumed
   (h/spit-atomic (loop/delegate-state-file) (h/json-str {"children" {} "delivered" []}))
   ;; kbb/SCI binds missing args to nil — the requirement must be RUNTIME
