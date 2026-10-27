@@ -57,7 +57,11 @@
   bind it to nil under kbb/SCI). Resolves
   to a map naming path and format, or a map
   naming the error — a named outcome either way, never a guessed artifact."
-  ([config home args fetch] (synthesize! config home args fetch nil))
+  ([config home args fetch]
+   ;; nil writable? = ungated, safe ONLY because out-path is fully
+   ;; determined by sha256-hex + safe-format's alphanumeric guard — no
+   ;; caller argument ever joins the path ungated
+   (synthesize! config home args fetch nil))
   ([config home {:strs [text voice model] :as args} fetch writable?]
   ;; `format` is pulled by key — destructuring it would shadow clojure.core
   (let [cfg (configured config)
@@ -100,10 +104,17 @@
                   ;; never fires and the fetch stays unbounded. (The timer is
                   ;; cleared on BOTH outcomes; p/finally is avoided: it
                   ;; breaks value propagation through p/catch in this build.)
-                  ;; a non-numeric request_timeout_seconds must not throw
-                  ;; or NaN the delay — clamp like backoff-ms does
-                  timeout-s (let [t (:timeout-s hop)]
-                              (if (and (number? t) (pos? t)) t 900))
+                  ;; clamp like backoff-ms: floor AND CAP. Node collapses
+                  ;; setTimeout delays above 2^31-1 ms to ~1 ms, so an
+                  ;; uncapped large request_timeout_seconds (a plausible
+                  ;; ms/s unit mix-up) would abort every request instantly.
+                  ;; 600000 ms is backoff-ms' ceiling.
+                  timeout-s (let [t (:timeout-s hop)
+                                  t (cond
+                                      (string? t) (js/Number t)
+                                      :else t)
+                                  t (if (and (number? t) (js/isFinite t) (pos? t)) t 900)]
+                              (min 600 t))
                   timer (js/setTimeout (fn [] (.abort ctl)) (* 1000 timeout-s))]
               (-> (fetch (:url req) (clj->js {:method "POST"
                                               :headers (clj->js (:headers req))
@@ -117,9 +128,11 @@
                      ;; the timer is cleared at the INNERMOST completions —
                      ;; it must stay armed through the body read (.arrayBuffer),
                      ;; which is exactly where a slow drip stalls (the cited
-                     ;; chat-hop pattern keeps it armed past (.text r) too)
+                     ;; chat-hop pattern keeps it armed past (.text r) too).
+                     ;; The early error-map return clears it too (R1: the
+                     ;; 'both outcomes' claim must be literal).
                      (if (get r "error")
-                       r
+                       (do (js/clearTimeout timer) r)
                        (if (.-ok r)
                          (-> (.arrayBuffer r)
                              (p/then
@@ -139,8 +152,13 @@
                                         ;; reader never sees a
                                         ;; half-written cache file
                                         (let [tmp (str out-path ".tmp-" (.-pid js/process))]
-                                          (fs/writeFileSync tmp (js/Buffer.from buf))
-                                          (fs/renameSync tmp out-path))
+                                          (try
+                                            (fs/writeFileSync tmp (js/Buffer.from buf))
+                                            (fs/renameSync tmp out-path)
+                                            (catch :default e
+                                              ;; no tmp litter on failure
+                                              (try (fs/unlinkSync tmp) (catch :default _ nil))
+                                              (throw e))))
                                         ;; the CALLER records this as a run
                                         ;; write (tools.cljk) — tts cannot
                                         ;; require tools (cycle)
