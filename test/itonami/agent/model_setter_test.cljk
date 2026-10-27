@@ -119,6 +119,20 @@
     (is (= "model:\n  default: NEW # pinned\n"
            (profile/set-model-text "model:\n  default: old # pinned\n" "NEW" nil)))))
 
+(deftest comments-are-transparent-and-last-block-wins
+  (testing "a column-0 comment inside the block does NOT end it (the reader strips comments)"
+    (let [out (profile/set-model-text "model:\n# c\n  default: old\n" "NEW" nil)]
+      (is (= 1 (count (re-seq #"(?m)^\s+default:" out))) "no duplicate default key")
+      (is (str/includes? out "  default: NEW"))
+      (is (not (str/includes? out "old")) "the old value must be gone — not a silent no-op")))
+
+  (testing "duplicate top-level model: blocks: the LAST is what the reader keeps"
+    (let [out (profile/set-model-text "model:\n  default: first\nmodel:\n  default: second\n" "NEW" nil)]
+      (is (str/includes? out "  default: first") "the ignored first block is left alone")
+      (is (str/includes? out "  default: NEW"))
+      (is (not (str/includes? out "second")))
+      (is (= "NEW" (get-in (parse-yaml out) ["model" "default"])) "the reader resolves NEW"))))
+
 (deftest config-mode-is-preserved
   (let [home (str "/tmp/test-model-mode-" (.-pid js/process) "-" (random-uuid))]
     (.mkdirSync fs home #js {:recursive true})

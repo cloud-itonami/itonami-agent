@@ -1235,8 +1235,9 @@
   ;; default while showing a different effective model would mislead
   (when (and (seq args) (:model opts))
     (die 2 "model NAME and -m/--model cannot combine: NAME writes the default, -m overrides one run"))
-  ;; --provider must be a real string (--provider=true parses as boolean)
-  (when (and (seq args) (some? (:provider opts)) (not (string? (:provider opts))))
+  ;; --provider must be a real string (--provider=true parses as boolean) —
+  ;; on the SHOW path too, where it feeds provider/resolution
+  (when (and (some? (:provider opts)) (not (string? (:provider opts))))
     (die 2 "--provider must be a name, not a flag value"))
   (when-let [name (first args)]
     (when (str/blank? (str/trim name))
