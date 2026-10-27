@@ -55,6 +55,14 @@
       (is (re-find #"not a regular file" (str (:error (main/claim-pid! dir "gateway.pid" 1))))))
     (fs/rmSync dir #js {:recursive true :force true})))
 
+(deftest fresh-directory-bootstraps
+  ;; the R5 regression: h/spit used to create the parent dir; the claim
+  ;; must still boot in a fresh profile dir
+  (let [dir (str "/tmp/test-pid-guard5-" (.-pid js/process) "-" (random-uuid) "/nested")]
+    (is (nil? (:error (main/claim-pid! dir "gateway.pid"))))
+    (is (h/file? (h/join dir "gateway.pid")))
+    (fs/rmSync (subs dir 0 (- (count dir) 7)) #js {:recursive true :force true})))
+
 (deftest claim-pid-claims-a-free-slot
   (let [dir (str "/tmp/test-pid-guard2-" (.-pid js/process) "-" (random-uuid))]
     (.mkdirSync fs dir #js {:recursive true})
