@@ -18,6 +18,7 @@
             [itonami.agent.webguard :as webguard]
             [itonami.agent.process :as process]
             [itonami.agent.code-rpc :as code-rpc]
+            [itonami.agent.clarify :as clarify]
             [itonami.agent.connections :as connections]
             [itonami.agent.tts :as tts]
             [itonami.agent.homeassistant :as homeassistant]
@@ -354,6 +355,18 @@
               {"domain" {"type" "string"} "service" {"type" "string"}
                "entity_id" {"type" "string"} "data" {"type" "string"}}
               ["domain" "service"])
+   "clarify"
+   (fn-schema "clarify"
+     "Ask the user one or more questions when you need a decision or clarification. questions carries 1-5 entries of {question, choices?, multi_select?}; choices are best-first (the first is marked Recommended), 0-4 labels. The surface asks; answers come back as JSON where every response has status (answered/skipped/unanswered) and user_response. Unavailable in contexts with no user to ask."
+     {"questions" {"type" "array"
+                   "minItems" 1
+                   "maxItems" 5
+                   "items" {"type" "object"
+                            "properties" {"question" {"type" "string"}
+                                          "choices" {"type" "array" "items" {"type" "string"}}
+                                          "multi_select" {"type" "boolean"}}}
+                   "description" "1-5 questions: [{\"question\": text, \"choices\": [label...], \"multi_select\": bool}]."}}
+     ["questions"])
    "manage_connections"
    (fn-schema "manage_connections"
      "Check or describe connection surfaces. Two kinds exist: hosted connector accounts (a tool-gateway integration, answered here with a named error) and local MCP servers (configured state plus cached OAuth auth). Slice 1 is read-only; installing or authorizing a connection is a later slice. Pass connections=[{name: ..., mcp: bool}]; with none, every configured surface is listed."
@@ -3002,6 +3015,12 @@
 (defn- vault-filled? [r]
   (true? (get-in (h/json-parse r) ["result" "result" "value"])))
 
+(defn clarify
+  "Hermes tools/clarify_tool.clarify_tool: normalize, then ask through the
+  surface-injected callback (ctx :clarify-fn). No callback answers the honest
+  unavailability error."
+  [ctx {:strs [questions]}]
+  (clarify/ask! questions (:clarify-fn ctx)))
 (defn manage-connections
   "Hermes manage_connections, slice 1: read-only connection surfaces
   (connections.cljk)."
@@ -3114,7 +3133,7 @@
    "manage_connections" manage-connections
    "text_to_speech" text-to-speech "browser_vault_list" browser-vault-list "browser_vault_unlock" browser-vault-unlock
    "browser_vault_save_login" browser-vault-save-login "browser_vault_enter_code" browser-vault-enter-code
-   "browser_vault_fill" browser-vault-fill "browser_exec" browser/exec-code
+   "clarify" clarify "browser_vault_fill" browser-vault-fill "browser_exec" browser/exec-code
    "browser_vision" browser-vision
    "vision_analyze" vision-analyze
    "computer_use" computer-use/call

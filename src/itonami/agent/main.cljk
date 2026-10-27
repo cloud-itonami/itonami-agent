@@ -265,10 +265,61 @@
   (let [prof (profile/load-profile (:profile opts))
         rl (readline/createInterface #js {:input js/process.stdin :output js/process.stdout})
         history (atom nil)
+        clarify-ask
+        ;; Hermes' CLI clarify callback: ask each question on the readline,
+        ;; number-pick a choice (comma-separated for multi_select) or type
+        ;; free text; answers are keyed by qid
+        (fn [questions]
+          (js/Promise.
+           (fn [resolve]
+             (let [answers (atom {})
+                   settled (atom false)
+                   close-handler (atom nil)
+                   ;; settle exactly once, dropping the close listener so a
+                   ;; long chat never stacks them (Hermes' CLI modal too)
+                   settle (fn [reply]
+                            (when (compare-and-set! settled false true)
+                              (when-let [h @close-handler] (.removeListener rl "close" h))
+                              (resolve reply)))
+                   qs (vec questions)
+                   ask-at (fn ask-at [i]
+                            (if-let [q (get qs i)]
+                              (do (println (str "\n[clarify] " (get q "question")))
+                                  (doseq [[ci c] (map-indexed vector (get q "choices"))]
+                                    (println (str "  " (inc ci) ". " c)))
+                                  (when (seq (get q "choices")) (println "  (or type your own answer)"))
+                                  (.question rl (str (get q "qid") "> ")
+                                             (fn [line]
+                                               (let [line (str/trim (str line))
+                                                     choices (vec (get q "choices"))
+                                                     multi? (true? (get q "multi_select"))
+                                                     pick1 (fn [tok]
+                                                             (let [tok (str/trim (str tok))
+                                                                   n (js/parseInt tok 10)]
+                                                               (if (and (re-matches #"\d+" tok)
+                                                                        (<= 1 n (count choices)))
+                                                                 (nth choices (dec n))
+                                                                 tok)))
+                                                     picked (cond
+                                                              (str/blank? line) nil
+                                                              multi? (mapv pick1 (remove str/blank? (str/split line #",")))
+                                                              :else (pick1 line))]
+                                                 (swap! answers assoc (get q "qid") picked)
+                                                 (ask-at (inc i))))))
+                              (settle {"answers" @answers "outcome" "submitted"})))]
+               ;; stdin closing must SETTLE the promise — a dropped
+               ;; .question callback would wedge the whole run mid-tool
+               ;; (Hermes' CLI modal keeps the answers already locked in)
+               (reset! close-handler
+                       (fn [] (settle {"answers" @answers
+                                       "outcome" "cancelled"
+                                       "notice" "input closed before the questions were answered"})))
+               (.on rl "close" @close-handler)
+               (ask-at 0)))))
         ask-before-tool (fn [{:keys [name arguments]}]
                           (let [arguments (if (map? arguments) arguments
                                             (try (h/json-parse (str arguments)) (catch :default _ {})))]
-                          (if (and (= name "computer_use")
+                            (if (and (= name "computer_use")
                                    (not (contains? #{"capture" "list_apps" "list_windows" "wait"}
                                                    (get arguments "action"))))
                             (js/Promise.
@@ -281,7 +332,12 @@
               ;; one turn per group_process_notifications group, as the CLI's
               ;; pending input queue does (`_pending_input.put` per group)
               (if (seq notices)
-                (-> ((executor opts) prof (first notices) (run-opts opts prof))
+                (-> ((executor opts) prof (first notices)
+                     ;; clarify is wired for the whole CLI session (Hermes
+                     ;; wires clarify_callback once per agent session): every
+                     ;; turn the user is present for may ask — not just the
+                     ;; prompt turn
+                     (assoc (run-opts opts prof) :clarify-fn clarify-ask))
                     (p/then (fn [r]
                               (when (:final r) (println (:final r)))
                               (run-notices (rest notices)))))
@@ -299,7 +355,8 @@
                                              (str "- " (get r "goal") " [" (get r "status") "]: "
                                                   (or (get r "summary") (get r "error")))))
                             "\n\nAcknowledge these results in one line, then end your turn.")
-                       (run-opts (assoc opts :join-children? false) prof))
+                       (assoc (run-opts (assoc opts :join-children? false) prof)
+                              :clarify-fn clarify-ask))
                       (p/then (fn [r]
                                 (when (:final r) (println (:final r)))
                                 (ask))))
@@ -320,7 +377,9 @@
                                             (str "Conversation so far:\n" @history "\n\nUser: " line)
                                             line)]
                                (-> ((executor opts) prof prompt
-                                    (assoc (run-opts opts prof) :before-tool ask-before-tool))
+                                    (assoc (run-opts opts prof)
+                                           :before-tool ask-before-tool
+                                           :clarify-fn clarify-ask))
                                    (p/then (fn [r]
                                              (println (or (:final r) (str "[" (:exit-reason r) "] " (get-in r [:error :error]))))
                                              (swap! history #(str % "\nUser: " line "\nAssistant: " (:final r)))
