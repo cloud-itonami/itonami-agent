@@ -24,11 +24,14 @@
       (try
         (let [rec (h/json-parse (h/slurp f))
               exp (get rec "expires_at")]
-          ;; policy: a record without expires_at is a no-expiry token
-          ;; (token-cached); the boundary itself counts as expired
-          (if (and (number? exp) (<= exp (quot (h/now-ms) 1000)))
-            "token-expired"
-            "token-cached"))
+          ;; policy: a record WITHOUT expires_at is a no-expiry token
+          ;; (token-cached); the boundary itself counts as expired; a
+          ;; PRESENT but non-numeric expires_at is corrupt -> token-unreadable
+          ;; (a corrupt record must never read as healthy)
+          (cond
+            (nil? exp) "token-cached"
+            (number? exp) (if (<= exp (quot (h/now-ms) 1000)) "token-expired" "token-cached")
+            :else "token-unreadable"))
         (catch :default _ "token-unreadable"))
       "needs-login")))
 
@@ -40,7 +43,7 @@
   (let [mcp-names (set (keys (get config "mcp_servers")))
         req (if (and (sequential? requested) (seq requested)) (vec requested) nil)]
     (cond
-      (and requested (not (sequential? requested)))
+      (and (some? requested) (not (sequential? requested)))
       {"error" "connections must be a list of objects like {name, mcp}"}
 
       (and req (some (fn [i] (not (map? i))) req))

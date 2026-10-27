@@ -50,16 +50,19 @@
   (is (= "connections must be a list of objects like {name, mcp}"
          (get (connections/connection-status {} {} "/tmp/x" ["not-a-map"]) "error")))
   (is (= "connections must be a list of objects like {name, mcp}"
-         (get (connections/connection-status {} {} "/tmp/x" "not-a-list") "error"))))
+         (get (connections/connection-status {} {} "/tmp/x" "not-a-list") "error")))
+  (is (= "connections must be a list of objects like {name, mcp}"
+         (get (connections/connection-status {} {} "/tmp/x" false) "error"))))
 
 (deftest the-tool-reads-the-ctx-config-key
   ;; the tool ctx carries config at :mcp-config — the handler must not
   ;; invent a :config key and report an empty surface in real runs
   (let [ctx {:mcp-config {"mcp_servers" {"srv" {"command" "x"}}}
              :tool-env {} :home "/tmp/no-home"}
-        r (tools/manage-connections ctx {"connections" [{"name" "srv" "mcp" true}]})]
-    (is (re-find #"configured" (str r)))
-    (is (not (re-find #"false" (str r))))))
+        r (tools/manage-connections ctx {"connections" [{"name" "srv" "mcp" true}]})
+        row (get-in (h/json-parse r) ["connections" 0])]
+    (is (= "srv" (get row "name")))
+    (is (true? (get row "configured")))))
 
 (deftest expiring-tokens-are-expired-on-the-boundary
   (let [home (h/join (h/tmp-dir) (str "test-conn2-" (.-pid js/process) "-" (h/random-hex 4)))
@@ -72,4 +75,9 @@
     (testing "a record without expires_at is a no-expiry token: token-cached (policy)"
       (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json"))
               (h/json-str {"access_token" "S"}))
-      (is (= "token-cached" (auth-of))))))
+      (is (= "token-cached" (auth-of))))
+    (testing "a PRESENT but non-numeric expires_at is corrupt: token-unreadable (never healthy)"
+      (doseq [v ["100" true]]
+        (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json"))
+                (h/json-str {"access_token" "S" "expires_at" v}))
+        (is (= "token-unreadable" (auth-of)))))))
