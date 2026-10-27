@@ -1822,18 +1822,22 @@
       (str/replace "_" "\\_")))
 
 (defn- fts-syntax-error?
-  "The degrade gate: ONLY an fts5 SYNTAX error becomes 'no content rows'.
-  Corruption-class fts5 errors ('fts5: corrupt structure record') and IO
-  failures surface — the reference routes them to DatabaseError, not the
-  syntax arm."
+  "The degrade gate: QUERY-PARSE failures become 'no content rows' — the
+  user's query text cannot be parsed as an fts5 expression, exactly the
+  class the unported `_sanitize_fts5_query` exists to prevent. STRUCTURAL
+  and IO failures (corrupt index, missing table, disk errors) surface
+  instead: the fail-closed choice rounds 2-3 gated (the reference's blanket
+  OperationalError arm would swallow some of these too — the split here is
+  deliberate and stricter)."
   [e]
-  ;; node:sqlite's MATCH syntax family: besides 'fts5: syntax error', an
-  ;; unbalanced quote raises 'unterminated string' and a bad expression
-  ;; raises 'malformed MATCH expression' — Hermes degrades every
-  ;; OperationalError from the MATCH read, so the whole family degrades
+  ;; node:sqlite's MATCH query-parse family, verified empirically: colon-
+  ;; bearing text raises 'no such column: <col>', '*star' raises 'unknown
+  ;; special query', an unbalanced quote raises 'unterminated string'
   (let [m (str (.-message e))]
     (boolean (some #(str/includes? m %)
-                   ["fts5: syntax error" "unterminated string" "malformed MATCH expression"]))))
+                   ["fts5: syntax error" "unterminated string"
+                    "malformed MATCH expression" "no such column:"
+                    "unknown special query"]))))
 
 (defn- session-resolve-title
   "hermes_state_titles.resolve_session_by_title: the id a session title names —
@@ -1843,10 +1847,11 @@
   no counterpart here.)"
   [db title]
   ;; both queries filter visibility: a hidden session must not swallow the
-  ;; title of a visible one sharing it (the R1 suggestion)
-  (let [exact (get (first (sqlite-records db "SELECT id FROM sessions WHERE title = ? AND COALESCE(hidden, 0) = 0" title)) "id")
+  ;; title of a visible one sharing it (the R1 suggestion), and both order
+  ;; deterministically (newest first, id tiebreak)
+  (let [exact (get (first (sqlite-records db "SELECT id FROM sessions WHERE title = ? AND COALESCE(hidden, 0) = 0 ORDER BY started_at DESC, id DESC" title)) "id")
         numbered (sqlite-records db
-                   "SELECT id FROM sessions WHERE title LIKE ? ESCAPE '\\' AND COALESCE(hidden, 0) = 0 ORDER BY started_at DESC"
+                   "SELECT id FROM sessions WHERE title LIKE ? ESCAPE '\\' AND COALESCE(hidden, 0) = 0 ORDER BY started_at DESC, id DESC"
                    (str (session-escape-like title) " #%"))]
     (or (get (first numbered) "id") exact)))
 

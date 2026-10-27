@@ -251,13 +251,23 @@
                       [{:id 1 :session "s1" :role "user" :content "don't panic"}])
       (let [res (call {:home work :cwd work} {"query" "don't"})]
         (is (nil? (get res "error")) "an fts5 syntax error is not a tool error")
-        (is (map? res))))))
+        (is (zero? (get res "count" -1)) "it DEGRADES to empty — not a silent success with hits")))))
 
 (deftest the-syntax-family-degrades
   ;; the R3 gate: node:sqlite's MATCH syntax errors are a FAMILY — an
   ;; unbalanced double quote raises "unterminated string", which lacks the
   ;; "fts5: syntax error" substring; the whole family degrades to no content
   ;; rows like Hermes' OperationalError arm
+  (testing "colon-bearing queries degrade too (no such column / unknown special)"
+    (let [root (h/join (h/tmp-dir) (str "itonami-fts-colon-" (h/random-hex 4)))
+          work (h/join root "profiles" "work")]
+      (make-state-db! (h/join work "state.db")
+                      [{:id "s1" :title "alpha" :started 100}]
+                      [{:id 1 :session "s1" :role "user" :content "build failure"}])
+      (doseq [q ["Re: build failure" "notes: planning" "*star"]]
+        (let [res (call {:home work :cwd work} {"query" q})]
+          (is (nil? (get res "error")) (str "query " q))
+          (is (zero? (get res "count" -1)) (str "query " q))))))
   (testing "unbalanced-quote queries degrade to empty content rows, not tool errors"
     (let [root (h/join (h/tmp-dir) (str "itonami-fts-unbal-" (h/random-hex 4)))
           work (h/join root "profiles" "work")]
@@ -265,7 +275,8 @@
                       [{:id "s1" :title "alpha" :started 100}]
                       [{:id 1 :session "s1" :role "user" :content "say hello"}])
       (let [res (call {:home work :cwd work} {"query" "say \"hello"})]
-        (is (nil? (get res "error")) "an unbalanced quote is syntax, not a tool error"))
+        (is (nil? (get res "error")) "an unbalanced quote is syntax, not a tool error")
+        (is (zero? (get res "count" -1)) "degraded to empty"))
       (is (false? (#'tools/fts-syntax-error? (js/Error. "no such table: messages_fts")))))))
 
 (deftest fts-corruption-surfaces-never-empties
