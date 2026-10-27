@@ -395,16 +395,42 @@
 
       :else {:error (str platform " is not implemented for send (telegram/slack/matrix/discord/mattermost)")})))
 
+(def max-reply-chars
+  "Sendable reply segment size. Telegram sendMessage rejects over 4096 chars
+  with HTTP 400; stay under the limit with margin."
+  4000)
+
+(defn chunk-text
+  "Split a reply into sendable segments of at most `limit` chars, preferring
+  the last newline inside the window (a hard split only when one line is
+  longer than the limit). The boundary newline stays with the earlier
+  segment, so concatenating every segment returns the original text."
+  ([text] (chunk-text text max-reply-chars))
+  ([text limit]
+   (let [s (str text)]
+     (if (<= (count s) limit)
+       [s]
+       (loop [rest-s s acc []]
+         (if (<= (count rest-s) limit)
+           (conj acc rest-s)
+           (let [window (subs rest-s 0 limit)
+                 nl (str/last-index-of window "\n")
+                 cut (if nl (inc nl) limit)]
+             (recur (subs rest-s cut) (conj acc (subs window 0 cut))))))))))
+
 (defn send-reply!
   "The reply through the platform's existing send adapter (the same one the
-  cron delivery queue uses), addressed to the MESSAGE'S chat — a
+  cron delivery queue uses), addressed to the MESSAGE'S chat: a
   `gateway.routes`-routed chat must never leak into the profile's configured
-  delivery chat: a message that names no chat is refused outright, and
+  delivery chat — a message that names no chat is refused outright, and
   webhook-style sends (one fixed target) refuse a chat they do not serve
-  rather than post into the configured channel. The message's `thread_id` rides along as the platform's thread
-  target where one exists (telegram: message_thread_id). `prof` is the owning
-  profile (same position as `send!`'s first argument). Resolves to nil on
-  success or the adapter's error string."
+  rather than post into the configured channel. The message's thread_id
+  rides along as the platform's thread target where one exists (telegram:
+  message_thread_id). A reply longer than `max-reply-chars` is sent as
+  ordered newline-preferring segments; the first failing segment stops the
+  send and its error is returned. `prof` is the owning profile (same position
+  as send!'s first argument). Resolves to nil on success or the adapter's
+  error string."
   ([prof msg text] (send-reply! prof msg text nil))
   ([prof msg text fetch]
    (let [platform (get msg "platform")
@@ -412,10 +438,22 @@
          adapter (platforms/for-lane platform (:config prof))]
      (cond
        (str/blank? chat)
-       (p/resolved (str platform " reply names no chat — refusing to fall back to the configured delivery chat"))
+       (p/resolved (str platform " reply names no chat - refusing to fall back to the configured delivery chat"))
+
        (nil? adapter)
        (p/resolved (str platform " send adapter not configured"))
+
        :else
-       (adapter nil platform text (cond-> {:chat-id chat
-                                          :thread-id (get msg "thread_id")}
-                                    fetch (assoc :fetch fetch)))))))
+       (let [send-opts (cond-> {:chat-id chat
+                                :thread-id (get msg "thread_id")}
+                         fetch (assoc :fetch fetch))
+             segments (chunk-text text)
+             send-segs (fn send-segs [segs]
+                         (let [seg (first segs)
+                               more (rest segs)]
+                           (-> (adapter nil platform seg send-opts)
+                               (p/then (fn [res]
+                                         (if (and (nil? res) (seq more))
+                                           (send-segs more)
+                                           res))))))]
+         (send-segs segments))))))
