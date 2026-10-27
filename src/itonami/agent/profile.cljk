@@ -41,7 +41,11 @@
   []
   (h/expand (or (h/env "ITONAMI_HERMES_ROOT") "~/.hermes")))
 
-(defn valid-name? [n] (boolean (re-matches #"^[a-z0-9][a-z0-9_-]{0,63}$" (str n))))
+(defn valid-name?
+  "A profile name: a lowercase token of at most 64 chars. Non-strings refuse —
+  the coercion is for callers passing keyword/string twins, not for numbers."
+  [n]
+  (boolean (and (string? n) (re-matches #"^[a-z0-9][a-z0-9_-]{0,63}$" n))))
 
 (defn home-in
   "Profile name -> its home directory in an explicit store root. `default` is

@@ -1,0 +1,100 @@
+(ns itonami.agent.connections-test
+  "manage_connections slice 1: read-only connection surfaces — local MCP rows
+  carry auth state without token values; hosted connectors answer the named
+  unavailability."
+  (:require [cljs.test :refer [deftest is testing]]
+            [itonami.agent.host :as h]
+            [itonami.agent.tools :as tools]
+            [itonami.agent.oauth :as oauth]
+            [itonami.agent.connections :as connections]))
+
+(deftest mcp-rows-carry-auth-state
+  (let [home (h/join (h/tmp-dir) (str "test-conn-" (.-pid js/process) "-" (h/random-hex 4)))
+        _ (h/mkdirs (h/join home "mcp-tokens"))
+        config {"mcp_servers" {"srv" {"command" "x"} "other" {"url" "https://mcp.example"}}}]
+    (testing "no cache file: needs-login (dapp rows ride alongside)"
+      (let [rows (filter #(= "mcp" (get % "kind"))
+                         (connections/connection-status config {} home nil))]
+        (is (= 2 (count rows)))
+        (is (every? #(= "mcp" (get % "kind")) rows))
+        (is (every? #(true? (get % "configured")) rows))
+        (is (every? #(= "needs-login" (get % "auth")) rows))))
+    (testing "a cached, unexpired token reads as token-cached (never the value)"
+      (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json"))
+              (h/json-str {"access_token" "SECRET" "expires_at" (+ 9999999999 (quot (h/now-ms) 1000))}))
+      (let [rows (connections/connection-status config {} home nil)
+            srv (first (filter #(= "srv" (get % "name")) rows))]
+        (is (some? srv))
+        (is (= "token-cached" (get srv "auth")))
+        (is (not (re-find #"SECRET" (h/json-str rows))))))
+    (testing "an expired token reads as token-expired; a corrupt one as token-unreadable"
+      (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json"))
+              (h/json-str {"access_token" "SECRET" "expires_at" 100}))
+      (is (= "token-expired" (get (first (filter #(= "srv" (get % "name"))
+                                                 (connections/connection-status config {} home nil)))
+                                  "auth")))
+      (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json")) "{not json")
+      (is (= "token-unreadable" (get (first (filter #(= "srv" (get % "name"))
+                                                   (connections/connection-status config {} home nil)))
+                                    "auth"))))))
+
+(deftest hosted-connectors-name-their-unavailability
+  (let [rows (connections/connection-status {} {} "/tmp/no-home"
+                                            [{"name" "gmail"} {"name" "srv" "mcp" true}])]
+    (is (= connections/hosted-error (get-in (first rows) ["error"])))
+    (is (= "hosted" (get-in (first rows) ["kind"])))
+    (is (= "mcp" (get-in (second rows) ["kind"])))
+    (is (false? (get-in (second rows) ["configured"])))))
+
+(deftest hardening-edges-are-named
+  (testing "a parseable but non-object token record is corrupt: token-unreadable"
+    (let [home (h/join (h/tmp-dir) (str "test-conn3-" (.-pid js/process) "-" (h/random-hex 4)))
+          _ (h/mkdirs (h/join home "mcp-tokens"))
+          config {"mcp_servers" {"srv" {"command" "x"}}}]
+      (doseq [v ["null" "[]" "42" "false"]]
+        (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json")) v)
+        (is (= "token-unreadable"
+               (get (first (connections/connection-status config {} home nil)) "auth"))
+            (str "record " v)))))
+  (testing "non-string names are named errors, never coerced into names"
+    (let [rows (connections/connection-status {} {} "/tmp/x" [{"name" false} {"name" 42}])]
+      (is (every? #(re-find #"non-blank name string" (str (get % "error"))) rows))))
+  (testing "a non-boolean mcp is a named error"
+    (is (= "mcp must be boolean or absent (omit the key)"
+           (get (first (connections/connection-status {} {} "/tmp/x" [{"name" "x" "mcp" "true"}])) "error")))))
+
+(deftest malformed-requests-are-named
+  (is (= "connections must be a list of objects like {name, mcp}"
+         (get (connections/connection-status {} {} "/tmp/x" ["not-a-map"]) "error")))
+  (is (= "connections must be a list of objects like {name, mcp}"
+         (get (connections/connection-status {} {} "/tmp/x" "not-a-list") "error")))
+  (is (= "connections must be a list of objects like {name, mcp}"
+         (get (connections/connection-status {} {} "/tmp/x" false) "error"))))
+
+(deftest the-tool-reads-the-ctx-config-key
+  ;; the tool ctx carries config at :mcp-config — the handler must not
+  ;; invent a :config key and report an empty surface in real runs
+  (let [ctx {:mcp-config {"mcp_servers" {"srv" {"command" "x"}}}
+             :tool-env {} :home "/tmp/no-home"}
+        r (tools/manage-connections ctx {"connections" [{"name" "srv" "mcp" true}]})
+        row (get-in (h/json-parse r) ["connections" 0])]
+    (is (= "srv" (get row "name")))
+    (is (true? (get row "configured")))))
+
+(deftest expiring-tokens-are-expired-on-the-boundary
+  (let [home (h/join (h/tmp-dir) (str "test-conn2-" (.-pid js/process) "-" (h/random-hex 4)))
+        _ (h/mkdirs (h/join home "mcp-tokens"))
+        config {"mcp_servers" {"srv" {"command" "x"}}}
+        auth-of (fn [] (get (first (connections/connection-status config {} home nil)) "auth"))]
+    (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json"))
+            (h/json-str {"access_token" "S" "expires_at" (quot (h/now-ms) 1000)}))
+    (is (= "token-expired" (auth-of)))
+    (testing "a record without expires_at is a no-expiry token: token-cached (policy)"
+      (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json"))
+              (h/json-str {"access_token" "S"}))
+      (is (= "token-cached" (auth-of))))
+    (testing "a PRESENT but non-numeric expires_at is corrupt: token-unreadable (never healthy)"
+      (doseq [v ["100" true nil]]
+        (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json"))
+                (h/json-str {"access_token" "S" "expires_at" v}))
+        (is (= "token-unreadable" (auth-of)))))))

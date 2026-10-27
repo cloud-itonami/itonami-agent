@@ -154,7 +154,8 @@
   "The env var that carries this lane's token, or nil when the lane needs no
   token: a webhook lane (mattermost ALWAYS, discord when webhook_url is set)
   is configured by its webhook, not by a token — a configured token_env on
-  such a lane is dead and must not be demanded."
+  such a lane is dead and must not be demanded. An UNKNOWN lane with no
+  token_env also answers nil — never a guessed env name."
   [lane config]
   (let [lane (str/lower-case (str lane))
         c (get-in config ["delivery" lane])]
