@@ -1,0 +1,71 @@
+(ns itonami.agent.pid-guard-test
+  "gateway single-instance guard: a LIVE owner refuses the claim, a dead
+  owner's stale file is taken over."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            ["node:fs" :as fs]
+            [itonami.agent.host :as h]
+            [itonami.agent.main :as main]))
+
+(deftest claim-pid-refuses-a-live-owner
+  (let [dir (str "/tmp/test-pid-guard-" (.-pid js/process) "-" (random-uuid))]
+    (.mkdirSync fs dir #js {:recursive true})
+    (h/spit (h/join dir "gateway.pid") (str (.-pid js/process)))
+    (testing "a live owner (ourselves) blocks the claim"
+      (is (re-find #"already running" (str (:error (main/claim-pid! dir "gateway.pid"))))))
+    (testing "a dead owner is stale: the claim takes over"
+      (h/spit (h/join dir "gateway.pid") "999999999")
+      (let [claim (main/claim-pid! dir "gateway.pid")]
+        (is (nil? (:error claim)))
+        (is (= (.-pid js/process) (:pid claim)))
+        (is (= (str (.-pid js/process)) (str/trim (h/slurp (h/join dir "gateway.pid")))))))
+    (testing "garbage in the pid file is stale too"
+      (h/spit (h/join dir "gateway.pid") "not-a-pid")
+      (is (nil? (:error (main/claim-pid! dir "gateway.pid")))))
+    (fs/rmSync dir #js {:recursive true :force true})))
+
+(deftest exclusivity-and-edge-pids
+  (let [dir (str "/tmp/test-pid-guard3-" (.-pid js/process) "-" (random-uuid))]
+    (.mkdirSync fs dir #js {:recursive true})
+    (testing "the second claim loses to the first (exclusive create, no TOCTOU window)"
+      (let [first-claim (main/claim-pid! dir "gateway.pid")
+            second-claim (main/claim-pid! dir "gateway.pid")]
+        (is (= (.-pid js/process) (:pid first-claim)))
+        (is (re-find #"already running" (str (:error second-claim))))))
+    (testing "out-of-int32 numeric content is garbage, not a live owner"
+      (h/spit (h/join dir "gateway.pid") "2147483648")
+      (is (nil? (:error (main/claim-pid! dir "gateway.pid")))))
+    (testing "pid 0 and 1 are never a live owner"
+      (doseq [v ["0" "1"]]
+        (h/spit (h/join dir "gateway.pid") v)
+        (is (nil? (:error (main/claim-pid! dir "gateway.pid"))) (str "pid " v))))
+    (fs/rmSync dir #js {:recursive true :force true})))
+
+(deftest edge-paths-name-what-stopped-them
+  (let [dir (str "/tmp/test-pid-guard4-" (.-pid js/process) "-" (random-uuid))]
+    (.mkdirSync fs dir #js {:recursive true})
+    (testing "a dead owner with no retries left is NOT reported as running"
+      (h/spit (h/join dir "gateway.pid") "999999999")
+      (let [r (main/claim-pid! dir "gateway.pid" 0)]
+        (is (re-find #"stale takeover attempts exhausted" (str (:error r))))
+        (is (not (re-find #"already running" (str (:error r)))))))
+    (testing "a non-regular file at the pid path is named, not 'keeps reappearing'"
+      (fs/rmSync (h/join dir "gateway.pid") #js {:force true})
+      (.mkdirSync fs (h/join dir "gateway.pid"))
+      (is (re-find #"not a regular file" (str (:error (main/claim-pid! dir "gateway.pid" 1))))))
+    (fs/rmSync dir #js {:recursive true :force true})))
+
+(deftest fresh-directory-bootstraps
+  ;; the R5 regression: h/spit used to create the parent dir; the claim
+  ;; must still boot in a fresh profile dir
+  (let [dir (str "/tmp/test-pid-guard5-" (.-pid js/process) "-" (random-uuid) "/nested")]
+    (is (nil? (:error (main/claim-pid! dir "gateway.pid"))))
+    (is (h/file? (h/join dir "gateway.pid")))
+    (fs/rmSync (subs dir 0 (- (count dir) 7)) #js {:recursive true :force true})))
+
+(deftest claim-pid-claims-a-free-slot
+  (let [dir (str "/tmp/test-pid-guard2-" (.-pid js/process) "-" (random-uuid))]
+    (.mkdirSync fs dir #js {:recursive true})
+    (let [claim (main/claim-pid! dir "gateway-serve.pid")]
+      (is (= (.-pid js/process) (:pid claim))))
+    (fs/rmSync dir #js {:recursive true :force true})))
