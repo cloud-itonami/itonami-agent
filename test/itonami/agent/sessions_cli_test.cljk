@@ -10,6 +10,10 @@
   (testing "a whole positive integer passes, capped"
     (is (= 20 (tools/bounded-limit "20" 200)))
     (is (= 200 (tools/bounded-limit "9999" 200))))
+  (testing "the 9-digit boundary: nine digits pass (capped), ten refuse"
+    (is (= 200 (tools/bounded-limit "999999999" 200)))
+    (is (nil? (tools/bounded-limit "1000000000" 200)))
+    (is (nil? (tools/bounded-limit "9999999999" 200))))
   (testing "NaN, negatives, and partial numbers are refused (never SQLite errors)"
     (is (nil? (tools/bounded-limit "abc" 200)))
     (is (nil? (tools/bounded-limit "-3" 200)))
