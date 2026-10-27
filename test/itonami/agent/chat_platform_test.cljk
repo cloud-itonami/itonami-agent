@@ -303,6 +303,26 @@
       (h/spit f "{\"offset\":42}")
       (is (= 42 (#'chat/read-offset f))))))
 
+(deftest serve-loop-a-rejecting-dispatch-replays-the-batch
+  (async done
+    (let [dir (h/join (h/tmp-dir) (str "test-offset-rej-" (.-pid js/process) "-" (h/random-hex 4)))
+          _ (h/mkdirs dir)
+          state-file (h/join dir "offset.json")
+          tick (atom 0)
+          fake-fetch (fn [_ _]
+                       (swap! tick inc)
+                       (let [body (h/json-str {"ok" true "result" [(tg-update 7 "c1" "one")]})]
+                         (p/resolved #js {:ok true :text (fn [] (p/resolved body))})))
+          srv (chat/serve! {:fetch fake-fetch :token "T" :poll-timeout 0 :max-ticks 1
+                            :offset-file state-file
+                            :dispatch (fn [_] (js/Promise.reject (js/Error. "dispatch boom")))})]
+      (-> (:done srv)
+          (p/then (fn [_]
+                    (testing "the batch is never acked: memory and disk stay behind"
+                      (is (not (h/file? state-file))))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
 (deftest serve-loop-stop-ends-the-loop
   (async done
     (let [srv (chat/serve! {:fetch (fn [_ _] (p/resolved #js {:ok true :text (fn [] (p/resolved (h/json-str {"ok" true "result" []})))}))
