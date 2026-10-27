@@ -1246,11 +1246,11 @@
               (str/blank? (:provider opts))
               (str/starts-with? (str (:provider opts)) "-"))
       (die 2 "--provider must be a provider name")))
-  (when-let [name (first args)]
-    (when (str/blank? (str/trim name))
+  (when-let [model-name (first args)]
+    (when (str/blank? (str/trim model-name))
       (die 2 "model name must be non-empty"))
     (let [home (:home (profile/load-profile (or (:profile opts) "default") {:secrets? false}))]
-      (profile/set-config-model! home (str/trim name) (:provider opts))))
+      (profile/set-config-model! home (str/trim model-name) (:provider opts))))
   (p/let [prof (profile/load-profile (or (:profile opts) "default") {:secrets? false})
           r (provider/resolution (:config prof) {:model (:model opts) :provider (:provider opts)})]
     (println (str "model:     " (get-in r [:model :value]) "   (" (get-in r [:model :source]) ")"))

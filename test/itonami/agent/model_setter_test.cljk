@@ -188,6 +188,15 @@
   (testing "the APPEND path refuses too when any line's quote is unclosed"
     (is (thrown-with-msg? js/Error #"refusing to edit a folded"
                           (profile/set-model-text "foo: \"bar\n" "NEW" nil))))
+  (testing "the reader's OTHER fold triggers are guarded too (the R11 gate)"
+    ;; sequence items and quoted keys with embedded colons open folds the
+    ;; key: value regex alone would miss
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "list:\n  - \"unclosed\nmodel:\n  default: old\n" "NEW" nil)))
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "\"a:b\": \"unclosed\nmodel:\n  default: old\n" "NEW" nil))))
+  (testing "the '' single-quote pair closes per the reader (no false refusal)"
+    (is (string? (profile/set-model-text "model:\n  default: 'it''s'\n" "NEW" nil))))
   (testing "control characters the escape set cannot carry are refused"
     ;; raw CR breaks the reader's line scanning and the escape set cannot
     ;; encode it — refuse CR and exotic controls, never corrupt

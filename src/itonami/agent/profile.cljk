@@ -231,15 +231,24 @@
   quoted value with trailing junk is UNCLOSABLE to the reader — it folds the
   rest of the file into the value (the R9 gate)."
   [l]
-  (let [v (second (re-find #"^\s*[^:]+:\s*(.*)$" l))
+  ;; the value comes from ANY of the reader's head-value shapes: `key: v`
+  ;; (bare, or a quoted key that may contain colons) and `- v` sequence
+  ;; items — yaml.cljk's head-value alternatives, each of which can open a
+  ;; fold (the R11 gate)
+  (let [v (or (second (re-find #"^\s*(?:\"[^\"]*\"|'[^']*'|[^:]+)\s*:\s*(.*)$" l))
+              (second (re-find #"^\s*-\s+(\S.*)$" l)))
         unclosed? (fn [v q esc-form?]
                     (loop [i 1 esc? false]
                       (cond
                         (>= i (count v)) true
                         esc? (recur (inc i) false)
                         (and esc-form? (= (nth v i) \\)) (recur (inc i) true)
+                        ;; single quotes close at '' too (the reader's
+                        ;; escaped-quote pair)
                         (= (nth v i) q)
-                        (not (boolean (re-matches #"\s*(?:#.*)?" (subs v (inc i)))))
+                        (if (and (not esc-form?) (= (get v (inc i)) q))
+                          (recur (+ i 2) false)
+                          (not (boolean (re-matches #"\s*(?:#.*)?" (subs v (inc i))))))
                         :else (recur (inc i) false))))]
     (boolean
      (when v
@@ -429,9 +438,9 @@
         mode (try (bit-and 511 (.-mode (fs/statSync p))) (catch :default _ 384))
         text (if (h/file? p) (h/slurp p) "")
         tmp (str p ".tmp-" (.-pid js/process) "-" (h/random-hex 4))]
-    ;; the tmp file is created OWNER-ONLY before any secret content lands
-    ;; (the R4 gate: umask 0644 must never hold config text) and renamed
-    ;; into place; the target keeps its own mode
+    ;; the tmp file is created at the TARGET's mode before any secret
+    ;; content lands (a new config is 0600; an existing file keeps its
+    ;; operator-set mode) and renamed into place
     (try
       (fs/writeFileSync tmp (set-model-text text model provider) #js {:mode mode :flag "wx"})
       (fs/renameSync tmp p)
