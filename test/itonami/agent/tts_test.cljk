@@ -15,12 +15,16 @@
     (is (= "murakumo" (:provider c)))
     (is (= "tts-1" (:model c)))
     (is (= "alloy" (:voice c))))
-  (is (= "nova" (:voice (tts/configured {"tts" {"provider" "p" "model" "m" "voice" "nova"}})))))
+  (is (= "nova" (:voice (tts/configured {"tts" {"provider" "p" "model" "m" "voice" "nova"}}))))
+  (testing "a blank configured voice is unset: it defaults to alloy"
+    (is (= "alloy" (:voice (tts/configured {"tts" {"provider" "p" "model" "m" "voice" ""}}))))
+    (is (= "alloy" (:voice (tts/configured {"tts" {"provider" "p" "model" "m" "voice" "   "}}))))))
 
 (deftest speech-request-shape
   (let [req (tts/speech-request {:base-url "https://api.x/v1" :model "tts-1" :token "T" :headers {}} "nova" "hi" "mp3")]
     (is (= "https://api.x/v1/audio/speech" (:url req)))
     (is (= "Bearer T" (get-in req [:headers "Authorization"])))
+    (is (= "application/json" (get-in req [:headers "Content-Type"])))
     (let [body (js->clj (js/JSON.parse (:body req)))]
       (is (= "tts-1" (get body "model")))
       (is (= "nova" (get body "voice")))
@@ -45,7 +49,11 @@
                     (is (= "mp3" (get r "format")))
                     (is (h/file? (get r "path")))
                     (is (re-find #"workspace/tts/" (get r "path")))
-                    (is (re-find #"audio/speech" (:url @captured)))))
+                    (is (re-find #"audio/speech" (:url @captured)))
+                    (testing "the wire body carries model and voice"
+                      (let [body (h/json-parse (str (:body @captured)))]
+                        (is (= "tts-1" (get body "model")))
+                        (is (= "nova" (get body "voice")))))))
           (p/finally (fn [] (js-delete (.-env js/process) "X_TOKEN") (done)))
           (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
 

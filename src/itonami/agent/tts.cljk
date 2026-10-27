@@ -22,7 +22,8 @@
                   (str/blank? (str (get c "model"))))
       {:provider (str (get c "provider"))
        :model (str (get c "model"))
-       :voice (str (or (get c "voice") "alloy"))})))
+       ;; blank counts as unset, as everywhere else in this module
+       :voice (let [v (str (get c "voice"))] (if (str/blank? v) "alloy" v))})))
 
 (defn speech-request
   "The /audio/speech request (pure): one hop -> {url headers body}. The
@@ -30,7 +31,9 @@
   the hop's headers ride along."
   [hop voice text format]
   {:url (str (:base-url hop) "/audio/speech")
-   :headers (cond-> (or (:headers hop) {})
+   ;; Content-Type is REQUIRED: FastAPI-based OpenAI-compatible servers
+   ;; (vLLM and friends) answer 422 to a JSON body sent as text/plain
+   :headers (cond-> (assoc (or (:headers hop) {}) "Content-Type" "application/json")
               (not (str/blank? (str (:token hop)))) (assoc "Authorization" (str "Bearer " (:token hop))))
    :body (h/json-str {"model" (:model hop)
                       "voice" voice
@@ -83,7 +86,7 @@
                 out-dir (h/join home "workspace" "tts")
                 ;; json encoding is delimiter-unambiguous: distinct requests
                 ;; cannot collide on one path
-                out-path (h/join out-dir (str (h/sha256-hex (h/json-str [text voice model fmt])) "." fmt))]
+                out-path (h/join out-dir (str (h/sha256-hex (h/json-str [(str text) voice model fmt])) "." fmt))]
             (-> (fetch (:url req) (clj->js {:method "POST"
                                             :headers (clj->js (:headers req))
                                             :body (:body req)}))
