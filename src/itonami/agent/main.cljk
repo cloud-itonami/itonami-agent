@@ -1083,11 +1083,21 @@
   named by code, exit 1 when any. Reads only (no secrets): it starts nothing
   and changes no profile."
   [opts _]
-  (p/let [prof (profile/load-profile (or (:profile opts) "default") {:secrets? false})
+  (p/let [loaded (try {:prof (profile/load-profile (or (:profile opts) "default") {:secrets? false})}
+                      (catch :default e
+                        {:failure (str (or (.-message e) e))}))
+          _ (when-let [f (:failure loaded)]
+              ;; a profile that will not load (e.g. a malformed jobs.json,
+              ;; which load-profile parses) is a NAMED finding, not a raw die
+              (println (str "profile-load-failed: " (subs f 0 (min 200 (count f)))))
+              (println "1 finding(s)")
+              (js/process.exit 1))
+          prof (:prof loaded)
           home (:home prof)
           cfg (:config prof)
           readiness (vec (profile-readiness-issues prof))
-          ;; no model resolves anywhere: same precedence as provider/chain
+          ;; no model resolves anywhere: the chain's sources are job pin ->
+          ;; cron.model -> model.default; the CLI's -m is the same pin layer
           model-issue (when (and (str/blank? (str (get-in cfg ["model" "default"])))
                                  (str/blank? (str (get-in cfg ["cron" "model"])))
                                  (str/blank? (str (:model opts))))
@@ -1101,13 +1111,10 @@
           db-issue (when-not (h/file? (h/join home "state.db"))
                      {:code :no-state-db
                       :detail "state.db missing — sessions / session_search will be empty"})
-          jobs-issue (try (cron/read-jobs home) nil
-                          (catch :default e {:code :jobs-unreadable
-                                             :detail (str "cron/jobs.json: " (.-message e))}))
           pause-note (when (pause/active?)
                        {:code :paused :detail (str "emergency stop is set (" (pause/since) ")")})
           findings (vec (concat readiness
-                               (keep identity [model-issue db-issue jobs-issue pause-note])
+                               (keep identity [model-issue db-issue pause-note])
                                token-issues))]
     (if (seq findings)
       (do (doseq [f findings] (println (str (name (:code f)) ": " (:detail f))))

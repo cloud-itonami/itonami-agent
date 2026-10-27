@@ -8,6 +8,9 @@
     (is (= "TELEGRAM_BOT_TOKEN" (platforms/token-env-name "telegram" {})))
     (is (= "MY_TOK" (platforms/token-env-name "telegram" {"delivery" {"telegram" {"token_env" "MY_TOK"}}}))))
   (testing "a webhook lane has no token env"
-    (is (nil? (platforms/token-env-name "mattermost" {}))))
+    (is (nil? (platforms/token-env-name "mattermost" {})))
+    (is (nil? (platforms/token-env-name "discord" {"delivery" {"discord" {"webhook_url" "https://d/h"}}}))))
+  (testing "a discord BOT lane does use the token env"
+    (is (= "DISCORD_BOT_TOKEN" (platforms/token-env-name "discord" {"delivery" {"discord" {"channel_id" "c1"}}}))))
   (testing "an unknown lane resolves to nothing — never a guess"
     (is (nil? (platforms/token-env-name "feishu" {})))))

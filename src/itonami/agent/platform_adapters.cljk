@@ -143,7 +143,7 @@
 
 (def token-env-defaults
   "The env var each lane's token comes from when delivery.<lane>.token_env does
-  not name one — shared by for-lane and `doctor`."
+  not name one — the single source shared by for-lane and `doctor`."
   {"telegram" "TELEGRAM_BOT_TOKEN"
    "slack" "SLACK_BOT_TOKEN"
    "discord" "DISCORD_BOT_TOKEN"
@@ -151,11 +151,15 @@
    "matrix" "MATRIX_ACCESS_TOKEN"})
 
 (defn token-env-name
-  "The env var that carries this lane's token, or nil (a webhook lane has no
-  token)."
+  "The env var that carries this lane's token, or nil when the lane needs no
+  token: a webhook lane (mattermost, discord with webhook_url) is configured
+  by its webhook, not by a token."
   [lane config]
-  (let [c (get-in config ["delivery" lane])]
-    (or (get c "token_env") (get token-env-defaults lane))))
+  (let [lane (str/lower-case (str lane))
+        c (get-in config ["delivery" lane])]
+    (cond
+      (and (= "discord" lane) (not (str/blank? (str (get c "webhook_url"))))) nil
+      :else (or (get c "token_env") (get token-env-defaults lane)))))
 
 (defn for-lane
   "The built-in adapter for a deliver lane, or nil when this lane has no
@@ -166,21 +170,21 @@
   (case (str/lower-case (str lane))
     "telegram"
     (let [c (get-in config ["delivery" "telegram"])
-          token-env (or (get c "token_env") "TELEGRAM_BOT_TOKEN")
+          token-env (token-env-name "telegram" config)
           token (h/env token-env)
           chat-id (get c "chat_id")]
       (when (and (not (str/blank? (str token))) (not (str/blank? (str chat-id))))
         (telegram-adapter token chat-id)))
     "slack"
     (let [c (get-in config ["delivery" "slack"])
-          token (h/env (or (get c "token_env") "SLACK_BOT_TOKEN"))
+          token (h/env (token-env-name "slack" config))
           channel (get c "channel")]
       (when (and (not (str/blank? (str token))) (not (str/blank? (str channel))))
         (slack-adapter token channel)))
     "discord"
     (let [c (get-in config ["delivery" "discord"])
           webhook (get c "webhook_url")
-          token (h/env (or (get c "token_env") "DISCORD_BOT_TOKEN"))
+          token (h/env (token-env-name "discord" config))
           channel-id (get c "channel_id")]
       (cond
         (not (str/blank? (str webhook))) (discord-adapter (str webhook) nil nil (str (get c "chat_id")))
@@ -194,7 +198,7 @@
     "matrix"
     (let [c (get-in config ["delivery" "matrix"])
           homeserver (get c "homeserver")
-          token (h/env (or (get c "token_env") "MATRIX_ACCESS_TOKEN"))
+          token (h/env (token-env-name "matrix" config))
           room-id (get c "room_id")]
       (when (and (not (str/blank? (str homeserver)))
                  (not (str/blank? (str token)))
