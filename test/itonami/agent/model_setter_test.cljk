@@ -5,6 +5,7 @@
             [clojure.string :as str]
             ["node:fs" :as fs]
             [itonami.agent.yaml :as yaml]
+            [itonami.agent.host :as h]
             [itonami.agent.profile :as profile]))
 
 (defn parse-yaml [s] (yaml/parse s))
@@ -94,6 +95,42 @@
     (let [text (profile/set-model-text "" "a: b # c" nil)
           cfg (parse-yaml text)]
       (is (= "a: b # c" (get-in cfg ["model" "default"]))))))
+
+(deftest reader-coercion-and-key-shapes
+  (testing "numeric-shaped values are quoted (the reader would coerce them)"
+    (doseq [v ["7" "1.5" "-3"]]
+      (let [cfg (parse-yaml (profile/set-model-text "" v nil))]
+        (is (= v (get-in cfg ["model" "default"])) (str "value " v)))))
+
+  (testing "quoted and space-before-colon child keys are replaced, not duplicated"
+    (doseq [line ["  \"default\": old" "  'default': old" "  default : old"]]
+      (let [out (profile/set-model-text (str "model:\n" line "\n") "NEW" nil)]
+        (is (= 1 (count (re-seq #"(?m)^\s+\"?\x27?default" out))) (str "line " line))
+        (is (str/includes? out "NEW"))
+        (is (not (str/includes? out "old"))))))
+
+  (testing "duplicate default keys: the LAST is what the reader keeps — replace it"
+    (let [out (profile/set-model-text "model:\n  default: first\n  default: second\n" "NEW" nil)]
+      (is (not (str/includes? out "first")))
+      (is (not (str/includes? out "second")))
+      (is (= 1 (count (re-seq #"(?m)^\s+default:" out))))))
+
+  (testing "a trailing comment on the replaced line survives"
+    (is (= "model:\n  default: NEW # pinned\n"
+           (profile/set-model-text "model:\n  default: old # pinned\n" "NEW" nil)))))
+
+(deftest config-mode-is-preserved
+  (let [home (str "/tmp/test-model-mode-" (.-pid js/process) "-" (random-uuid))]
+    (.mkdirSync fs home #js {:recursive true})
+    (profile/set-config-model! home "first/model" nil)
+    (testing "a new config lands owner-only (0600), the token-bearing convention"
+      (is (= 384 (bit-and 511 (.-mode (fs/statSync (str home "/config.yaml")))))))
+    (testing "a stricter operator mode is preserved across a set"
+      (fs/chmodSync (str home "/config.yaml") 256) ;; 0400
+      (profile/set-config-model! home "second/model" nil)
+      (is (= 256 (bit-and 511 (.-mode (fs/statSync (str home "/config.yaml"))))))
+      (is (= "second/model" (get-in (parse-yaml (h/slurp (str home "/config.yaml"))) ["model" "default"]))))
+    (fs/rmSync home #js {:recursive true :force true})))
 
 (deftest set-config-model-writes-and-reads-back
   (let [home (str "/tmp/test-model-setter-" (.-pid js/process) "-" (random-uuid))]

@@ -19,6 +19,7 @@
   A profile with an itonami.edn is an *itonami profile*. It stays a valid
   Hermes-format profile: deleting itonami.edn returns it to plain Hermes."
   (:require [clojure.string :as str]
+            ["node:fs" :as fs]
             [cljs.reader :as reader]
             [itonami.agent.host :as h]
             [itonami.agent.manifest :as manifest]
@@ -181,15 +182,32 @@
   #{"secrets" "command_allowlist" "onboarding" "terminal" "skills"})
 
 
+(defn- reader-coerces?
+  "TRUE when yaml.cljk's scalar reader would turn this PLAIN token into a
+  non-string (or throw on it). The exclusion set is exactly that reader's
+  behavior — ints, floats, its null/bool spellings, its sequence/map shapes,
+  its refused block-scalar/anchor markers — not YAML-1.1 folklore."
+  [s]
+  (or (= s "")
+      (contains? #{"~" "null" "Null" "NULL"
+                   "true" "True" "TRUE" "false" "False" "FALSE"
+                   "[]"} s)
+      (= s "{}")
+      (and (str/starts-with? s "[") (str/ends-with? s "]"))
+      (re-matches #"-?\d+" s)
+      (re-matches #"-?\d+\.\d+([eE][-+]?\d+)?" s)
+      (contains? #{"|" ">" "|-" ">-"} s)
+      (or (str/starts-with? s "&") (str/starts-with? s "*") (str/starts-with? s "!"))))
+
 (defn- yaml-scalar
-  "Write a value as a safe YAML scalar: plain when it is a safe token that
-  the project's own scalar reader will NOT coerce (no null/bool/yes-no
-  shapes), otherwise a JSON double-quoted string (YAML 1.2 superset) —
-  `: `, `#` and newlines can never corrupt the line."
+  "Write a value as a safe YAML scalar: plain ONLY when the project's own
+  scalar reader will hand it back as the same string (reader-coerces? is
+  that reader's exact coercion set), otherwise a JSON double-quoted string
+  (YAML 1.2 superset) — `: `, `#` and newlines can never corrupt the line."
   [v]
   (let [s (str v)]
     (if (and (re-matches #"[A-Za-z0-9._/-]+" s)
-             (not (contains? #{"true" "false" "null" "~" "yes" "no" "on" "off"} (str/lower-case s))))
+             (not (reader-coerces? s)))
       s
       (js/JSON.stringify s))))
 
@@ -228,11 +246,21 @@
                                              (count (re-find #"^\s*" l))))
                                     2))
         pad (apply str (repeat child-indent " "))
-        key-rx (fn [k] (re-pattern (str "^" pad k ":.*$")))
+        ;; the key shapes the reader's split-key accepts: quoted (double or
+        ;; single) or bare, with optional spaces before the colon
+        key-rx (fn [k] (re-pattern (str "^" pad "(?:\"|')?" k "(?:\"|')?\\s*:.*$")))
+        trailing-comment (fn [l] (second (re-find #"(\s+#.*)$" l)))
         replace-key (fn [ls k value]
                       (let [rx (key-rx k)
-                            idx (first (keep-indexed (fn [i l] (when (re-matches rx l) i)) ls))
-                            line (str pad k ": " (yaml-scalar value))]
+                            hits (keep-indexed (fn [i l] (when (re-matches rx l) i)) ls)
+                            ;; the reader keeps the LAST duplicate key —
+                            ;; replace THAT one and drop the earlier ones
+                            idx (last hits)
+                            keep (remove (set (butlast hits)) (vec (range (count ls))))
+                            ls (mapv #(nth ls %) keep)
+                            idx (last (keep-indexed (fn [i l] (when (re-matches rx l) i)) ls))
+                            comment (when idx (trailing-comment (nth ls idx)))
+                            line (str pad k ": " (yaml-scalar value) (or comment ""))]
                         (if (nil? idx)
                           (conj (vec ls) line)
                           (assoc (vec ls) idx line))))]
@@ -258,11 +286,25 @@
 
 (defn set-config-model!
   "Persist the default model (and optional provider) in the profile's
-  config.yaml. Atomic: write to a sibling temp file, then rename."
+  config.yaml. Atomic: write to a sibling temp file, then rename. The file's
+  MODE is preserved (config.yaml can hold literal auth headers — the repo
+  convention for such files is 0600, and a rename-replace would otherwise
+  silently loosen a stricter operator mode to umask 0644); a symlink is
+  followed to its target so the link itself is never replaced."
   [home model provider]
-  (let [p (h/join home "config.yaml")
+  (let [p0 (h/join home "config.yaml")
+        ;; follow a symlink to the real file: rename would replace the LINK
+        p (try (if (and (h/file? p0) (fs/lstatSync p0) (.-isSymbolicLink (fs/lstatSync p0)))
+                 (fs/realpathSync p0)
+                 p0)
+               (catch :default _ p0))
+        mode (try (.-mode (fs/statSync p)) (catch :default _ 384))
         text (if (h/file? p) (h/slurp p) "")]
-    (h/spit-atomic p (set-model-text text model provider))))
+    (h/spit-atomic p (set-model-text text model provider))
+    ;; spit-atomic's rename carries the TMP file's mode (umask 0644):
+    ;; restore the file's own — 0600 (owner-only) for a new config
+    (fs/chmodSync p (if (number? mode) mode 384))
+    p))
 
 (def job-definition-keys
   #{"id" "name" "prompt" "skills" "skill" "script" "no_agent" "schedule" "deliver" "enabled"
