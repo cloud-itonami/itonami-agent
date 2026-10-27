@@ -64,6 +64,38 @@
         fb (for [e fb :when (and (get e "provider") (get e "model"))] (resolve-hop config e))]
     (vec (distinct (if pinned? [primary] (cons primary fb))))))
 
+(defn resolution
+  "The effective model resolution for `config` and run `opts`, with the SOURCE
+  of each choice — the `model` / `fallback` display side (Hermes `hermes
+  model` / `hermes fallback` show). Sources follow `chain` verbatim: run
+  override (a job's pin, or the CLI's -m/--provider) -> cron.model ->
+  model.default, override -> cron.model_provider -> model.provider. An
+  override is a PIN — `:pinned? (boolean (or (:pinned? opts) (:model opts)))`,
+  matching run-opts and cron, which both pin on any model override — so the chain keeps only the primary. `:hops` is the chain as provider/model pairs (primary
+  first; a pinned run keeps only the primary)."
+  [config opts]
+  ;; a run override IS a pin — run-opts sets :pinned? (boolean (:model opts))
+  ;; and cron sets (boolean (get job "model")); the display must say what the
+  ;; run will do, so `fallback -m X` shows no fallbacks
+  (let [opts (assoc opts :pinned? (boolean (or (:pinned? opts) (:model opts))))
+        m (or (:model opts) (get-in config ["cron" "model"]) (get-in config ["model" "default"]))
+        m-src (cond (:model opts) "override (-m / job pin)"
+                    (get-in config ["cron" "model"]) "cron.model"
+                    (get-in config ["model" "default"]) "model.default"
+                    :else "unset")
+        pv (or (:provider opts) (get-in config ["cron" "model_provider"]) (get-in config ["model" "provider"]))
+        pv-src (cond (:provider opts) "override (--provider / job pin)"
+                     (get-in config ["cron" "model_provider"]) "cron.model_provider"
+                     (get-in config ["model" "provider"]) "model.provider"
+                     :else "unset")]
+    {:model {:value m :source m-src}
+     :provider {:value pv :source pv-src}
+     :pinned? (boolean (:pinned? opts))
+     :hops (->> (chain config opts)
+                (map (fn [h] {:provider (:provider h) :model (:model h)}))
+                distinct
+                vec)}))
+
 (def default-deny-hosts
   "Third-party relays an itonami profile does not depend on. A rail must be
   owned by a node (its own server, its mesh, a trusted peer) or be one of the
