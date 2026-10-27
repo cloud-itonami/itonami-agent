@@ -269,9 +269,11 @@
         (.catch (fn [e] (str "dingtalk batchSend failed: " (.-message e)))))))
 
 (defn- dingtalk-adapter
-  "delivery.dingtalk: direct token (token_env default
-  DINGTALK_ACCESS_TOKEN) or an app-credential exchange per send (the
-  JUN-471 auth transport). BOTH credentials are env-only — never config."
+  "delivery.dingtalk: auth via direct token (token_env default
+  DINGTALK_ACCESS_TOKEN) OR the app-credential exchange per send (the
+  JUN-471 auth transport); the robot identity (robotCode = the app key) is
+  ALWAYS required — batchSend rejects a body without it. ALL credentials
+  are env-only — never config."
   [token app-key app-secret chat-id]
   (fn [_job _lane content opts]
     (let [fetch-fn (or (:fetch opts) js/fetch)
@@ -360,9 +362,13 @@
           app-key (h/env "DINGTALK_APP_KEY")
           app-secret (h/env "DINGTALK_APP_SECRET")
           chat-id (get c "chat_id")]
+      ;; batchSend REQUIRES robotCode (= the app key) on every request —
+      ;; a direct token alone builds a body that cannot succeed (the R2
+      ;; gate). Auth needs token OR the exchange (app-secret); the robot
+      ;; identity needs the app key either way.
       (when (and (not (str/blank? (str chat-id)))
+                 (not (str/blank? (str app-key)))
                  (or (not (str/blank? (str token)))
-                     (and (not (str/blank? (str app-key)))
-                          (not (str/blank? (str app-secret))))))
+                     (not (str/blank? (str app-secret)))))
         (dingtalk-adapter token app-key app-secret chat-id)))
     nil))

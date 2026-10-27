@@ -43,13 +43,17 @@
       (is (fn? (get-in chat/platform-adapters ["dingtalk" :normalize]))))))
 
 (deftest dingtalk-lane-resolves-with-token-or-env-exchange
-  (testing "a direct token (env default) and chat_id resolve an adapter"
-    (with-redefs [h/env (fn [k] (when (= k "DINGTALK_ACCESS_TOKEN") "tok"))]
+  (testing "a direct token + app key (robotCode) + chat_id resolve an adapter"
+    (with-redefs [h/env (fn [k] (case k "DINGTALK_ACCESS_TOKEN" "tok" "DINGTALK_APP_KEY" "key" nil))]
       (is (fn? (platforms/for-lane "dingtalk" {"delivery" {"dingtalk" {"chat_id" "u1"}}})))))
   (testing "ENV app credentials resolve the exchange adapter; config-held ones are not read"
     (with-redefs [h/env (fn [k] (case k "DINGTALK_APP_KEY" "k" "DINGTALK_APP_SECRET" "s" nil))]
       (is (fn? (platforms/for-lane "dingtalk" {"delivery" {"dingtalk" {"chat_id" "u1"}}}))))
     (with-redefs [h/env (fn [_] nil)]
       (is (nil? (platforms/for-lane "dingtalk" {"delivery" {"dingtalk" {"chat_id" "u1" "app_key" "k" "app_secret" "s"}}})))))
+  (testing "the app key is required even with a direct token (robotCode)"
+    (with-redefs [h/env (fn [k] (when (= k "DINGTALK_ACCESS_TOKEN") "tok"))]
+      (is (nil? (platforms/for-lane "dingtalk" {"delivery" {"dingtalk" {"chat_id" "u1"}}}))
+          "token without robotCode cannot build a valid batchSend body")))
   (testing "no chat_id means no adapter"
     (is (nil? (platforms/for-lane "dingtalk" {"delivery" {"dingtalk" {}}})))))
