@@ -4,6 +4,7 @@
   unavailability."
   (:require [cljs.test :refer [deftest is testing]]
             [itonami.agent.host :as h]
+            [itonami.agent.tools :as tools]
             [itonami.agent.oauth :as oauth]
             [itonami.agent.connections :as connections]))
 
@@ -46,5 +47,29 @@
     (is (false? (get-in (second rows) ["configured"])))))
 
 (deftest malformed-requests-are-named
-  (is (= "connectors must be objects like {name, mcp?}"
-         (get (connections/connection-status {} {} "/tmp/x" ["not-a-map"]) "error"))))
+  (is (= "connections must be a list of objects like {name, mcp}"
+         (get (connections/connection-status {} {} "/tmp/x" ["not-a-map"]) "error")))
+  (is (= "connections must be a list of objects like {name, mcp}"
+         (get (connections/connection-status {} {} "/tmp/x" "not-a-list") "error"))))
+
+(deftest the-tool-reads-the-ctx-config-key
+  ;; the tool ctx carries config at :mcp-config — the handler must not
+  ;; invent a :config key and report an empty surface in real runs
+  (let [ctx {:mcp-config {"mcp_servers" {"srv" {"command" "x"}}}
+             :tool-env {} :home "/tmp/no-home"}
+        r (tools/manage-connections ctx {"connections" [{"name" "srv" "mcp" true}]})]
+    (is (re-find #"configured" (str r)))
+    (is (not (re-find #"false" (str r))))))
+
+(deftest expiring-tokens-are-expired-on-the-boundary
+  (let [home (h/join (h/tmp-dir) (str "test-conn2-" (.-pid js/process) "-" (h/random-hex 4)))
+        _ (h/mkdirs (h/join home "mcp-tokens"))
+        config {"mcp_servers" {"srv" {"command" "x"}}}
+        auth-of (fn [] (get (first (connections/connection-status config {} home nil)) "auth"))]
+    (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json"))
+            (h/json-str {"access_token" "S" "expires_at" (quot (h/now-ms) 1000)}))
+    (is (= "token-expired" (auth-of)))
+    (testing "a record without expires_at is a no-expiry token: token-cached (policy)"
+      (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json"))
+              (h/json-str {"access_token" "S"}))
+      (is (= "token-cached" (auth-of))))))

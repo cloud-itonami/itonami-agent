@@ -355,7 +355,7 @@
               ["domain" "service"])
    "manage_connections"
    (fn-schema "manage_connections"
-     "Check or describe connection surfaces. Two kinds exist: hosted connector accounts (a tool-gateway integration, answered here with a named error) and local MCP servers (configured state plus cached OAuth auth). Slice 1 is read-only; installing or authorizing a connection is a later slice. Pass connectors=[{name, mcp?}]; with none, every configured surface is listed."
+     "Check or describe connection surfaces. Two kinds exist: hosted connector accounts (a tool-gateway integration, answered here with a named error) and local MCP servers (configured state plus cached OAuth auth). Slice 1 is read-only; installing or authorizing a connection is a later slice. Pass connections=[{name: ..., mcp: bool}]; with none, every configured surface is listed."
      {"connections" {"type" "array"
                      "description" "Connector requests: [{\"name\": ..., \"mcp\": bool}]. Omit to list everything configured."}}
      [])
@@ -2992,7 +2992,9 @@
   "Hermes manage_connections, slice 1: read-only connection surfaces
   (connections.cljk)."
   [ctx {:strs [connections]}]
-  (let [rows (connections/connection-status (:config ctx) (:tool-env ctx) (:home ctx) connections)]
+  ;; the tool ctx carries the loaded config at :mcp-config (loop.cljk) —
+  ;; :config does not exist and would silently report an empty surface
+  (let [rows (connections/connection-status (:mcp-config ctx) (:tool-env ctx) (:home ctx) connections)]
     (if-let [e (get rows "error")]
       (err e)
       (ok {"connections" rows}))))

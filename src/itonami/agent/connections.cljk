@@ -24,7 +24,9 @@
       (try
         (let [rec (h/json-parse (h/slurp f))
               exp (get rec "expires_at")]
-          (if (and (number? exp) (< exp (quot (h/now-ms) 1000)))
+          ;; policy: a record without expires_at is a no-expiry token
+          ;; (token-cached); the boundary itself counts as expired
+          (if (and (number? exp) (<= exp (quot (h/now-ms) 1000)))
             "token-expired"
             "token-cached"))
         (catch :default _ "token-unreadable"))
@@ -38,8 +40,11 @@
   (let [mcp-names (set (keys (get config "mcp_servers")))
         req (if (and (sequential? requested) (seq requested)) (vec requested) nil)]
     (cond
+      (and requested (not (sequential? requested)))
+      {"error" "connections must be a list of objects like {name, mcp}"}
+
       (and req (some (fn [i] (not (map? i))) req))
-      {"error" "connectors must be objects like {name, mcp?}"}
+      {"error" "connections must be a list of objects like {name, mcp}"}
 
       :else
       (if (nil? req)
@@ -48,7 +53,9 @@
               (for [n (sort mcp-names)]
                 {"name" n "kind" "mcp" "configured" true "auth" (auth-status home n)})
               (for [row (dapps/status env)]
-                (assoc row "kind" "dapp"))))
+                ;; normalize the row identity to "name" like every other row
+                (cond-> (assoc row "kind" "dapp")
+                  (and (get row "server") (not (get row "name"))) (assoc "name" (get row "server"))))))
         (mapv (fn [item]
                 (let [n (str (get item "name"))
                       mcp? (or (true? (get item "mcp")) (contains? mcp-names n))]
