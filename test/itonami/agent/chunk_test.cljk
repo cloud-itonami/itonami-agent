@@ -1,0 +1,61 @@
+(ns itonami.agent.chunk-test
+  "Reply chunking: ordered sendable segments, newline-preferring, no content
+  invented or lost."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [promesa.core :as p]
+            [itonami.agent.chat-platform :as chat]
+            [itonami.agent.host :as h]))
+
+(deftest chunk-text-shapes
+  (testing "short text is one segment; exact-fit is one segment"
+    (is (= ["hi"] (chat/chunk-text "hi")))
+    (is (= ["abcd"] (chat/chunk-text "abcd" 4))))
+  (testing "split prefers the last newline inside the window"
+    (is (= ["ab\n" "cd"] (chat/chunk-text "ab\ncd" 4)))
+    (is (= ["ab\n" "cd\nef"] (chat/chunk-text "ab\ncd\nef" 5)))
+    (is (= ["ab\ncd\n" "ef"] (chat/chunk-text "ab\ncd\nef" 6))))
+  (testing "a line longer than the window hard-splits"
+    (is (= ["abcde" "fgh"] (chat/chunk-text "abcdefgh" 5))))
+  (testing "nothing is lost or reordered: segments concatenate to the original"
+    (let [text (apply str (repeat 50 "0123456789\n"))]
+      (is (= text (apply str (chat/chunk-text text 37))))
+      (is (every? #(<= (count %) 37) (chat/chunk-text text 37)))))
+  (testing "empty text is one empty send, not zero sends"
+    (is (= [""] (chat/chunk-text "")))))
+
+(deftest send-reply-chunks-in-order
+  (async done
+    (aset (.-env js/process) "TELEGRAM_BOT_TOKEN" "TESTTOKEN")
+    (let [sent (atom [])
+          fake-fetch (fn [_url opts]
+                       (swap! sent conj (get (h/json-parse (str (.-body opts))) "text"))
+                       (p/resolved #js {:ok true :status 200}))
+          prof {:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}} :home "/tmp"}
+          msg {"platform" "telegram" "chat_id" "c1"}
+          text (str (apply str (repeat 3000 "a\n")) "end")]
+      (-> (chat/send-reply! prof msg text fake-fetch)
+          (p/then (fn [res]
+                    (is (nil? res))
+                    (is (< 1 (count @sent)))
+                    (is (= text (apply str @sent)))))
+          (p/finally (fn [] (js-delete (.-env js/process) "TELEGRAM_BOT_TOKEN") (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
+(deftest send-reply-stops-at-the-first-failing-segment
+  (async done
+    (aset (.-env js/process) "TELEGRAM_BOT_TOKEN" "TESTTOKEN")
+    (let [calls (atom 0)
+          fake-fetch (fn [_url _opts]
+                       (swap! calls inc)
+                       (if (= 1 @calls)
+                         (p/resolved #js {:ok true :status 200})
+                         (p/resolved #js {:ok false :status 400})))
+          prof {:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}} :home "/tmp"}
+          msg {"platform" "telegram" "chat_id" "c1"}
+          text (apply str (repeat 3000 "a\n"))]
+      (-> (chat/send-reply! prof msg text fake-fetch)
+          (p/then (fn [res]
+                    (is (re-find #"HTTP 400" (str res)))
+                    (is (= 2 @calls))))
+          (p/finally (fn [] (js-delete (.-env js/process) "TELEGRAM_BOT_TOKEN") (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
