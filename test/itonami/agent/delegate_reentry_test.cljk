@@ -1,0 +1,40 @@
+(ns itonami.agent.delegate-reentry-test
+  "Hermes delegate cross-run re-entry: pending background results PERSIST
+  across a run ending and re-enter as delegated-results on the next run."
+  (:require [cljs.test :refer [deftest is testing]]
+            [itonami.agent.host :as h]
+            [itonami.agent.loop :as loop]))
+
+(deftest pending-results-survive-a-run-ending
+  (let [saved-children (atom {"kid1" {"goal" "g" "status" "completed" "summary" "done here"}})
+        saved-delivered (atom #{})]
+    (with-redefs [loop/delegate-children saved-children
+                  loop/delegate-delivered saved-delivered]
+      (testing "the first call yields the finished child and marks it delivered"
+        (let [pending (loop/delegate-pending-results!)]
+          (is (= 1 (count pending)))
+          (is (= "kid1" (get (first pending) "subagent_id")))
+          (is (= "done here" (get (first pending) "summary")))))
+      (testing "the delivery is PERSISTED — a next run must not re-deliver"
+        (let [rec (h/json-parse (h/slurp (loop/delegate-state-file)))]
+          (is (contains? (set (get rec "delivered")) "kid1")))
+        (is (= [] (vec (loop/delegate-pending-results!))))))))
+
+(deftest a-crashed-runs-results-reenter
+  ;; simulate the registry as a previous process left it: a child that
+  ;; finished AFTER its run ended is still undelivered
+  (let [f (loop/delegate-state-file)]
+    (h/spit-atomic f (h/json-str {"children" {"kid2" {"goal" "g2" "status" "completed" "summary" "late result"}}
+                                  "delivered" []}))
+    (let [loaded (loop/load-delegate-state)]
+      (is (= "late result" (get-in (get loaded "children") ["kid2" "summary"])))
+      (is (empty? (get loaded "delivered"))))
+    ;; and with the atoms restored from disk, the re-entry happens
+    (with-redefs [loop/delegate-children (atom (get (loop/load-delegate-state) "children"))
+                  loop/delegate-delivered (atom (get (loop/load-delegate-state) "delivered"))]
+      (let [pending (loop/delegate-pending-results!)]
+        (is (= 1 (count pending)))
+        (is (= "kid2" (get (first pending) "subagent_id")))))
+    ;; a corrupt registry never wedges startup
+    (h/spit f "{not json")
+    (is (= {"children" {} "delivered" #{}} (loop/load-delegate-state)))))

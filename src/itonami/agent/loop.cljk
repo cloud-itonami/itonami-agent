@@ -19,6 +19,7 @@
             [itonami.agent.mcp :as mcp]
             [itonami.agent.dapps :as dapps]
             [itonami.agent.yaml :as yaml]
+            [itonami.agent.p2p :as p2p]
             [itonami.agent.confine :as confine]))
 
 (def wrapup-notice
@@ -396,12 +397,44 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                (inc n) attempts resp)))))))))))
        (fn [] (browser-runtime/close-session ctx)))))
 
+(defn delegate-state-file
+  "Where the delegate registry persists: children and delivered ids SURVIVE
+  a run ending (Hermes: background results that finish after the parent run
+  re-enter on the NEXT run instead of being lost). Same root as
+  p2p/itonami-dir, inlined to avoid a require cycle."
+  []
+  (h/join (h/expand (or (h/env "ITONAMI_DIR") "~/.itonami")) "delegate-results.json"))
+
+(defn load-delegate-state
+  "The persisted registry as {children delivered}; empty when absent or
+  unreadable (a corrupt registry never wedges startup)."
+  []
+  (try
+    (let [f (delegate-state-file)]
+      (if (h/file? f)
+        (let [rec (h/json-parse (h/slurp f))]
+          {"children" (let [c (get rec "children")] (if (map? c) c {}))
+           "delivered" (set (let [d (get rec "delivered")] (if (sequential? d) d [])))})
+        {"children" {} "delivered" #{}}))
+    (catch :default _ {"children" {} "delivered" #{}})))
+
 (def delegate-children
   "subagent_id -> {goal status summary}. Children are registered while they
-  run and kept afterwards, so action=list stays truthful."
-  (atom {}))
+  run and kept afterwards, so action=list stays truthful. Loaded from the
+  persisted registry at startup (cross-run re-entry)."
+  (atom (get (load-delegate-state) "children")))
 
-(def delegate-delivered (atom #{}))
+(def delegate-delivered (atom (get (load-delegate-state) "delivered")))
+
+(defn persist-delegate-state!
+  "Atomically persist the registry after every mutation (the cross-run
+  re-entry record)."
+  []
+  (try
+    (h/spit-atomic (delegate-state-file)
+                   (h/json-str {"children" @delegate-children
+                                "delivered" (vec @delegate-delivered)}))
+    (catch :default _ nil)))
 
 (defn delegate-pending-results!
   "Finished background children not yet delivered — one message per call, as
@@ -412,7 +445,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                       (not (contains? @delegate-delivered id)))]
                        (assoc c "subagent_id" id)))]
     (when (seq pending)
-      (swap! delegate-delivered into (map #(get % "subagent_id") pending)))
+      (swap! delegate-delivered into (map #(get % "subagent_id") pending))
+      (persist-delegate-state!))
     pending))
 
 (def delegate-ctl
@@ -551,6 +585,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                          (proc/unregister-subagent-attribution! id)
                                          base))]
                             (swap! delegate-children assoc id {"goal" goal "status" "running"})
+                            (persist-delegate-state!)
                             (swap! delegate-ctl assoc id ctl)
                             ;; Hermes tools/delegate_tool_registry._register_child:
                             ;; the process-notice attribution record
@@ -573,6 +608,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                     (p/catch (fn [_] (done result v)))))))))
                                 (p/catch (fn [e]
                                            (swap! delegate-children assoc id {"goal" goal "status" "failed"})
+                                           (persist-delegate-state!)
                                            (proc/unregister-subagent-attribution! id)
                                            {"subagent_id" id "goal" goal "status" "failed" "error" (.-message e)})))))
               child-runs (mapv child-run ids tasks)]
