@@ -21,7 +21,21 @@
         (is (= (str (.-pid js/process)) (str/trim (h/slurp (h/join dir "gateway.pid")))))))
     (testing "garbage in the pid file is stale too"
       (h/spit (h/join dir "gateway.pid") "not-a-pid")
-      (is (nil? (:error (main/claim-pid! dir "gateway.pid")))))))
+      (is (nil? (:error (main/claim-pid! dir "gateway.pid")))))
+    (fs/rmSync dir #js {:recursive true :force true})))
+
+(deftest exclusivity-and-edge-pids
+  (let [dir (str "/tmp/test-pid-guard3-" (.-pid js/process) "-" (random-uuid))]
+    (.mkdirSync fs dir #js {:recursive true})
+    (testing "the second claim loses to the first (exclusive create, no TOCTOU window)"
+      (let [first-claim (main/claim-pid! dir "gateway.pid")
+            second-claim (main/claim-pid! dir "gateway.pid")]
+        (is (= (.-pid js/process) (:pid first-claim)))
+        (is (re-find #"already running" (str (:error second-claim))))))
+    (testing "pid 0 and 1 are never a live owner"
+      (doseq [v ["0" "1"]]
+        (h/spit (h/join dir "gateway.pid") v)
+        (is (nil? (:error (main/claim-pid! dir "gateway.pid"))) (str "pid " v))))))
 
 (deftest claim-pid-claims-a-free-slot
   (let [dir (str "/tmp/test-pid-guard2-" (.-pid js/process) "-" (random-uuid))]
