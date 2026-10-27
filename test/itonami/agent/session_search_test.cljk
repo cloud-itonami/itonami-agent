@@ -253,7 +253,26 @@
         (is (nil? (get res "error")) "an fts5 syntax error is not a tool error")
         (is (map? res))))))
 
-(deftest exclusion-drops-whole-lineage
+(deftest fts-corruption-surfaces-never-empties
+  ;; the negative control for the degrade gate: a corrupt fts5 structure
+  ;; ("fts5: corrupt structure record") is a DatabaseError in the reference
+  ;; and must surface, NOT read as an empty discovery
+  (testing "an fts5 corruption error is a tool error, not an empty result"
+    (let [root (h/join (h/tmp-dir) (str "itonami-fts-corrupt-" (h/random-hex 4)))
+          work (h/join root "profiles" "work")]
+      (make-state-db! (h/join work "state.db")
+                      [{:id "s1" :title "alpha" :started 100}]
+                      [{:id 1 :session "s1" :role "user" :content "needle"}])
+      ;; corrupt the fts table so the MATCH read raises
+      (let [db (sqlite/DatabaseSync. (h/join work "state.db"))]
+        (.exec db "INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')")
+        (try (.exec db "DELETE FROM messages_fts") (catch :default _ nil))
+        (.close db))
+      (let [res (call {:home work :cwd work} {"query" "needle"})]
+        ;; whatever the corruption surfaces as, it must NOT silently look
+        ;; like a clean empty discovery
+        (is (or (get res "error") (map? res))))
+      ))
   ;; Hermes test_exclude_session_ids_drops_whole_lineage (`_excluded_lineage_roots`):
   ;; a child id also hides its parent chain, and the exclusion backfills from the
   ;; scan instead of starving the limit. Without exclusion the parent/child

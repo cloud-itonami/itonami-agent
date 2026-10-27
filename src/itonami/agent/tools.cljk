@@ -1821,7 +1821,7 @@
       (str/replace "%" "\\%")
       (str/replace "_" "\\_")))
 
-(defn session-resolve-title
+(defn- session-resolve-title
   "hermes_state_titles.resolve_session_by_title: the id a session title names —
   an exact title, or the newest `<title> #N` continuation (LIKE wildcards
   escaped) which outranks the exact row; nil when nothing holds the title.
@@ -1843,8 +1843,9 @@
   (cond
     (or (nil? value) (boolean? value)) nil
     ;; Math.trunc, NOT int: CLJS int is 32-bit and wraps after 2038
-    ;; (Python int() is unbounded); trunc matches int()'s toward-zero cut
-    (number? value) (js/Math.trunc value)
+    ;; (Python int() is unbounded); trunc matches int()'s toward-zero cut.
+    ;; Non-finite numbers are unusable (Python int() raises -> None)
+    (number? value) (when (js/isFinite value) (js/Math.trunc value))
     :else (let [text (str/trim (str value))
                 n (js/Number text)]
             ;; any finite numeric form Python's int(float(text)) accepts,
@@ -2058,7 +2059,13 @@
                                        ;; turned them into a successful no-result). Only
                                        ;; fts5 syntax degrades; everything else surfaces.
                                        (catch :default e
-                                         (if (str/includes? (str (.-message e)) "fts5:")
+                                         ;; ONLY 'fts5: syntax error' — the
+                                         ;; bare 'fts5:' prefix also matches
+                                         ;; corruption ('fts5: corrupt
+                                         ;; structure record'), which the
+                                         ;; reference treats as DatabaseError
+                                         ;; and surfaces (the R2 gate)
+                                         (if (str/includes? (str (.-message e)) "fts5: syntax error")
                                            []
                                            (throw e))))]
                             ;; `_discover`'s dedup: one hit per lineage (lineage root ->
