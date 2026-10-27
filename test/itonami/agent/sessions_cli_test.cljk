@@ -6,6 +6,17 @@
             [itonami.agent.host :as h]
             [itonami.agent.tools :as tools]))
 
+(deftest bounded-limit-shapes-cli-input
+  (testing "a whole positive integer passes, capped"
+    (is (= 20 (tools/bounded-limit "20" 200)))
+    (is (= 200 (tools/bounded-limit "9999" 200))))
+  (testing "NaN, negatives, and partial numbers are refused (never SQLite errors)"
+    (is (nil? (tools/bounded-limit "abc" 200)))
+    (is (nil? (tools/bounded-limit "-3" 200)))
+    (is (nil? (tools/bounded-limit "42abc" 200)))
+    (is (nil? (tools/bounded-limit "0" 200)))
+    (is (nil? (tools/bounded-limit nil 200)))))
+
 (deftest browse-and-show
   (let [dir (h/join (h/tmp-dir) (str "test-sessions-" (.-pid js/process) "-" (h/random-hex 4)))
         _ (h/mkdirs dir)

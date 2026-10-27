@@ -1083,7 +1083,11 @@
   [opts [sub & args]]
   (let [prof (profile/load-profile (or (:profile opts) "default"))
         db-path (h/join (:home prof) "state.db")
-        limit (or (some-> (:limit opts) (js/parseInt 10)) 20)]
+        limit-raw (:limit opts)
+        limit (tools/bounded-limit limit-raw 200)
+        _ (when (and (not (nil? limit-raw)) (nil? limit))
+            (die 2 "sessions: --limit must be a positive integer"))
+        limit (or limit 20)]
     (case (str sub)
       ("" "list")
       (let [rows (tools/sessions-browse db-path limit)]
