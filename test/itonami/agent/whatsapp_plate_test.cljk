@@ -1,0 +1,51 @@
+(ns itonami.agent.whatsapp-plate-test
+  "JUN-471 whatsapp plate (4/4): delivery send, env-only auth transport,
+  inbound normalize — the fleet's last plate."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [itonami.agent.host :as h]
+            [itonami.agent.platform-adapters :as platforms]
+            [itonami.agent.chat-platform :as chat]))
+
+(deftest whatsapp-requests-are-pure-and-correct
+  (testing "the send request is the Cloud API messages shape (identity in the URL)"
+    (let [r (platforms/whatsapp-request "tok" "pnid-1" "+15551234567" "hello")]
+      (is (str/includes? (:url r) "graph.facebook.com/v20.0/pnid-1/messages"))
+      (is (= "Bearer tok" (get-in r [:headers "Authorization"])))
+      (let [body (h/json-parse (:body r))]
+        (is (= "whatsapp" (get body "messaging_product")))
+        (is (= "+15551234567" (get body "to")))
+        (is (= "text" (get body "type")))
+        (is (= "hello" (get-in (js->clj (get body "text")) ["body"])))))))
+
+(deftest whatsapp-normalize-maps-webhook-messages
+  (let [entry {"entry" [{"changes" [{"value" {"messages" [{"from" "+15550001111" "id" "wamid.1"
+                                                           "type" "text" "timestamp" "123"
+                                                           "text" {"body" "hi there"}}]
+                                             "contacts" [{"profile" {"name" "User"}}]}}]}]}]
+    (testing "a text message becomes the platform-agnostic inbound map"
+      (let [m (chat/whatsapp-normalize entry)]
+        (is (= "whatsapp" (get m "platform")))
+        (is (= "hi there" (get m "text")))
+        (is (= "+15550001111" (get m "chat_id")) "chat_id is the REPLY route: the `to` vocabulary")
+        (is (= "wamid.1" (get m "update_id")))))
+    (testing "the dedup id is the message id, else timestamp; neither refuses the turn"
+      (let [no-id (update-in entry ["entry" 0 "changes" 0 "value" "messages" 0] #(dissoc % "id"))]
+        (is (= "123" (get (chat/whatsapp-normalize no-id) "update_id")))
+        (is (nil? (chat/whatsapp-normalize (update-in no-id ["entry" 0 "changes" 0 "value" "messages" 0] #(dissoc % "timestamp")))))))
+    (testing "non-text messages carry no turn"
+      (is (nil? (chat/whatsapp-normalize (assoc-in entry ["entry" 0 "changes" 0 "value" "messages" 0 "type"] "image")))))
+    (testing "the platform entry wires normalize"
+      (is (fn? (get-in chat/platform-adapters ["whatsapp" :normalize]))))))
+
+(deftest whatsapp-lane-requires-token-and-identity
+  (testing "token + phone_number_id + chat_id resolve an adapter"
+    (with-redefs [h/env (fn [k] (when (= k "WHATSAPP_ACCESS_TOKEN") "tok"))]
+      (is (fn? (platforms/for-lane "whatsapp" {"delivery" {"whatsapp" {"phone_number_id" "pn" "chat_id" "+1555"}}})))))
+  (testing "the identity is REQUIRED (it is the URL); config-held tokens are not read"
+    (with-redefs [h/env (fn [k] (when (= k "WHATSAPP_ACCESS_TOKEN") "tok"))]
+      (is (nil? (platforms/for-lane "whatsapp" {"delivery" {"whatsapp" {"chat_id" "+1555"}}}))))
+    (with-redefs [h/env (fn [_] nil)]
+      (is (nil? (platforms/for-lane "whatsapp" {"delivery" {"whatsapp" {"phone_number_id" "pn" "chat_id" "+1555" "access_token" "tok"}}})))))
+  (testing "no chat_id means no adapter"
+    (is (nil? (platforms/for-lane "whatsapp" {"delivery" {"whatsapp" {"phone_number_id" "pn"}}})))))

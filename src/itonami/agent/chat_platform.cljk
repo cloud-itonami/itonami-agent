@@ -102,6 +102,26 @@
        "message_id" (str (or (get raw "MsgId") ""))
        "text" (get raw "Content")})))
 
+(defn whatsapp-normalize
+  "WhatsApp Cloud API webhook entry -> the platform-agnostic inbound
+  message, or nil when the event carries no turn. The dedup id needs a
+  UNIQUE value (the wamid message id, else timestamp) — the dingtalk R1
+  lesson. chat_id is the REPLY route (the sender phone number — the `to`
+  vocabulary), per the dingtalk R2 lesson."
+  [raw]
+  (let [msg (get-in raw ["entry" 0 "changes" 0 "value" "messages" 0])
+        uid (let [a (get msg "id")] (if (str/blank? (str a)) (get msg "timestamp") a))]
+    (when (and msg (= "text" (get msg "type")) (string? (get-in msg ["text" "body"]))
+               (not (str/blank? (str uid))))
+      {"update_id" (str uid)
+       "platform" "whatsapp"
+       "chat_id" (str (get msg "from"))
+       "user_id" (str (get msg "from"))
+       "user_name" (str (or (get-in raw ["entry" 0 "changes" 0 "value" "contacts" 0 "profile" "name"]) ""))
+       "thread_id" ""
+       "message_id" (str (or (get msg "id") ""))
+       "text" (get-in msg ["text" "body"])})))
+
 (def platform-adapters
   "One entry per platform. `:normalize` turns one raw transport update into
   the inbound message map above (nil = carries no turn). The send half lives
@@ -110,7 +130,8 @@
   {"telegram" {:normalize telegram-normalize}
    "feishu" {:normalize feishu-normalize}
    "dingtalk" {:normalize dingtalk-normalize}
-   "wecom" {:normalize wecom-normalize}})
+   "wecom" {:normalize wecom-normalize}
+   "whatsapp" {:normalize whatsapp-normalize}})
 
 (defn normalize
   "The inbound message in `raw` for `platform`, or nil."
