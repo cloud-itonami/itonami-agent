@@ -67,18 +67,18 @@
 (defn resolution
   "The effective model resolution for `config` and run `opts`, with the SOURCE
   of each choice — the `model` / `fallback` display side (Hermes `hermes
-  model` / `hermes fallback` show). Sources follow `chain` verbatim: job pin
-  -> cron.model -> model.default, job pin -> cron.model_provider ->
-  model.provider. `:hops` is the chain as provider/model pairs (primary
+  model` / `hermes fallback` show). Sources follow `chain` verbatim: run
+  override (a job's pin, or the CLI's -m/--provider) -> cron.model ->
+  model.default, override -> cron.model_provider -> model.provider. `:hops` is the chain as provider/model pairs (primary
   first; a pinned run keeps only the primary)."
   [config opts]
   (let [m (or (:model opts) (get-in config ["cron" "model"]) (get-in config ["model" "default"]))
-        m-src (cond (:model opts) "job pin"
+        m-src (cond (:model opts) "override (-m / job pin)"
                     (get-in config ["cron" "model"]) "cron.model"
                     (get-in config ["model" "default"]) "model.default"
                     :else "unset")
         pv (or (:provider opts) (get-in config ["cron" "model_provider"]) (get-in config ["model" "provider"]))
-        pv-src (cond (:provider opts) "job pin"
+        pv-src (cond (:provider opts) "override (--provider / job pin)"
                      (get-in config ["cron" "model_provider"]) "cron.model_provider"
                      (get-in config ["model" "provider"]) "model.provider"
                      :else "unset")]

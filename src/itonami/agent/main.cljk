@@ -1082,8 +1082,8 @@
   the hop chain, each with the config layer it came from. The setter lands
   with config writing."
   [opts _]
-  (p/let [prof (profile/load-profile (or (:profile opts) "default"))
-          r (provider/resolution (:config prof) {})]
+  (p/let [prof (profile/load-profile (or (:profile opts) "default") {:secrets? false})
+          r (provider/resolution (:config prof) {:model (:model opts) :provider (:provider opts)})]
     (println (str "model:     " (get-in r [:model :value]) "   (" (get-in r [:model :source]) ")"))
     (println (str "provider:  " (get-in r [:provider :value]) "   (" (get-in r [:provider :source]) ")"))
     (println (str "chain:"))
@@ -1095,13 +1095,14 @@
   fails. A pinned run disables fallback (Hermes: 'job pin disables fallback').
   The setter lands with config writing."
   [opts _]
-  (p/let [prof (profile/load-profile (or (:profile opts) "default"))
-          r (provider/resolution (:config prof) {})]
+  (p/let [prof (profile/load-profile (or (:profile opts) "default") {:secrets? false})
+          r (provider/resolution (:config prof) {:model (:model opts) :provider (:provider opts)})]
     (if (seq (drop 1 (:hops r)))
       (doseq [[i h] (map-indexed vector (drop 1 (:hops r)))]
         (println (str "fallback " (inc i) ". " (:provider h) "/" (:model h))))
-      (println "no fallback providers configured (fallback_providers)"))
-    (println "(a pinned run keeps only the primary — job pin disables fallback)")))
+      (println "no fallback hops in the effective chain"))
+    (when (:pinned? r)
+      (println "(pinned run — fallback is disabled)"))))
 
 (defn status-cmd
   "Hermes `hermes status`: what this store is running."

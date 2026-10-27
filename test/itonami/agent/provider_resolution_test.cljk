@@ -19,14 +19,21 @@
       (is (= "cron.model" (get-in r [:model :source])))
       (is (= "p2" (get-in r [:provider :value])))
       (is (= "cron.model_provider" (get-in r [:provider :source])))))
-  (testing "a job pin wins over everything"
+  (testing "a run override (job pin / CLI) wins over everything"
     (let [r (provider/resolution {"model" {"default" "m1" "provider" "p1"}
                                   "cron" {"model" "m2"}}
                                  {:model "m3" :provider "p3" :pinned? true})]
       (is (= "m3" (get-in r [:model :value])))
-      (is (= "job pin" (get-in r [:model :source])))
+      (is (re-find #"override" (get-in r [:model :source])))
       (is (= "p3" (get-in r [:provider :value])))
+      (is (re-find #"override" (get-in r [:provider :source])))
       (is (true? (:pinned? r)))))
+  (testing "the legacy fallback_model map also becomes a hop"
+    (let [r (provider/resolution {"model" {"default" "m1" "provider" "p1"}
+                                  "fallback_model" {"provider" "p9" "model" "m9"}}
+                                 {})]
+      (is (= 2 (count (:hops r))))
+      (is (= "p9" (get-in r [:hops 1 :provider])))))
   (testing "nothing configured reports unset, not a guess"
     (let [r (provider/resolution {} {})]
       (is (= "unset" (get-in r [:model :source])))
