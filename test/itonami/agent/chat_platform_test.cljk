@@ -163,11 +163,24 @@
           (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
 
 (deftest telegram-request-thread-id
-  (testing "a forum-topic reply carries message_thread_id"
-    (is (re-find #"message_thread_id\":42" (:body (platforms/telegram-request "TOK" "c1" "hi" "42")))))
-  (testing "absent or unparseable thread ids add no field"
-    (is (not (re-find #"message_thread_id" (:body (platforms/telegram-request "TOK" "c1" "hi")))))
-    (is (not (re-find #"message_thread_id" (:body (platforms/telegram-request "TOK" "c1" "hi" "abc")))))))
+  (let [body (fn [t] (js->clj (js/JSON.parse (:body (platforms/telegram-request "TOK" "c1" "hi" t)))))]
+    (testing "a forum-topic reply carries message_thread_id as a number"
+      (is (= 42 (get (body "42") "message_thread_id")))
+      (is (= -1 (get (body "-1") "message_thread_id"))))
+    (testing "absent or non-numeric thread ids add no field"
+      (is (nil? (get (body nil) "message_thread_id")))
+      (is (nil? (get (body "abc") "message_thread_id")))
+      (is (nil? (get (body "42abc") "message_thread_id"))))))
+
+(deftest backoff-ms-validates
+  (testing "a poll-error backoff can never be NaN, zero, or sub-second"
+    (is (= 5000 (chat/backoff-ms nil)))
+    (is (= 5000 (chat/backoff-ms js/NaN)))
+    (is (= 5000 (chat/backoff-ms "abc")))
+    (is (= 5000 (chat/backoff-ms 0)))
+    (is (= 1000 (chat/backoff-ms 60)))
+    (is (= 30000 (chat/backoff-ms "30000")))
+    (is (= 5000 (chat/backoff-ms -5)))))
 
 (deftest serve-loop-dispatches-and-bounds
   (async done

@@ -1049,8 +1049,16 @@
   (let [platform (or (:platform opts) "telegram")]
     (when-not (= "telegram" platform)
       (die 2 (str "gateway serve: platform " platform " not implemented (telegram only)")))
-    (let [profiles (mapv profile/load-profile (profile/names))
-          token (some chat/telegram-token (map :config profiles))]
+    (let [profiles (into [] (keep (fn [n]
+                                    (try (profile/load-profile n)
+                                         (catch :default e
+                                           (println (str "gateway serve: skipping profile " n ": " (.-message e)))
+                                           nil)))
+                                  (profile/names)))
+          tokens (into #{} (keep chat/telegram-token (map :config profiles)))
+          token (first tokens)]
+      (when (< 1 (count tokens))
+        (die 2 "gateway serve: profiles resolve to more than one telegram token — one bot token per serve process"))
       (when (str/blank? (str token))
         (die 2 "gateway serve: no telegram token configured (delivery.telegram.token_env / TELEGRAM_BOT_TOKEN)"))
       (let [d (chat/make-dispatcher
@@ -1065,7 +1073,8 @@
                       :token token
                       :dispatch (fn [raw] (d platform raw))
                       :on-error (fn [e] (println (str (h/iso-local) " gateway serve: " e)))
-                      :interval (some-> (:interval opts) (js/parseInt 10))})))))
+                      ;; --interval is SECONDS, as on `gateway run`
+                      :interval (some-> (:interval opts) (js/parseInt 10) (* 1000))})))))
 
 ;; ---------------------------------------------------------------- peer
 

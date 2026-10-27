@@ -299,15 +299,27 @@
         token (h/env (or (get c "token_env") "TELEGRAM_BOT_TOKEN"))]
     (when-not (str/blank? (str token)) (str token))))
 
+(defn backoff-ms
+  "The poll-error backoff in milliseconds: a finite positive interval floored
+  at 1000 — a NaN or zero backoff would hot-loop the platform's API. Anything
+  unparseable falls back to 5000."
+  [interval]
+  (let [n (if (number? interval) interval (js/parseFloat (str interval)))]
+    (if (and (js/isFinite n) (pos? n))
+      (max 1000 (js/Math.floor n))
+      5000)))
+
 (defn serve!
   "The gateway serve loop (JUN-465): one `telegram-poll!` long poll, dispatch
   every carried update through `dispatch`, recur until stopped. A poll error
-  reports through `on-error` and backs off `interval` ms (default 5000).
+  reports through `on-error` and backs off `backoff-ms` of `interval` (ms,
+  floored at 1000; default 5000 — never a hot retry loop).
   Injected: `fetch`, `dispatch` (fn [raw]), optional `on-error`, `max-ticks`
   (tests bound the loop), `poll-timeout` (the long-poll timeout, default 25).
   Returns {:stop (fn []) :done <promise resolving :stopped|:max-ticks>}."
   [{:keys [fetch token dispatch on-error interval max-ticks poll-timeout]}]
-  (let [stopped (atom false)
+  (let [iv (backoff-ms interval)
+        stopped (atom false)
         ticks (atom 0)
         off (atom 0)
         resolve-done (atom nil)
@@ -325,13 +337,13 @@
                                (swap! ticks inc)
                                (if-let [err (:error res)]
                                  (do (when on-error (on-error err))
-                                     (-> (wait (or interval 5000)) (p/then (fn [_] (step)))))
+                                     (-> (wait iv) (p/then (fn [_] (step)))))
                                  (do (reset! off (:offset res))
                                      (-> (p/all (map dispatch (:updates res)))
                                          (p/then (fn [_] (step))))))))
                      (p/catch (fn [e]
                                 (when on-error (on-error (err-str e)))
-                                (-> (wait (or interval 5000)) (p/then (fn [_] (step)))))))))]
+                                (-> (wait iv) (p/then (fn [_] (step)))))))))]
     (step)
     {:stop (fn [] (reset! stopped true)) :done done}))
 
