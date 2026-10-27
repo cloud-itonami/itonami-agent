@@ -46,6 +46,23 @@
     (is (= "mcp" (get-in (second rows) ["kind"])))
     (is (false? (get-in (second rows) ["configured"])))))
 
+(deftest hardening-edges-are-named
+  (testing "a parseable but non-object token record is corrupt: token-unreadable"
+    (let [home (h/join (h/tmp-dir) (str "test-conn3-" (.-pid js/process) "-" (h/random-hex 4)))
+          _ (h/mkdirs (h/join home "mcp-tokens"))
+          config {"mcp_servers" {"srv" {"command" "x"}}}]
+      (doseq [v ["null" "[]" "42" "false"]]
+        (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json")) v)
+        (is (= "token-unreadable"
+               (get (first (connections/connection-status config {} home nil)) "auth"))
+            (str "record " v)))))
+  (testing "non-string names are named errors, never coerced into names"
+    (let [rows (connections/connection-status {} {} "/tmp/x" [{"name" false} {"name" 42}])]
+      (is (every? #(re-find #"non-blank name string" (str (get % "error"))) rows))))
+  (testing "a non-boolean mcp is a named error"
+    (is (= "mcp must be boolean or absent (omit the key)"
+           (get (first (connections/connection-status {} {} "/tmp/x" [{"name" "x" "mcp" "true"}])) "error")))))
+
 (deftest malformed-requests-are-named
   (is (= "connections must be a list of objects like {name, mcp}"
          (get (connections/connection-status {} {} "/tmp/x" ["not-a-map"]) "error")))
@@ -77,7 +94,7 @@
               (h/json-str {"access_token" "S"}))
       (is (= "token-cached" (auth-of))))
     (testing "a PRESENT but non-numeric expires_at is corrupt: token-unreadable (never healthy)"
-      (doseq [v ["100" true]]
+      (doseq [v ["100" true nil]]
         (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json"))
                 (h/json-str {"access_token" "S" "expires_at" v}))
         (is (= "token-unreadable" (auth-of)))))))

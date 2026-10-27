@@ -23,13 +23,20 @@
     (if (h/file? f)
       (try
         (let [rec (h/json-parse (h/slurp f))
-              exp (get rec "expires_at")]
+              exp-present (and (map? rec) (contains? rec "expires_at"))
+              exp (when exp-present (get rec "expires_at"))]
+          ;; a parseable but non-object record (null, [], 42, false) is
+          ;; corrupt — it must never read as healthy
+          (when-not (map? rec)
+            (throw (js/Error. "token record is not an object")))
           ;; policy: a record WITHOUT expires_at is a no-expiry token
           ;; (token-cached); the boundary itself counts as expired; a
           ;; PRESENT but non-numeric expires_at is corrupt -> token-unreadable
           ;; (a corrupt record must never read as healthy)
           (cond
-            (nil? exp) "token-cached"
+            ;; ABSENT key = the no-expiry policy; a PRESENT null is corrupt
+            (not exp-present) "token-cached"
+            (nil? exp) "token-unreadable"
             (number? exp) (if (<= exp (quot (h/now-ms) 1000)) "token-expired" "token-cached")
             :else "token-unreadable"))
         (catch :default _ "token-unreadable"))
@@ -60,17 +67,24 @@
                 (cond-> (assoc row "kind" "dapp")
                   (and (get row "server") (not (get row "name"))) (assoc "name" (get row "server"))))))
         (mapv (fn [item]
-                (let [n (str (get item "name"))
-                      mcp? (or (true? (get item "mcp")) (contains? mcp-names n))]
+                (let [raw-name (get item "name")
+                      n (if (string? raw-name) raw-name "")
+                      mcp-val (get item "mcp")]
                   (cond
+                    ;; names must be non-blank STRINGS — never coerced from
+                    ;; false/numbers into usable-looking names
                     (str/blank? n)
-                    {"name" n "error" "a connection needs a name"}
+                    {"name" (str raw-name) "error" "a connection needs a non-blank name string"}
 
-                    mcp?
-                    {"name" n "kind" "mcp"
-                     "configured" (contains? mcp-names n)
-                     "auth" (if (contains? mcp-names n) (auth-status home n) "needs-login")}
+                    ;; a PRESENT mcp must be boolean — null is not absent
+                    (and (contains? item "mcp") (not (boolean? mcp-val)))
+                    {"name" n "error" "mcp must be boolean or absent (omit the key)"}
 
                     :else
-                    {"name" n "kind" "hosted" "error" hosted-error})))
+                    (let [mcp? (or (true? mcp-val) (contains? mcp-names n))]
+                      (if mcp?
+                        {"name" n "kind" "mcp"
+                         "configured" (contains? mcp-names n)
+                         "auth" (if (contains? mcp-names n) (auth-status home n) "needs-login")}
+                        {"name" n "kind" "hosted" "error" hosted-error})))))
               req)))))
