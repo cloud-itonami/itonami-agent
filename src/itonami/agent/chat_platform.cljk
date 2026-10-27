@@ -291,12 +291,10 @@
         (p/catch (fn [e] {:error (err-str e) :updates [] :offset (or offset 0)})))))
 
 (defn telegram-token
-  "The bot token for a telegram session: the env named by
-  `delivery.telegram.token_env` (default TELEGRAM_BOT_TOKEN). nil = not
-  configured."
+  "The bot token for a telegram session, resolved through the single source
+  (platform-adapters/token-env-name). nil = not configured."
   [config]
-  (let [c (get-in config ["delivery" "telegram"])
-        token (h/env (or (get c "token_env") "TELEGRAM_BOT_TOKEN"))]
+  (let [token (h/env (platforms/token-env-name "telegram" config))]
     (when-not (str/blank? (str token)) (str token))))
 
 (defn backoff-ms

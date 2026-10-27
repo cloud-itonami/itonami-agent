@@ -51,10 +51,15 @@
     (let [called (atom false)
           fake-fetch (fn [_ _] (reset! called true) (p/resolved #js {:ok true :status 200}))
           prof {:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}} :home "/tmp"}]
-      (-> (chat/send-reply! prof {"platform" "telegram" "chat_id" "c1"} "   " fake-fetch)
+      (-> (chat/send-reply! prof {"platform" "telegram" "chat_id" "c1"} nil fake-fetch)
           (p/then (fn [res]
                     (is (re-find #"reply is empty" (str res)))
                     (is (false? @called))))
+          (p/then (fn [_] (chat/send-reply! prof {"platform" "telegram" "chat_id" "c1"} "   " fake-fetch)))
+          (p/then (fn [res]
+                    (testing "whitespace-only text is blank too"
+                      (is (re-find #"reply is empty" (str res)))
+                      (is (false? @called)))))
           (p/then (fn [_] (done)))
           (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
 
