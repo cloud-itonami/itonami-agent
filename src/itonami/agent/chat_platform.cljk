@@ -316,8 +316,13 @@
   [file]
   (try
     (if (h/file? file)
-      (let [n (js/parseInt (str (get (h/json-parse (h/slurp file)) "offset")) 10)]
-        (if (and (js/isFinite n) (pos? n)) n 0))
+      (let [raw (str (get (h/json-parse (h/slurp file)) "offset"))]
+        ;; strict digits only: a corrupt value restarts at 0, never a
+        ;; parseInt prefix guess ("8abc" is NOT 8)
+        (if (re-matches #"\d+" raw)
+          (let [n (js/parseInt raw 10)]
+            (if (and (js/isFinite n) (pos? n)) n 0))
+          0))
       0)
     (catch :default _ 0)))
 
@@ -367,10 +372,15 @@
                                (if-let [err (:error res)]
                                  (do (notify! err)
                                      (-> (wait iv) (p/then (fn [_] (step)))))
-                                 (do (reset! off (:offset res))
-                                     (write-offset! offset-file (:offset res))
-                                     (-> (p/all (map dispatch (:updates res)))
-                                         (p/then (fn [_] (step))))))))
+                                 ;; ack (memory + disk) only AFTER every
+                                 ;; dispatch settles: a crash or a rejecting
+                                 ;; dispatch replays the batch on restart
+                                 ;; (at-least-once — the safe direction)
+                                 (-> (p/all (map dispatch (:updates res)))
+                                     (p/then (fn [_]
+                                               (reset! off (:offset res))
+                                               (write-offset! offset-file (:offset res))
+                                               (step)))))))
                      (p/catch (fn [e]
                                 (notify! (err-str e))
                                 (-> (wait iv) (p/then (fn [_] (step)))))))))]

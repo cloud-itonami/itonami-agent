@@ -274,7 +274,7 @@
       (-> (:done srv1)
           (p/then (fn [_]
                     (testing "the consumed offset is on disk after the run"
-                      (is (re-find #"8" (h/slurp state-file))))))
+                      (is (= 8 (get (h/json-parse (h/slurp state-file)) "offset"))))))
           (p/then (fn [_]
                     ;; a fresh serve reads it back: the next poll asks from 8
                     (let [srv2 (chat/serve! {:fetch fake-fetch :token "T" :poll-timeout 0 :max-ticks 1
@@ -285,6 +285,23 @@
                                     (is (= "8" (last @requested-offsets)))))))))
           (p/then (fn [_] (done)))
           (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
+(deftest read-offset-fallbacks
+  (let [dir (h/join (h/tmp-dir) (str "test-offset-ro-" (.-pid js/process) "-" (h/random-hex 4)))
+        _ (h/mkdirs dir)
+        f (h/join dir "offset.json")]
+    (testing "a missing file restarts at 0"
+      (is (= 0 (#'chat/read-offset (h/join dir "absent.json")))))
+    (testing "corrupt values never become guessed numbers"
+      (h/spit f "{\"offset\":\"8abc\"}")
+      (is (= 0 (#'chat/read-offset f)))
+      (h/spit f "{\"offset\":8.5}")
+      (is (= 0 (#'chat/read-offset f)))
+      (h/spit f "not json")
+      (is (= 0 (#'chat/read-offset f))))
+    (testing "a strict positive integer passes"
+      (h/spit f "{\"offset\":42}")
+      (is (= 42 (#'chat/read-offset f))))))
 
 (deftest serve-loop-stop-ends-the-loop
   (async done
