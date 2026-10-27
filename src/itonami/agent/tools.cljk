@@ -1821,6 +1821,14 @@
       (str/replace "%" "\\%")
       (str/replace "_" "\\_")))
 
+(defn- fts-syntax-error?
+  "The degrade gate: ONLY an fts5 SYNTAX error becomes 'no content rows'.
+  Corruption-class fts5 errors ('fts5: corrupt structure record') and IO
+  failures surface — the reference routes them to DatabaseError, not the
+  syntax arm."
+  [e]
+  (str/includes? (str (.-message e)) "fts5: syntax error"))
+
 (defn- session-resolve-title
   "hermes_state_titles.resolve_session_by_title: the id a session title names —
   an exact title, or the newest `<title> #N` continuation (LIKE wildcards
@@ -2059,15 +2067,7 @@
                                        ;; turned them into a successful no-result). Only
                                        ;; fts5 syntax degrades; everything else surfaces.
                                        (catch :default e
-                                         ;; ONLY 'fts5: syntax error' — the
-                                         ;; bare 'fts5:' prefix also matches
-                                         ;; corruption ('fts5: corrupt
-                                         ;; structure record'), which the
-                                         ;; reference treats as DatabaseError
-                                         ;; and surfaces (the R2 gate)
-                                         (if (str/includes? (str (.-message e)) "fts5: syntax error")
-                                           []
-                                           (throw e))))]
+                                         (if (fts-syntax-error? e) [] (throw e))))]
                             ;; `_discover`'s dedup: one hit per lineage (lineage root ->
                             ;; first surviving scan row, `parent_session_id` grouping the
                             ;; child under its root) up to `limit` — parent/child runs of
