@@ -38,7 +38,8 @@
     (testing "pid 0 and 1 are never a live owner"
       (doseq [v ["0" "1"]]
         (h/spit (h/join dir "gateway.pid") v)
-        (is (nil? (:error (main/claim-pid! dir "gateway.pid"))) (str "pid " v))))))
+        (is (nil? (:error (main/claim-pid! dir "gateway.pid"))) (str "pid " v))))
+    (fs/rmSync dir #js {:recursive true :force true})))
 
 (deftest claim-pid-claims-a-free-slot
   (let [dir (str "/tmp/test-pid-guard2-" (.-pid js/process) "-" (random-uuid))]
