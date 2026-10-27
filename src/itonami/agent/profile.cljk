@@ -325,6 +325,14 @@
                                  i))
                         (count lines)))
         body (when start (vec (subvec (vec lines) start block-end)))
+        ;; the block BODY must be a MAPPING: a sequence-valued `model:`
+        ;; (`- item` children) is a shape this editor cannot honor — refuse
+        ;; like a folded value, never rewrite into unparseable YAML (the R13
+        ;; gate)
+        ;; INDENTED seq items only (`  - x`): a column-0 `---` is a
+        ;; separator and a column-0 `- x` ends the block as a top line
+        _ (when (and body (some (fn [l] (boolean (re-matches #"^\s+-.*" l))) body))
+            (throw (js/Error. "refusing to edit a model block that is a sequence, not a mapping")))
         ;; the block's child indent comes from the first indented NON-COMMENT
         ;; line — a differently-indented comment must not set it
         child-indent (when body (or (first (for [l (rest body)
