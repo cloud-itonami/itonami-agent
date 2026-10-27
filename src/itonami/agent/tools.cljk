@@ -238,7 +238,7 @@
                "timeout" {"type" "integer" "minimum" 1 "maximum" 300 "description" "Maximum runtime in seconds (default 300)."}}
               ["code"])
    "session_search"
-   (fn-schema "session_search" "Search and read Hermes conversation history from this profile's state.db. Supports recent-session browsing, FTS discovery, reading the latest messages in a session, and scrolling around a message id. Cross-profile: pass profile=<name> (or the @session:<profile>/<id> link as session_id) to search another profile's state.db read-only. Discovery honours detail=adaptive (default: only the top-ranked hit is fully hydrated) / full, plus sort (newest/oldest temporal bias), after/before session-start bounds, and exclude_session_ids (those sessions and their lineage omitted). It is read-only."
+   (fn-schema "session_search" "Search and read Hermes conversation history from this profile's state.db. Supports recent-session browsing, FTS discovery (which also matches session titles and returns one hit per session lineage), reading the latest messages in a session, and scrolling around a message id. Cross-profile: pass profile=<name> (or the @session:<profile>/<id> link as session_id) to search another profile's state.db read-only. Discovery honours detail=adaptive (default: only the top-ranked hit is fully hydrated) / full, plus sort (newest/oldest temporal bias), after/before session-start bounds, and exclude_session_ids (those sessions and their lineage omitted). It is read-only."
               {"query" {"type" "string" "description" "Full-text search query; omit to browse recent sessions."}
                "limit" {"type" "integer" "minimum" 1 "maximum" 20 "description" "Maximum sessions or matching messages (default 5)."}
                "session_id" {"type" "string" "description" "Read one session; an @session:<profile>/<id> link resolves to that profile (or pass profile=)."}
@@ -1812,6 +1812,92 @@
   (reduce (fn [acc sid] (conj acc sid (or (session-lineage-root db sid) sid)))
           #{} exclude-ids))
 
+(defn- session-escape-like
+  "hermes_state_common.escape_like: escape LIKE wildcards (`\\`, `%`, `_`) so
+  derived text matches literally; paired with `ESCAPE '\\'` in the query."
+  [text]
+  (-> (str text)
+      (str/replace "\\" "\\\\")
+      (str/replace "%" "\\%")
+      (str/replace "_" "\\_")))
+
+(defn session-resolve-title
+  "hermes_state_titles.resolve_session_by_title: the id a session title names —
+  an exact title, or the newest `<title> #N` continuation (LIKE wildcards
+  escaped) which outranks the exact row; nil when nothing holds the title.
+  (Hermes' canonical \"Bot Chat\" exception is Bot Mode identity routing and has
+  no counterpart here.)"
+  [db title]
+  (let [exact (get (first (sqlite-records db "SELECT id FROM sessions WHERE title = ?" title)) "id")
+        numbered (sqlite-records db
+                   "SELECT id FROM sessions WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC"
+                   (str (session-escape-like title) " #%"))]
+    (or (get (first numbered) "id") exact)))
+
+(defn- session-coerce-started-ts
+  "`_coerce_started_ts`: `sessions.started_at` as unix seconds (numeric or ISO
+  text); nil when unusable."
+  [value]
+  (cond
+    (or (nil? value) (boolean? value)) nil
+    (number? value) (int value)
+    :else (let [text (str/trim (str value))]
+            (if (re-matches #"-?\d+(?:\.\d+)?" text)
+              (int (js/parseFloat text))
+              (try (session-parse-iso-bound text) (catch :default _ nil))))))
+
+(defn- session-in-time-window
+  "`_in_time_window`: `after_ts <= started_ts < before_ts`; an unknown start
+  fails any bound."
+  [started-ts after-ts before-ts]
+  (cond
+    (and (nil? after-ts) (nil? before-ts)) true
+    (nil? started-ts) false
+    :else (and (or (nil? after-ts) (>= started-ts after-ts))
+               (or (nil? before-ts) (< started-ts before-ts)))))
+
+(defn- session-title-hit-row
+  "Hermes `_title_match_result` plus `_discover`'s title gates: a raw discovery
+  row (FTS row shape, `role` \"session_title\") when the query — whitespace-
+  trimmed and stripped of surrounding quotes/backticks — matches a session
+  title, else nil. The anchor is the session's first message. The hit is gated
+  like every discovery row (visible sessions only) and additionally re-checked
+  against the after/before window here: it bypasses the bounded FTS query, so
+  this is the one place the window must be re-checked in code (Hermes re-checks
+  in Python). `parent_session_id` groups the hit under its lineage root
+  (Hermes `_discovery_entry`)."
+  [db query excluded after-ts before-ts]
+  (let [title-query (-> (str query) str/trim
+                        (str/replace #"^[`'\"]+" "")
+                        (str/replace #"[`'\"]+$" ""))]
+    (when (seq title-query)
+      (when-let [sid (session-resolve-title db title-query)]
+        (when-let [meta (first (sqlite-records db
+                                (str "SELECT s.id, s.title, s.started_at, s.message_count FROM sessions s WHERE s.id = ? AND "
+                                     session-hidden-filter " AND " session-source-filter)
+                                sid))]
+          (let [root (session-lineage-root db sid)
+                started (session-coerce-started-ts
+                         (or (get (first (sqlite-records db
+                                          "SELECT started_at FROM sessions WHERE id = ?" root))
+                                  "started_at")
+                             (get meta "started_at")))
+                anchor (get (first (sqlite-records db
+                                     "SELECT MIN(id) AS id FROM messages WHERE session_id = ?" sid))
+                            "id")
+                title (or (get meta "title") title-query)]
+            (when (and (not (contains? excluded sid))
+                       (not (contains? excluded root))
+                       (session-in-time-window started after-ts before-ts))
+              (cond-> {"session_id" sid
+                       "title" title
+                       "started_at" (get meta "started_at")
+                       "message_count" (get meta "message_count")
+                       "match_message_id" anchor
+                       "role" "session_title"
+                       "snippet" (str "Session title matched: " title)}
+                (not= root sid) (assoc "parent_session_id" root)))))))))
+
 (defn session-search
   "Read-only session history search. Cross-profile lookup follows Hermes
   `session_search_tool._resolve_profile_db`: the `profile` argument and a raw
@@ -1819,7 +1905,10 @@
   state.db read-only for every shape (a bare id never scans other profiles —
   `_read_scoped`'s miss hint). Discovery honours Hermes' `detail` modes
   (`_hydrate_hit`: `adaptive` fully hydrates only the top-ranked hit, `full`
-  hydrates every hit)."
+  hydrates every hit), matches session titles as well as message content
+  (`_title_match_result`: the hit carries `role` \"session_title\"), and returns
+  one hit per session lineage (`_discover`'s dedup — a child hit carries
+  `parent_session_id`)."
   [ctx {:strs [query limit session_id around_message_id window role_filter profile detail
                sort after before exclude_session_ids]}]
   (let [;; Hermes session_search_tool.session_search: ids never contain "/", so a
@@ -1931,22 +2020,51 @@
                                                 (when (:before bounds) " AND s.started_at < ?"))
                                 window-params (vec (concat (when (:after bounds) [(:after bounds)])
                                                            (when (:before bounds) [(:before bounds)])))
-                                rows (apply sqlite-records db
-                                        (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count, "
-                                             "m.id AS match_message_id, m.role, m.content, m.timestamp, "
-                                             "snippet(messages_fts, 0, '[', ']', ' … ', 16) AS snippet "
-                                             "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
-                                             "JOIN sessions s ON s.id = m.session_id WHERE messages_fts MATCH ? AND "
-                                             hidden-filter " AND " source-filter " AND m.role IN (" role-sql ") "
-                                             window-sql " " order-sql " LIMIT ?")
-                                        (into [query] (conj window-params session-discover-scan-limit)))
-                                excluded (session-excluded-lineage-roots db excluded-ids)]
-                            (vec (take limit
-                                   (remove (fn [row]
-                                             (let [sid (get row "session_id")]
-                                               (or (contains? excluded sid)
-                                                   (contains? excluded (session-lineage-root db sid)))))
-                                           rows))))
+                                excluded (session-excluded-lineage-roots db excluded-ids)
+                                ;; Hermes `_title_match_result`: a query matching a
+                                ;; session title surfaces that session first, owning
+                                ;; its lineage group and one of the `limit` slots.
+                                title-row (session-title-hit-row db query excluded (:after bounds) (:before bounds))
+                                title-root (when title-row
+                                             (or (get title-row "parent_session_id")
+                                                 (get title-row "session_id")))
+                                rows (try
+                                       (apply sqlite-records db
+                                         (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count, "
+                                              "m.id AS match_message_id, m.role, m.content, m.timestamp, "
+                                              "snippet(messages_fts, 0, '[', ']', ' … ', 16) AS snippet "
+                                              "FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid "
+                                              "JOIN sessions s ON s.id = m.session_id WHERE messages_fts MATCH ? AND "
+                                              hidden-filter " AND " source-filter " AND m.role IN (" role-sql ") "
+                                              window-sql " " order-sql " LIMIT ?")
+                                         (into [query] (conj window-params session-discover-scan-limit)))
+                                       ;; hermes_state_search.py search_messages: an FTS5
+                                       ;; syntax error is "no content rows", never a tool
+                                       ;; error (Hermes sanitizes `_sanitize_fts5_query`
+                                       ;; first, which is still unported here) — a quoted
+                                       ;; remembered title must not blow up the scan.
+                                       (catch :default _ []))]
+                            ;; `_discover`'s dedup: one hit per lineage (lineage root ->
+                            ;; first surviving scan row, `parent_session_id` grouping the
+                            ;; child under its root) up to `limit` — parent/child runs of
+                            ;; one session never surface as duplicate hits.
+                            (loop [rows rows
+                                   seen (if title-row {title-root title-row} {})
+                                   out (if title-row [title-row] [])]
+                              (cond
+                                (or (empty? rows) (>= (count seen) limit)) out
+                                :else
+                                (let [row (first rows)
+                                      sid (get row "session_id")
+                                      root (session-lineage-root db sid)]
+                                  (if (or (contains? excluded sid)
+                                          (contains? excluded root)
+                                          (contains? seen root))
+                                    (recur (rest rows) seen out)
+                                    (recur (rest rows)
+                                           (assoc seen root row)
+                                           (conj out (cond-> row
+                                                       (not= root sid) (assoc "parent_session_id" root)))))))))
 
                           :else
                           (sqlite-records db

@@ -243,7 +243,9 @@
 (deftest exclusion-drops-whole-lineage
   ;; Hermes test_exclude_session_ids_drops_whole_lineage (`_excluded_lineage_roots`):
   ;; a child id also hides its parent chain, and the exclusion backfills from the
-  ;; scan instead of starving the limit.
+  ;; scan instead of starving the limit. Without exclusion the parent/child
+  ;; lineage surfaces ONCE (`_discover`'s dedup), so the assertion pins count,
+  ;; not the exact winning session.
   (let [root (h/join (h/tmp-dir) (str "itonami-session-search-" (h/random-hex 4)))
         work (h/join root "profiles" "work")]
     (make-state-db! (h/join work "state.db")
@@ -255,9 +257,11 @@
                      {:id 4 :session "s_child" :role "assistant" :content "child unique lineage token alpha"}])
     (let [ctx {:home work :cwd work}
           sids (fn [res] (set (mapv #(get % "session_id") (get res "results"))))]
-      (testing "without exclusion both the parent and the child hit"
-        (is (= #{"s_root" "s_child"}
-               (sids (call ctx {"query" "unique lineage token alpha" "limit" 5})))))
+      (testing "without exclusion the lineage is one hit (deduped), not two"
+        (let [res (call ctx {"query" "unique lineage token alpha" "limit" 5})]
+          (is (= 1 (get res "count")))
+          (is (= 1 (count (sids res))))
+          (is (contains? #{"s_root" "s_child"} (first (sids res))))))
       (testing "excluding the child drops the child AND its parent chain"
         (is (= #{} (sids (call ctx {"query" "unique lineage token alpha" "limit" 5
                                     "exclude_session_ids" ["s_child"]})))))
@@ -287,4 +291,138 @@
         (is (= "s_c" (first-sid (call ctx {"query" "needle" "sort" "oldest"})))))
       (testing "an unknown sort value is rank-only"
         (is (= 3 (get (call ctx {"query" "needle" "sort" "bogus"}) "count")))))
+    (h/rm root)))
+
+(deftest title-match-surfaces-titled-session
+  ;; Hermes `_title_match_result`: a query matching a session TITLE surfaces that
+  ;; session as a discovery entry even when no message matches — `role`
+  ;; "session_title", `snippet` "Session title matched: <title>", anchored on the
+  ;; session's first message, always detail "full".
+  (let [root (h/join (h/tmp-dir) (str "itonami-session-search-" (h/random-hex 4)))
+        work (h/join root "profiles" "work")]
+    (make-state-db! (h/join work "state.db")
+                    [{:id "s_titled" :title "quasar ledger reconciliation" :started 100}]
+                    [{:id 1 :session "s_titled" :role "user" :content "filler one"}
+                     {:id 2 :session "s_titled" :role "assistant" :content "filler two"}])
+    (let [ctx {:home work :cwd work}]
+      (testing "the title hit anchors on the first message and hydrates full"
+        (let [res (call ctx {"query" "quasar ledger reconciliation"})
+              entry (get-in res ["results" 0])]
+          (is (= "discover" (get res "mode")))
+          (is (= 1 (get res "count")))
+          (is (= "s_titled" (get entry "session_id")))
+          (is (= "session_title" (get entry "role")))
+          (is (= "Session title matched: quasar ledger reconciliation" (get entry "snippet")))
+          (is (= "full" (get entry "detail")))
+          (is (= 1 (get entry "match_message_id")))
+          (is (true? (some #(get % "anchor") (get entry "messages"))))
+          (is (= ["filler one" "filler two"] (mapv #(get % "content") (get entry "messages"))))
+          (is (= [] (get entry "bookend_start")))
+          (is (= [] (get entry "bookend_end")))))
+      (testing "a quoted remembered title still matches (Hermes strips surrounding ' and \")"
+        (is (= ["s_titled"] (mapv #(get % "session_id")
+                                  (get (call ctx {"query" "'quasar ledger reconciliation'"}) "results"))))
+        (is (= ["s_titled"] (mapv #(get % "session_id")
+                                  (get (call ctx {"query" "\"quasar ledger reconciliation\""}) "results")))))
+      (testing "a query matching neither titles nor messages finds nothing"
+        (is (= 0 (get (call ctx {"query" "no such topic anywhere"}) "count")))))
+    (h/rm root)))
+
+(deftest title-match-resolution-precedence
+  ;; Hermes `resolve_session_by_title`: a `title #N` continuation outranks the
+  ;; exact title (newest started_at first), and LIKE wildcards in titles are
+  ;; escaped (hermes_state_common.escape_like) so `test_project` cannot resolve
+  ;; through `testXproject #2`.
+  (let [root (h/join (h/tmp-dir) (str "itonami-session-search-" (h/random-hex 4)))
+        work (h/join root "profiles" "work")]
+    (make-state-db! (h/join work "state.db")
+                    [{:id "s_exact" :title "modpack overhaul plan" :started 100}
+                     {:id "s_num" :title "modpack overhaul plan #2" :started 200}
+                     {:id "s_under" :title "test_project" :started 100}
+                     {:id "s_x" :title "testXproject #2" :started 200}]
+                    [{:id 1 :session "s_exact" :role "user" :content "filler one"}
+                     {:id 2 :session "s_num" :role "user" :content "filler two"}
+                     {:id 3 :session "s_under" :role "user" :content "filler three"}
+                     {:id 4 :session "s_x" :role "user" :content "filler four"}])
+    (let [ctx {:home work :cwd work}
+          sid-of (fn [q] (get-in (call ctx {"query" q}) ["results" 0 "session_id"]))]
+      (testing "the newest <title> #N continuation outranks the exact title"
+        (is (= "s_num" (sid-of "modpack overhaul plan")))
+        (is (= "s_num" (sid-of "'modpack overhaul plan'"))))
+      (testing "LIKE wildcards are escaped: test_project resolves exactly, never testXproject #2"
+        (is (= "s_under" (sid-of "test_project")))))
+    (h/rm root)))
+
+(deftest title-match-gates
+  ;; The title hit bypasses the bounded FTS query, so `_discover` re-checks the
+  ;; after/before window in code; hidden/integration sessions are gated like
+  ;; every discovery row; exclusion drops the title lineage; and the title hit
+  ;; owns one `limit` slot and the `full` detail slot under adaptive.
+  (let [root (h/join (h/tmp-dir) (str "itonami-session-search-" (h/random-hex 4)))
+        work (h/join root "profiles" "work")
+        epoch (fn [y mo d] (js/Math.floor (/ (js/Date.UTC y (dec mo) d) 1000)))]
+    (make-state-db! (h/join work "state.db")
+                    [{:id "s_titled" :title "deep dive widgets" :started (epoch 2026 6 15)}
+                     {:id "s_fts" :title "fts side" :started (epoch 2026 8 10)}
+                     {:id "s_hidden" :title "ghost story" :started (epoch 2026 9 1) :hidden true}
+                     {:id "s_tool" :title "tooling topic" :started (epoch 2026 9 2) :source "tool"}]
+                    [{:id 1 :session "s_titled" :role "user" :content "filler one"}
+                     {:id 2 :session "s_titled" :role "assistant" :content "filler two"}
+                     {:id 3 :session "s_fts" :role "user" :content "deep dive widgets in content"}
+                     {:id 4 :session "s_hidden" :role "user" :content "filler three"}
+                     {:id 5 :session "s_tool" :role "user" :content "filler four"}])
+    (let [ctx {:home work :cwd work}
+          sids (fn [res] (mapv #(get % "session_id") (get res "results")))]
+      (testing "the title hit leads and takes the adaptive `full` slot; FTS hits stay compact"
+        (let [res (call ctx {"query" "deep dive widgets"})]
+          (is (= 2 (get res "count")))
+          (is (= ["s_titled" "s_fts"] (sids res)))
+          (is (= "session_title" (get-in res ["results" 0 "role"])))
+          (is (= "full" (get-in res ["results" 0 "detail"])))
+          (is (= "compact" (get-in res ["results" 1 "detail"])))))
+      (testing "the title hit owns one limit slot"
+        (let [res (call ctx {"query" "deep dive widgets" "limit" 1})]
+          (is (= ["s_titled"] (sids res)))))
+      (testing "the window is re-checked for the title hit (it bypasses the bounded FTS query)"
+        (let [res (call ctx {"query" "deep dive widgets" "after" "2026-07-01"})]
+          (is (= ["s_fts"] (sids res)))))
+      (testing "exclusion drops the title lineage"
+        (let [res (call ctx {"query" "deep dive widgets" "exclude_session_ids" ["s_titled"]})]
+          (is (= ["s_fts"] (sids res)))))
+      (testing "hidden and integration sessions hold no discoverable title"
+        (is (= 0 (get (call ctx {"query" "ghost story"}) "count")))
+        (is (= 0 (get (call ctx {"query" "tooling topic"}) "count")))))
+    (h/rm root)))
+
+(deftest lineage-dedup-one-hit-per-lineage
+  ;; Hermes `_discover`'s dedup: one hit per lineage root (first surviving scan
+  ;; row wins) — parent/child runs of one session never surface as duplicate
+  ;; hits, and a child hit carries `parent_session_id` (Hermes
+  ;; `_discovery_entry`). Rank ties fall to `m.id DESC`, so with identical
+  ;; contents the newest matching message's session owns the hit.
+  (let [root (h/join (h/tmp-dir) (str "itonami-session-search-" (h/random-hex 4)))
+        work (h/join root "profiles" "work")]
+    (make-state-db! (h/join work "state.db")
+                    [{:id "s_root" :title "root" :started 100}
+                     {:id "s_child" :title "shared lineage recap" :started 200 :parent "s_root"}
+                     {:id "s_alone" :title "alone" :started 300}]
+                    [{:id 1 :session "s_root" :role "user" :content "shared lineage token"}
+                     {:id 2 :session "s_child" :role "user" :content "shared lineage token"}
+                     {:id 3 :session "s_alone" :role "user" :content "shared lineage token"}])
+    (let [ctx {:home work :cwd work}]
+      (testing "parent and child collapse to one hit, grouped under the lineage root"
+        (let [res (call ctx {"query" "shared lineage token" "limit" 5})]
+          (is (= 2 (get res "count")))
+          (is (= ["s_alone" "s_child"] (mapv #(get % "session_id") (get res "results"))))
+          (is (= [nil "s_root"] (mapv #(get % "parent_session_id") (get res "results"))))))
+      (testing "a title hit in a child groups under its lineage root too"
+        (let [res (call ctx {"query" "shared lineage recap"})
+              entry (get-in res ["results" 0])]
+          (is (= 1 (get res "count")))
+          (is (= "s_child" (get entry "session_id")))
+          (is (= "s_root" (get entry "parent_session_id")))
+          (is (= "session_title" (get entry "role")))))
+      (testing "excluding a lineage member leaves the unrelated hit"
+        (let [res (call ctx {"query" "shared lineage token" "limit" 5 "exclude_session_ids" ["s_child"]})]
+          (is (= ["s_alone"] (mapv #(get % "session_id") (get res "results")))))))
     (h/rm root)))
