@@ -1168,10 +1168,6 @@ plain: true
           (p/finally (fn [_ _] (done)))))))
 
 (deftest delegate-pending-results-delivered-once
-  ;; the atoms are pre-populated from the persisted registry at namespace
-  ;; load — reset them so real on-disk records cannot leak into this test
-  (reset! agent-loop/delegate-children {})
-  (reset! agent-loop/delegate-delivered #{})
   ;; background results re-enter as one message between turns and are
   ;; marked delivered
   (reset! agent-loop/delegate-children {})

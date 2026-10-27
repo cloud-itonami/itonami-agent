@@ -502,7 +502,10 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                 (js/console.error (str "delegate delivery ack failed: " (or (.-message e) e))))))
                        pending)))]
      (if (= outcome ::busy)
-       (throw (js/Error. "delegate registry busy — cannot fetch pending results safely"))
+       ;; TRANSIENT contention must not kill the interactive loop: return
+       ;; empty and let the next poll pick the results up (delivery stays
+       ;; atomic; the R6 escalation note)
+       []
        outcome))))
 
 (def delegate-ctl

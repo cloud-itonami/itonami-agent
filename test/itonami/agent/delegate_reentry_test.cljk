@@ -90,6 +90,7 @@
     (is (= [] (vec (loop/delegate-pending-results! ""))) "exactly once — never re-delivered")))
 
 (deftest joined-children-are-never-re-delivered
+  (h/spit-atomic (loop/delegate-state-file) (h/json-str {"children" {} "delivered" []}))
   ;; foreground children return INLINE — without a delivered mark the
   ;; registry would re-deliver them as duplicates on the next run (the R2
   ;; duplicate gate); the in-memory state models the post-join registry
