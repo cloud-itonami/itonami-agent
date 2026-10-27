@@ -1,0 +1,21 @@
+(ns itonami.agent.doctor-test
+  "doctor's pure pieces: the lane token env resolution."
+  (:require [cljs.test :refer [deftest is testing]]
+            [itonami.agent.platform-adapters :as platforms]))
+
+(deftest token-env-name-resolves
+  (testing "the lane default unless the config names one"
+    (is (= "TELEGRAM_BOT_TOKEN" (platforms/token-env-name "telegram" {})))
+    (is (= "MY_TOK" (platforms/token-env-name "telegram" {"delivery" {"telegram" {"token_env" "MY_TOK"}}}))))
+  (testing "a webhook lane has no token env"
+    (is (nil? (platforms/token-env-name "mattermost" {})))
+    (is (nil? (platforms/token-env-name "discord" {"delivery" {"discord" {"webhook_url" "https://d/h"}}}))))
+  (testing "a discord BOT lane does use the token env"
+    (is (= "DISCORD_BOT_TOKEN" (platforms/token-env-name "discord" {"delivery" {"discord" {"channel_id" "c1"}}}))))
+  (testing "mattermost is ALWAYS webhook-style: a configured token_env is dead and never demanded"
+    (is (nil? (platforms/token-env-name "mattermost" {"delivery" {"mattermost" {"token_env" "MM"}}})))
+    (is (nil? (platforms/token-env-name "mattermost" {"delivery" {"mattermost" {"webhook_url" "https://mm/h" "token_env" "MM"}}}))))
+  (testing "a discord webhook lane ignores a dead token_env too"
+    (is (nil? (platforms/token-env-name "discord" {"delivery" {"discord" {"webhook_url" "https://d/h" "token_env" "DT"}}}))))
+  (testing "an unknown lane resolves to nothing — never a guess"
+    (is (nil? (platforms/token-env-name "feishu" {})))))
