@@ -53,7 +53,8 @@
   bytes; different request, different file). Injected `fetch` for tests;
   `writable?` (a path predicate from the tool ctx) is consulted BEFORE the
   write — a path outside the permitted roots is refused, exactly as
-  write-file/patch refuse. Resolves to a map naming path and format, or a map
+  write (a nil predicate means ungated — legacy 4-arg call sites). Resolves
+  to a map naming path and format, or a map
   naming the error — a named outcome either way, never a guessed artifact."
   [config home {:strs [text voice model] :as args} fetch writable?]
   ;; `format` is pulled by key — destructuring it would shadow clojure.core
@@ -88,7 +89,9 @@
                 out-dir (h/join home "workspace" "tts")
                 ;; json encoding is delimiter-unambiguous: distinct requests
                 ;; cannot collide on one path
-                out-path (h/join out-dir (str (h/sha256-hex (h/json-str [(str text) voice model fmt (:provider cfg)])) "." fmt))]
+                ;; provider AND endpoint: re-pointing a named provider at a
+                ;; different base_url is a different request -> different file
+                out-path (h/join out-dir (str (h/sha256-hex (h/json-str [(str text) voice model fmt (:provider cfg) (:base-url hop)])) "." fmt))]
             (let [ctl (js/AbortController.)
                   ;; the chat-hop pattern: the controller is paired with a
                   ;; timer that ABORTS it — without the timer the signal
@@ -106,13 +109,20 @@
                              {"error" (str "speech request failed: " (or (.-message e) e))}))
                   (p/then
                    (fn [r]
-                     (js/clearTimeout timer)
+                     ;; the timer is cleared at the INNERMOST completions —
+                     ;; it must stay armed through the body read (.arrayBuffer),
+                     ;; which is exactly where a slow drip stalls (the cited
+                     ;; chat-hop pattern keeps it armed past (.text r) too)
                      (if (get r "error")
                        r
                        (if (.-ok r)
                          (-> (.arrayBuffer r)
                              (p/then
                               (fn [buf]
+                                ;; the body has settled here — the timer's job
+                                ;; is done on every outcome that reaches this
+                                ;; point (success or write refusal)
+                                (js/clearTimeout timer)
                                 (try
                                   ;; the roots gate runs BEFORE the write,
                                   ;; like write-file/patch — refuse, never
@@ -126,6 +136,10 @@
                                         ;; require tools (cycle)
                                         {"path" out-path "format" fmt}))
                                   (catch :default e
+                                    (js/clearTimeout timer)
                                     {"error" (str "speech write failed: " (or (.-message e) e))}))))
-                             (p/catch (fn [e] {"error" (str "speech read failed: " (or (.-message e) e))})))
-                         {"error" (str "speech request failed: HTTP " (.-status r))}))))))))))))
+                             (p/catch (fn [e]
+                                        (js/clearTimeout timer)
+                                        {"error" (str "speech read failed: " (or (.-message e) e))})))
+                         (do (js/clearTimeout timer)
+                             {"error" (str "speech request failed: HTTP " (.-status r))})))))))))))))

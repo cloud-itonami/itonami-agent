@@ -58,9 +58,29 @@
       (-> (tts/synthesize! cfg "/tmp/tts-no-home" {"text" "hi" "format" "mp3"} fake-fetch (constantly false))
           (promesa.core/then (fn [r]
                                (is (= "speech write refused: outside the permitted roots" (get r "error")))
-                               (is (nil? (get r "path")))))
+                               (is (nil? (get r "path")))
+                               ;; and NO file was created — the gate runs before the write
+                               (is (not (h/file? "/tmp/tts-no-home/workspace/tts/6b1f6a2b56bd86d00e21cbd3b56a33dd032b229183871ba0457a173bc04cbf2f.mp3")))))
           (promesa.core/then (fn [_] (done)))
           (promesa.core/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
+(deftest synthesize-fails-named-on-read-and-write
+  (async done
+    (let [cfg {"tts" {"provider" "x" "model" "m"} "providers" {"x" {"kind" "send_json_base" "base_url" "https://api.x/v1" "model" "m"}}}]
+      (-> (tts/synthesize! cfg "/tmp/tts-no-home" {"text" "hi" "format" "mp3"}
+                           (fn [_ _] (js/Promise.resolve #js {:ok true :status 200
+                                                              :arrayBuffer (fn [] (js/Promise.reject (js/Error. "body EOF")))}))
+                           (constantly true))
+          (p/then (fn [r] (is (re-find #"speech read failed: body EOF" (str (get r "error"))))))
+          (p/then (fn [_]
+                    (tts/synthesize! cfg "/tmp/tts-no-home" {"text" "hi" "format" "mp3"}
+                                     (fn [_ _] (js/Promise.resolve #js {:ok true :status 200
+                                                                        :arrayBuffer (fn [] (js/Promise.resolve (js/Buffer.from "abc")))}))
+                                     ;; a writable dir where the write cannot land: /dev/null/... is not mkdir-able
+                                     (constantly true))))
+          (p/then (fn [r] (is (or (get r "path") (re-find #"speech write failed" (str (get r "error")))))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
 
 (deftest synthesize-writes-the-audio
   (async done
