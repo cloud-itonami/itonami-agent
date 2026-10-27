@@ -1827,7 +1827,13 @@
   failures surface — the reference routes them to DatabaseError, not the
   syntax arm."
   [e]
-  (str/includes? (str (.-message e)) "fts5: syntax error"))
+  ;; node:sqlite's MATCH syntax family: besides 'fts5: syntax error', an
+  ;; unbalanced quote raises 'unterminated string' and a bad expression
+  ;; raises 'malformed MATCH expression' — Hermes degrades every
+  ;; OperationalError from the MATCH read, so the whole family degrades
+  (let [m (str (.-message e))]
+    (boolean (some #(str/includes? m %)
+                   ["fts5: syntax error" "unterminated string" "malformed MATCH expression"]))))
 
 (defn- session-resolve-title
   "hermes_state_titles.resolve_session_by_title: the id a session title names —
@@ -1896,13 +1902,19 @@
                                      session-hidden-filter " AND " session-source-filter)
                                 sid))]
           (let [root (session-lineage-root db sid)
+                ;; ROW-level fallback like _discover's
+                ;; (_get_session_meta(root) or _get_session_meta(sid)): a
+                ;; root row with NULL started_at means UNKNOWN (the bound
+                ;; drops the hit), not the child's timestamp (the R3 gate)
+                root-row (first (sqlite-records db
+                                 "SELECT started_at FROM sessions WHERE id = ?" root))
                 started (session-coerce-started-ts
-                         (or (get (first (sqlite-records db
-                                          "SELECT started_at FROM sessions WHERE id = ?" root))
-                                  "started_at")
-                             (get meta "started_at")))
+                         (if root-row (get root-row "started_at") (get meta "started_at")))
+                ;; the reference anchors on the session's first LIVE message
+                ;; (_get_messages' active clause): rewound/compacted rows
+                ;; (active=0) must not anchor the window
                 anchor (get (first (sqlite-records db
-                                     "SELECT MIN(id) AS id FROM messages WHERE session_id = ?" sid))
+                                     "SELECT MIN(id) AS id FROM messages WHERE session_id = ? AND COALESCE(active, 1) = 1" sid))
                             "id")
                 title (or (get meta "title") title-query)]
             (when (and (not (contains? excluded sid))
