@@ -1,0 +1,51 @@
+(ns itonami.agent.dingtalk-plate-test
+  "JUN-471 dingtalk plate (2/4): delivery send, env-only auth transport,
+  inbound normalize — one platform, one plate."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [itonami.agent.host :as h]
+            [itonami.agent.platform-adapters :as platforms]
+            [itonami.agent.chat-platform :as chat]))
+
+(deftest dingtalk-requests-are-pure-and-correct
+  (testing "the send request is the robot batchSend shape with a JSON-string msgParam"
+    (let [r (platforms/dingtalk-request "tok" "key-1" "u1" "hello")]
+      (is (str/includes? (:url r) "/robot/oToMessages/batchSend"))
+      (is (= "Bearer tok" (get-in r [:headers "Authorization"])))
+      (let [body (h/json-parse (:body r))]
+        (is (= "key-1" (get body "robotCode")))
+        (is (= ["u1"] (js->clj (get body "userIds"))))
+        (is (= "hello" (get (h/json-parse (str (get body "msgParam"))) "text"))))))
+  (testing "the auth transport is the oauth2/accessToken exchange"
+    (let [r (platforms/dingtalk-token-request "key" "secret")]
+      (is (str/includes? (:url r) "/oauth2/accessToken"))
+      (let [body (h/json-parse (:body r))]
+        (is (= "key" (get body "appKey")))
+        (is (= "secret" (get body "appSecret")))))))
+
+(deftest dingtalk-normalize-maps-robot-callbacks
+  (let [event {"msgId" "m1" "msgtype" "text" "conversationId" "c1"
+               "senderStaffId" "u1" "senderNick" "User"
+               "text" {"content" "hi there"}}]
+    (testing "a text callback becomes the platform-agnostic inbound map"
+      (let [m (chat/dingtalk-normalize event)]
+        (is (= "dingtalk" (get m "platform")))
+        (is (= "hi there" (get m "text")))
+        (is (= "c1" (get m "chat_id")))
+        (is (= "u1" (get m "user_id")))))
+    (testing "non-text messages carry no turn"
+      (is (nil? (chat/dingtalk-normalize (dissoc event "text")))))
+    (testing "the platform entry wires normalize"
+      (is (fn? (get-in chat/platform-adapters ["dingtalk" :normalize]))))))
+
+(deftest dingtalk-lane-resolves-with-token-or-env-exchange
+  (testing "a direct token (env default) and chat_id resolve an adapter"
+    (with-redefs [h/env (fn [k] (when (= k "DINGTALK_ACCESS_TOKEN") "tok"))]
+      (is (fn? (platforms/for-lane "dingtalk" {"delivery" {"dingtalk" {"chat_id" "u1"}}})))))
+  (testing "ENV app credentials resolve the exchange adapter; config-held ones are not read"
+    (with-redefs [h/env (fn [k] (case k "DINGTALK_APP_KEY" "k" "DINGTALK_APP_SECRET" "s" nil))]
+      (is (fn? (platforms/for-lane "dingtalk" {"delivery" {"dingtalk" {"chat_id" "u1"}}}))))
+    (with-redefs [h/env (fn [_] nil)]
+      (is (nil? (platforms/for-lane "dingtalk" {"delivery" {"dingtalk" {"chat_id" "u1" "app_key" "k" "app_secret" "s"}}})))))
+  (testing "no chat_id means no adapter"
+    (is (nil? (platforms/for-lane "dingtalk" {"delivery" {"dingtalk" {}}})))))
