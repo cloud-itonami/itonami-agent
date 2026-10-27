@@ -2,7 +2,9 @@
   "Hermes tools/clarify_tool.py core semantics: structured multiple-choice /
   open-ended questions to the user. Behavior is ported faithfully (filter
   order, falsy handling, error outcomes); MESSAGE STRINGS are not byte-identical
-  (over-long-choice wording, Python str() of numbers follows JS here). Schema
+  (over-long-choice wording), and stringification covers scalars — nil and
+  booleans print Python-style (None/True/False) while numbers and collections
+  follow JS (1 not 1.0; [] not []). Schema
   and validation live here; the UI is a platform-injected callback (chat
   readline / the bridge's request row), and a run with no callback answers the
   honest unavailability string."
@@ -29,6 +31,18 @@
     (and (sequential? x) (empty? x)) ""
     (and (map? x) (empty? x)) ""
     :else (str x)))
+
+(defn- py-truthy
+  "Python truthiness: nil/false/zero/empty string and empty collections are
+  falsy; everything else (including the whitespace string) is truthy."
+  [x]
+  (cond
+    (nil? x) false
+    (false? x) false
+    (and (number? x) (zero? x)) false
+    (and (string? x) (= "" x)) false
+    (and (coll? x) (empty? x)) false
+    :else true))
 
 (defn- py-str
   "Python `str()` on an answer value: booleans and nil print Python-style.
@@ -79,8 +93,12 @@
                   (array? raw) (vec raw)
                   :else (throw (js/Error. (str (py-str raw) " object is not iterable"))))]
       (->> items
-           (remove #(str/blank? (str %)))
-           (map strip-recommended)
+           ;; Python str(item).strip() truthiness: None and booleans are
+           ;; NON-blank and survive ("None", "True"/"False"); only empty or
+           ;; whitespace strings drop (empty collections stringify per JS,
+           ;; see the ns docstring)
+           (remove #(str/blank? (py-str %)))
+           (map (comp strip-recommended py-str))
            vec))))
 
 (defn- normalize-item
@@ -170,8 +188,11 @@
                              "status" status
                              "user_response" value}))
                         normalized)
+        ;; Hermes includes the notice on Python TRUTHINESS of the raw value:
+        ;; " " is included; 0/false/empty strings and collections are not
+        notice (get reply "notice")
         result (cond-> {"responses" responses "outcome" (get reply "outcome")}
-                 (not (str/blank? (str (get reply "notice")))) (assoc "notice" (str (get reply "notice"))))]
+                 (py-truthy notice) (assoc "notice" (str notice)))]
     (h/json-str result)))
 
 (defn ask!
@@ -189,10 +210,11 @@
       ;; the callback may be async (a readline, a chat round trip): p/let
       ;; AWAITS a Promise reply — a Promise answer is an ANSWER, never a
       ;; silent {} (p/resolved would wrap it unflattened)
-      (-> (p/let [r0 (callback normalized)
-                  ;; a bridge reply may arrive as a plain JS object
+      (->          (p/let [r0 (callback normalized)
+                  ;; a bridge reply may arrive as a plain JS object (answers
+                  ;; may too — coerce both so lookups never silently miss)
                   reply (cond
-                          (map? r0) r0
+                          (map? r0) (update r0 "answers" (fn [a] (if (instance? js/Object a) (js->clj a) a)))
                           (and r0 (instance? js/Object r0)) (js->clj r0)
                           :else nil)]
             (when-not (map? reply)

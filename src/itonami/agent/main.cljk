@@ -301,13 +301,7 @@
                               (resolve {"answers" @answers "outcome" "submitted"})))]
                ;; stdin closing must SETTLE the promise — a dropped
                ;; .question callback would wedge the whole run mid-tool
-               (.once rl "close"
-                      (fn []
-                        ;; Hermes' CLI modal preserves the answers already
-                        ;; locked in; only the gateway path drops them
-                        (resolve {"answers" @answers
-                                  "outcome" "cancelled"
-                                  "notice" "input closed before the questions were answered"})))
+               ;; (the close listener above is the cancelled path)
                (ask-at 0)))))
         ask-before-tool (fn [{:keys [name arguments]}]
                           (let [arguments (if (map? arguments) arguments

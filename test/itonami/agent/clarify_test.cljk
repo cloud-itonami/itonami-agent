@@ -65,6 +65,36 @@
           (is (= "skipped" (get-in parsed ["responses" 0 "status"])))
           (is (nil? (get-in parsed ["responses" 0 "user_response"]))))))))
 
+(deftest multi-items-stringify-python-style
+  (testing "None and booleans SURVIVE the raw filter as None/True/False"
+    (let [[norm _] (clarify/normalize-questions [{"question" "A" "choices" ["yes" "no"] "multi_select" true}])]
+      (is (= ["None" "True" "False" "yes"]
+             (get-in (h/json-parse (clarify/result-json norm {"answers" {"q0" [nil true false "yes" ""]} "outcome" "submitted"}))
+                     ["responses" 0 "user_response"]))))))
+
+(deftest notice-follows-python-truthiness
+  (let [[norm _] (clarify/normalize-questions [{"question" "A"}])
+        notice-of (fn [v] (get (h/json-parse (clarify/result-json norm {"answers" {} "outcome" "submitted" "notice" v})) "notice"))]
+    (testing "a whitespace string is truthy in Python: included"
+      (is (= " " (notice-of " "))))
+    (testing "0 / false / empty string / empty collection are falsy: omitted"
+      (is (nil? (notice-of 0)))
+      (is (nil? (notice-of false)))
+      (is (nil? (notice-of "")))
+      (is (nil? (notice-of []))))
+    (testing "non-empty strings are included"
+      (is (= "abc" (notice-of "abc"))))))
+
+(deftest js-answers-are-coerced
+  (testing "a bridge reply whose answers is a raw JS object still resolves"
+    (let [[norm _] (clarify/normalize-questions [{"question" "A"}])
+          reply (clj->js {"answers" {"q0" "hi"} "outcome" "submitted"})
+          wrapped (clj->js {"answers" (.-answers reply) "outcome" "submitted"})
+          q (promesa.core/resolved norm)]
+      (promesa.core/then
+       (clarify/ask! norm (fn [_] wrapped))
+       (fn [r] (is (= "hi" (get-in (h/json-parse (str r)) ["responses" 0 "user_response"]))))))))
+
 (deftest recommended-label-never-leaks
   (is (= "b" (clarify/strip-recommended "b (Recommended)")))
   (is (= ["b (Recommended)" "a"] (clarify/mark-recommended ["b" "a"])))
