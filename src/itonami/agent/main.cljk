@@ -1224,14 +1224,23 @@
 
       (die 2 "usage: itonami-agent sessions [list] [--limit N] | show <id> | resume <id>"))))
 (defn model-cmd
-  "Hermes `hermes model` (show): the effective model/provider resolution with
-  the config layer each came from, and the hop chain. The setter lands with
-  config writing."
-  [opts _]
+  "Hermes `hermes model` (show) / `hermes model NAME` (set): the effective
+  model/provider resolution with the config layer each came from, and the hop
+  chain. Setting writes model.default (and model.provider with --provider)
+  into config.yaml textually — comments and formatting survive."
+  [opts args]
+  (when (< 1 (count args))
+    (die 2 "usage: itonami-agent model [NAME] [--provider P] [--profile P]"))
+  (when-let [name (first args)]
+    (when (str/blank? (str/trim name))
+      (die 2 "model name must be non-empty"))
+    (let [home (:home (profile/load-profile (or (:profile opts) "default") {:secrets? false}))]
+      (profile/set-config-model! home (str/trim name) (:provider opts))))
   (p/let [prof (profile/load-profile (or (:profile opts) "default") {:secrets? false})
           r (provider/resolution (:config prof) {:model (:model opts) :provider (:provider opts)})]
     (println (str "model:     " (get-in r [:model :value]) "   (" (get-in r [:model :source]) ")"))
     (println (str "provider:  " (get-in r [:provider :value]) "   (" (get-in r [:provider :source]) ")"))
+    (when (seq args) (println "(written to config.yaml)"))
     (println (str "chain:"))
     (doseq [[i h] (map-indexed vector (:hops r))]
       (println (str "  " (inc i) ". " (:provider h) "/" (:model h))))))

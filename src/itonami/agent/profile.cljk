@@ -180,6 +180,63 @@
   "Same set scripts/hermes-profile-repo.cljk keeps on the host."
   #{"secrets" "command_allowlist" "onboarding" "terminal" "skills"})
 
+
+(defn set-model-text
+  "Hermes `hermes model NAME` writes the default model into config.yaml.
+  The edit is TEXTUAL (like bundle-config-text): comments and formatting
+  outside the touched keys survive verbatim. Sets model.default and, when
+  given, model.provider — inside the existing model block, or a new block
+  appended at the end."
+  [text model provider]
+  (let [lines (str/split-lines (str text))
+        ;; locate the top-level model: block
+        start (first (keep-indexed (fn [i l] (when (= "model:" (str/trim l)) i)) lines))
+        block-end (if (nil? start)
+                    nil
+                    (or (first (for [i (range (inc start) (count lines))
+                                     :let [l (nth lines i)]
+                                     :when (and (re-matches #"^[A-Za-z_].*" l) (not (str/blank? l)))]
+                                 i))
+                        (count lines)))
+        set-key (fn [ls key value]
+                  (let [rx (re-pattern (str "^\\s+" key ":.*$"))
+                        idx (first (keep-indexed (fn [i l] (when (re-matches rx l) i)) ls))
+                        line (str "  " key ": " value)]
+                    (if (nil? idx)
+                      (conj (vec ls) line)
+                      (assoc (vec ls) idx line))))
+        new-block (cond-> ["model:"]
+                    true (set-key "default" model)
+                    (not (str/blank? (str provider))) (set-key "provider" provider))]
+    (cond
+      (nil? start)
+      (str (str/trim-newline (str text))
+           (when-not (str/blank? (str text)) "\n")
+           (str/join "\n" new-block) "\n")
+
+      :else
+      (let [head (subvec (vec lines) 0 start)
+            body (subvec (vec lines) start block-end)
+            tail (subvec (vec lines) block-end)
+            ;; keep any other keys in the block; default/provider are
+            ;; replaced in place — but a provider NOT given here is KEPT
+            ;; (a model-only write must not drop the configured provider)
+            old-provider (first (filter #(re-matches #"^\s+provider:.*$" %) body))
+            body (cond-> (vec (remove #(re-matches #"^\s+(default|provider):.*$" %) body))
+                   true (into (filter some? [(or (when-not (str/blank? (str provider)) (str "  provider: " provider))
+                                                 old-provider)
+                                             (str "  default: " model)])))]
+        (str (str/join "\n" (concat head body tail))
+             (when (seq lines) "\n"))))))
+
+(defn set-config-model!
+  "Persist the default model (and optional provider) in the profile's
+  config.yaml. Atomic: write to a sibling temp file, then rename."
+  [home model provider]
+  (let [p (h/join home "config.yaml")
+        text (if (h/file? p) (h/slurp p) "")]
+    (h/spit-atomic p (set-model-text text model provider))))
+
 (def job-definition-keys
   #{"id" "name" "prompt" "skills" "skill" "script" "no_agent" "schedule" "deliver" "enabled"
     "enabled_toolsets" "model" "provider" "base_url" "workdir" "context_from"})

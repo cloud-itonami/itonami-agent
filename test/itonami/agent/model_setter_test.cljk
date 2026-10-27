@@ -1,0 +1,47 @@
+(ns itonami.agent.model-setter-test
+  "hermes model NAME: the config.yaml edit is textual — comments and
+  formatting outside the touched keys survive verbatim."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            ["node:fs" :as fs]
+            [itonami.agent.profile :as profile]))
+
+(deftest set-model-text-edits-in-place
+  (testing "the default line is replaced; comments and sibling keys survive"
+    (let [in "# top comment\nmodel:\n  # what to run\n  provider: openrouter\n  default: old/model\nfallback:\n  - x\n"
+          out (profile/set-model-text in "new/model" nil)]
+      (is (str/includes? out "# top comment"))
+      (is (str/includes? out "# what to run"))
+      (is (str/includes? out "  default: new/model"))
+      (is (not (str/includes? out "old/model")))
+      (is (str/includes? out "fallback:\n  - x"))))
+
+  (testing "provider is written when given"
+    (let [out (profile/set-model-text "model:\n  default: a\n" "b" "prov")]
+      (is (str/includes? out "  provider: prov"))
+      (is (str/includes? out "  default: b"))))
+
+  (testing "no model block: one is appended after the existing text"
+    (let [out (profile/set-model-text "cron:\n  model: z\n" "m1" nil)]
+      (is (str/includes? out "cron:\n  model: z"))
+      (is (str/includes? out "model:\n  default: m1"))))
+
+  (testing "an empty config gets exactly the block"
+    (is (= "model:\n  default: m\n" (profile/set-model-text "" "m" nil))))
+
+  (testing "unknown keys in the block survive the rewrite"
+    (let [out (profile/set-model-text "model:\n  custom: keep\n  default: old\n" "new" nil)]
+      (is (str/includes? out "  custom: keep"))
+      (is (str/includes? out "  default: new")))))
+
+(deftest set-config-model-writes-and-reads-back
+  (let [home (str "/tmp/test-model-setter-" (.-pid js/process) "-" (random-uuid))]
+    (.mkdirSync fs home #js {:recursive true})
+    (profile/set-config-model! home "first/model" "prov1")
+    (let [cfg (profile/read-yaml-file (str home "/config.yaml"))]
+      (is (= "first/model" (get-in cfg ["model" "default"])))
+      (is (= "prov1" (get-in cfg ["model" "provider"]))))
+    (profile/set-config-model! home "second/model" nil)
+    (let [cfg (profile/read-yaml-file (str home "/config.yaml"))]
+      (is (= "second/model" (get-in cfg ["model" "default"])))
+      (is (= "prov1" (get-in cfg ["model" "provider"]))))))
