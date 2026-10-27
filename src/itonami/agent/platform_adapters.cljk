@@ -151,7 +151,8 @@
    "matrix" "MATRIX_ACCESS_TOKEN"
    "feishu" "FEISHU_TENANT_ACCESS_TOKEN"
    "dingtalk" "DINGTALK_ACCESS_TOKEN"
-   "wecom" "WECOM_ACCESS_TOKEN"})
+   "wecom" "WECOM_ACCESS_TOKEN"
+   "whatsapp" "WHATSAPP_ACCESS_TOKEN"})
 
 (defn token-env-name
   "The env var that carries this lane's token, or nil when the lane needs no
@@ -369,6 +370,45 @@
                          (str "wecom token exchange failed: HTTP " (.-status res)))))
               (.catch (fn [e] (str "wecom token exchange failed: " (.-message e))))))))))
 
+
+;; ---------------------------------------------------------------- whatsapp
+
+(defn whatsapp-request
+  "The WhatsApp Cloud API messages request (long-lived access token).
+  Pure. `to` is the reply route (the sender's phone number), and
+  phone_number_id is the REQUIRED sender identity in the URL path."
+  [token phone-number-id to text]
+  {:url (str "https://graph.facebook.com/v20.0/"
+             (js/encodeURIComponent (str phone-number-id)) "/messages")
+   :headers {"Authorization" (str "Bearer " token) "Content-Type" "application/json; charset=utf-8"}
+   :body (h/json-str {"messaging_product" "whatsapp"
+                      "to" (str to)
+                      "type" "text"
+                      "text" {"body" (str text)}})})
+
+(defn- whatsapp-send! [fetch-fn token phone-number-id to content]
+  (let [r (whatsapp-request token phone-number-id to content)]
+    (-> (fetch-fn (:url r) #js {:method "POST"
+                                :headers (clj->js (:headers r))
+                                :body (:body r)})
+        (.then (fn [res]
+                 (if (.-ok res)
+                   (js/Promise.resolve nil)
+                   (str "whatsapp messages failed: HTTP " (.-status res)))))
+        (.catch (fn [e] (str "whatsapp messages failed: " (.-message e)))))))
+
+(defn- whatsapp-adapter
+  "delivery.whatsapp: auth is the long-lived token (token_env default
+  WHATSAPP_ACCESS_TOKEN — the platform issues no per-send exchange; the
+  token is the transport). The sender identity (phone_number_id) is ALWAYS
+  required — it IS the URL. Credentials are env-only — never config."
+  [token phone-number-id chat-id]
+  (fn [_job _lane content opts]
+    (let [fetch-fn (or (:fetch opts) js/fetch)
+          chat-override (str (:chat-id opts))
+          chat (if (str/blank? chat-override) (str chat-id) chat-override)]
+      (whatsapp-send! fetch-fn token phone-number-id chat content))))
+
 (defn for-lane
   "The built-in adapter for a deliver lane, or nil when this lane has no
   configured platform. `config` is the profile's config.yaml map.
@@ -463,4 +503,16 @@
                      (and (not (str/blank? (str corp-id)))
                           (not (str/blank? (str corp-secret))))))
         (wecom-adapter token corp-id corp-secret agent-id chat-id)))
+    "whatsapp"
+    ;; direct long-lived token (the platform issues no per-send exchange);
+    ;; credentials ENV-ONLY (WHATSAPP_ACCESS_TOKEN — never config). The
+    ;; sender identity (phone_number_id) is REQUIRED — it is the URL.
+    (let [c (get-in config ["delivery" "whatsapp"])
+          token (h/env (token-env-name "whatsapp" config))
+          phone-number-id (get c "phone_number_id")
+          chat-id (get c "chat_id")]
+      (when (and (not (str/blank? (str chat-id)))
+                 (not (str/blank? (str phone-number-id)))
+                 (not (str/blank? (str token))))
+        (whatsapp-adapter token phone-number-id chat-id)))
     nil))
