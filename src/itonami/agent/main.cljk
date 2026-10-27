@@ -1235,10 +1235,15 @@
   ;; default while showing a different effective model would mislead
   (when (and (seq args) (:model opts))
     (die 2 "model NAME and -m/--model cannot combine: NAME writes the default, -m overrides one run"))
-  ;; --provider must be a real string (--provider=true parses as boolean) —
-  ;; on the SHOW path too, where it feeds provider/resolution
-  (when (and (some? (:provider opts)) (not (string? (:provider opts))))
-    (die 2 "--provider must be a name, not a flag value"))
+  ;; --provider keeps a VERBATIM string in both spellings (opt-value is not
+  ;; boolean here), so validate the VALUE: a flag-looking token (the
+  ;; `--provider --verbose` shape) or a blank is refused on the SHOW path
+  ;; too, where it feeds provider/resolution
+  (when (and (some? (:provider opts))
+             (or (not (string? (:provider opts)))
+                 (str/blank? (:provider opts))
+                 (str/starts-with? (str (:provider opts)) "-")))
+    (die 2 "--provider must be a provider name"))
   (when-let [name (first args)]
     (when (str/blank? (str/trim name))
       (die 2 "model name must be non-empty"))

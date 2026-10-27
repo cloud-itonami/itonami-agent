@@ -133,6 +133,19 @@
       (is (not (str/includes? out "second")))
       (is (= "NEW" (get-in (parse-yaml out) ["model" "default"])) "the reader resolves NEW"))))
 
+(deftest separators-are-transparent-and-comments-stay-real
+  (testing "'---' between opener and children does not end the block (the reader drops it)"
+    (let [out (profile/set-model-text "model:\n---\n  default: old\n" "NEW" nil)]
+      (is (= 1 (count (re-seq #"(?m)^\s+default:" out))))
+      (is (str/includes? out "  default: NEW"))
+      (is (not (str/includes? out "old")))))
+
+  (testing "a # inside a quoted value is not a comment start (no fabricated comments)"
+    (let [out (profile/set-model-text "model:\n  default: \"a # b\"\n" "NEW" nil)]
+      (is (= "model:\n  default: NEW\n" out)))
+    (let [out (profile/set-model-text "model:\n  default: \"a # b\" # real\n" "NEW" nil)]
+      (is (= "model:\n  default: NEW # real\n" out)))))
+
 (deftest config-mode-is-preserved
   (let [home (str "/tmp/test-model-mode-" (.-pid js/process) "-" (random-uuid))]
     (.mkdirSync fs home #js {:recursive true})

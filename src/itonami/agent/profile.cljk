@@ -216,8 +216,10 @@
   The edit is TEXTUAL (like bundle-config-text): comments, formatting and
   keys outside model.default/model.provider survive verbatim. The block is
   the top-level `model:` opener (a bare key, or one carrying a trailing
-  comment); its END is the next non-blank COLUMN-0 line (any top-level key
-  shape, including dotted/quoted keys, or a top-level comment). Keys are
+  comment); its END is the next non-blank COLUMN-0 NON-COMMENT, non-`---`
+  line (any top-level key shape, including dotted/quoted keys) — comments
+  and `---` separators are TRANSPARENT here exactly as the reader treats
+  them. Keys are
   replaced IN PLACE at the block's child indent (derived from the first
   non-comment indented line) — a provider not given here is kept."
   [text model provider]
@@ -227,7 +229,11 @@
         ;; column-0 non-comment line does (the R4 silent-no-op gate)
         top-line? (fn [l] (and (not (str/blank? l))
                                (not (re-matches #"\s+.*" l))
-                               (not (str/starts-with? (str/trim l) "#"))))
+                               (not (str/starts-with? (str/trim l) "#"))
+                               ;; the reader drops '---' before parsing: it
+                               ;; must not end the block either (the R5
+                               ;; silent-no-op class)
+                               (not= "---" (str/trim l))))
         ;; the top-level model: opener: `model:` alone, or with a trailing
         ;; comment (the reader's strip-comment accepts both). LAST wins —
         ;; the reader keeps the last duplicate mapping (the R4 block gate)
@@ -255,7 +261,19 @@
         ;; the key shapes the reader's split-key accepts: quoted (double or
         ;; single) or bare, with optional spaces before the colon
         key-rx (fn [k] (re-pattern (str "^" pad "(?:\"|')?" k "(?:\"|')?\\s*:.*$")))
-        trailing-comment (fn [l] (second (re-find #"(\s+#.*)$" l)))
+        ;; quote-aware (like the reader's strip-comment): a # inside a
+        ;; quoted value is not a comment start
+        trailing-comment (fn [l]
+                           (loop [i 0 in-q nil esc? false]
+                             (when (< i (count l))
+                               (let [c (nth l i)]
+                                 (cond
+                                   esc? (recur (inc i) in-q false)
+                                   (= c \") (recur (inc i) (when-not in-q \") false)
+                                   (and in-q (= c in-q)) (recur (inc i) nil false)
+                                   (and (not in-q) (= c \#) (or (zero? i) (= \  (nth l (dec i)))))
+                                   (subs l i)
+                                   :else (recur (inc i) in-q false))))))
         replace-key (fn [ls k value]
                       (let [rx (key-rx k)
                             hits (keep-indexed (fn [i l] (when (re-matches rx l) i)) ls)
@@ -266,7 +284,9 @@
                             ls (mapv #(nth ls %) keep)
                             idx (last (keep-indexed (fn [i l] (when (re-matches rx l) i)) ls))
                             comment (when idx (trailing-comment (nth ls idx)))
-                            line (str pad k ": " (yaml-scalar value) (or comment ""))]
+                            line (str pad k ": " (yaml-scalar value)
+                                      (when comment
+                                        (if (str/starts-with? comment " ") comment (str " " comment))))]
                         (if (nil? idx)
                           (conj (vec ls) line)
                           (assoc (vec ls) idx line))))]
@@ -295,8 +315,9 @@
   config.yaml. Atomic: write to a sibling temp file, then rename. The file's
   MODE is preserved (config.yaml can hold literal auth headers — the repo
   convention for such files is 0600, and a rename-replace would otherwise
-  silently loosen a stricter operator mode to umask 0644); a symlink is
-  followed to its target so the link itself is never replaced."
+  silently loosen a stricter operator mode to umask 0644); a  symlink is
+  followed to its target so the link itself is normally not replaced (a
+  DANGLING link cannot be followed and is replaced — documented)."
   [home model provider]
   (let [p (h/join home "config.yaml")
         st (try (fs/lstatSync p) (catch :default _ nil))
@@ -309,8 +330,12 @@
     ;; the tmp file is created OWNER-ONLY before any secret content lands
     ;; (the R4 gate: umask 0644 must never hold config text) and renamed
     ;; into place; the target keeps its own mode
-    (fs/writeFileSync tmp (set-model-text text model provider) #js {:mode mode})
-    (fs/renameSync tmp p)
+    (try
+      (fs/writeFileSync tmp (set-model-text text model provider) #js {:mode mode})
+      (fs/renameSync tmp p)
+      (catch :default e
+        (try (fs/unlinkSync tmp) (catch :default _ nil))
+        (throw e)))
     (fs/chmodSync p mode)
     p))
 
