@@ -61,6 +61,12 @@
   "Intake guard: how many update ids per platform are remembered for dedup."
   512)
 
+(defn- err-str
+  "A rejection's message text — `(.-message e)` is undefined for non-Error
+  rejections."
+  [e]
+  (str (or (.-message e) e)))
+
 (defn guard-message
   "Hermes' intake guards (the base adapter side): a message already seen is
   dropped, an empty or oversized text is dropped. Returns `{:ok msg}` or
@@ -103,7 +109,9 @@
 ;; ---------------------------------------------------------------- history
 
 (defn- history-path [home platform chat-id]
-  (h/join home "chat" (str platform "-" (str/replace (str chat-id) #"[^A-Za-z0-9_-]" "_") ".jsonl")))
+  ;; both segments are sanitized: neither may escape home/chat
+  (h/join home "chat" (str (str/replace (str platform) #"[^A-Za-z0-9_-]" "_") "-"
+                           (str/replace (str chat-id) #"[^A-Za-z0-9_-]" "_") ".jsonl")))
 
 (defn load-history
   "The chat's user/assistant transcript ({\"role\" \"content\"} rows), newest
@@ -183,7 +191,7 @@
                                                           {:status :replied :reply final}
                                                           {:status :send-failed :reply final :error (str res)})))
                                               (p/catch (fn [e]
-                                                         {:status :send-failed :reply final :error (.-message e)})))
+                                                         {:status :send-failed :reply final :error (err-str e)})))
                                           (-> (send! prof msg (str "The turn failed: " (:exit-reason r)
                                                               (when-let [e (get-in r [:error :error])] (str " — " e))))
                                               (p/then (fn [res]
@@ -191,10 +199,10 @@
                                                          :notice (if (nil? res) :delivered (str res))}))
                                               (p/catch (fn [e]
                                                          {:status :turn-failed :exit-reason (:exit-reason r)
-                                                          :notice (str (.-message e))})))))))
+                                                          :notice (str (err-str e))})))))))
                             (p/catch (fn [e]
-                                       (emit {:event :turn-error :msg msg :error (.-message e)})
-                                       (p/resolved {:status :turn-failed :error (.-message e)}))))))))
+                                       (emit {:event :turn-error :msg msg :error (err-str e)})
+                                       (p/resolved {:status :turn-failed :error (err-str e)}))))))))
         pop-next! (fn [k]
                     ;; atomic: one compare-and-set takes the head, never a
                     ;; side effect inside swap!
@@ -234,7 +242,7 @@
                       (p/then (fn [_] (run-one msg)))
                       (p/then (fn [r] (res-fn r) (pump! k)))
                       (p/catch (fn [e]
-                                 (res-fn {:status :turn-failed :error (.-message e)})
+                                 (res-fn {:status :turn-failed :error (err-str e)})
                                  (pump! k))))
                   (when-not (release! k)
                     (pump! k))))]
@@ -243,8 +251,9 @@
     (fn dispatch [platform raw]
       (let [msg (normalize platform raw)]
         (if (nil? msg)
-          (do (emit {:event :drop :reason "no-turn"})
-              (p/resolved {:status :dropped :reason "no-turn"}))
+          (let [reason (if (contains? platform-adapters platform) "no-turn" "unknown-platform")]
+            (emit {:event :drop :reason reason})
+            (p/resolved {:status :dropped :reason reason}))
           (let [g (guard-message seen msg)]
             (if (:drop g)
               (do (emit {:event :drop :reason (:drop g)})
@@ -279,7 +288,7 @@
                        :offset (if (seq ids)
                                  (inc (apply max ids))
                                  (or offset 0))}))))
-        (p/catch (fn [e] {:error (.-message e) :updates [] :offset (or offset 0)})))))
+        (p/catch (fn [e] {:error (err-str e) :updates [] :offset (or offset 0)})))))
 
 (defn telegram-token
   "The bot token for a telegram session: the env named by
@@ -294,8 +303,10 @@
   "The reply through the platform's existing send adapter (the same one the
   cron delivery queue uses), addressed to the MESSAGE'S chat — a
   `gateway.routes`-routed chat must never leak into the profile's configured
-  delivery chat. `prof` is the owning profile (same position as `send!`'s
-  first argument). Resolves to nil on success or the adapter's error string."
+  delivery chat. Webhook-style sends have one fixed target, so the adapter
+  REFUSES a chat it does not serve rather than posting into the configured
+  channel. `prof` is the owning profile (same position as `send!`'s first
+  argument). Resolves to nil on success or the adapter's error string."
   ([prof msg text] (send-reply! prof msg text nil))
   ([prof msg text fetch]
    (let [platform (get msg "platform")

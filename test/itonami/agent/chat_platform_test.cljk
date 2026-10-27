@@ -244,6 +244,28 @@
                        (done)))
           (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
 
+(deftest webhook-platforms-refuse-misdirected-replies
+  (async done
+    ;; regression: a webhook has one fixed target — a reply for another chat
+    ;; is refused (fail closed), never posted into the configured channel
+    (let [called (atom false)
+          fake-fetch (fn [_ _] (reset! called true) (p/resolved #js {:ok true :status 200}))
+          prof {:name "alpha"
+                :config {"delivery" {"mattermost" {"webhook_url" "https://mm.example/hook"
+                                                   "chat_id" "mm-chat"}}}
+                :home "/tmp"}]
+      (-> (chat/send-reply! prof {"platform" "mattermost" "chat_id" "other-chat"} "hi" fake-fetch)
+          (p/then (fn [res]
+                    (is (re-find #"refusing" (str res)))
+                    (is (false? @called))))
+          (p/then (fn [_] (chat/send-reply! prof {"platform" "mattermost" "chat_id" "mm-chat"} "hi" fake-fetch)))
+          (p/then (fn [res]
+                    (testing "the chat the webhook serves is sent normally"
+                      (is (nil? res))
+                      (is (true? @called)))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
 (deftest dispatch-rejecting-send-is-send-failed
   (async done
     (let [home (tmp-home "reject")
