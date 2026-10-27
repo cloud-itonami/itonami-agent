@@ -1,0 +1,80 @@
+(ns itonami.agent.clarify-test
+  "Hermes tools/clarify_tool.py semantics: normalization errors name their
+  index, the recommendation label never leaks into user_response, and an
+  unavailable surface answers the honest string."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [itonami.agent.clarify :as clarify]
+            [itonami.agent.host :as h]))
+
+(deftest normalize-errors-name-their-index
+  (testing "shape errors"
+    (is (re-find #"non-empty array" (str (second (clarify/normalize-questions [])))))
+    (is (re-find #"non-empty array" (str (second (clarify/normalize-questions "x")))))
+    (is (re-find #"at most 5" (str (second (clarify/normalize-questions (vec (repeat 6 {"question" "q"}))))))))
+  (testing "per-entry errors"
+    (is (re-find #"questions\[0\] must be an object" (str (second (clarify/normalize-questions ["x"])))))
+    (is (re-find #"questions\[1\]\.question must be non-empty" (str (second (clarify/normalize-questions [{"question" "a"} {"question" "  "}])))))
+    (is (re-find #"questions\[0\]\.choices must be a list of strings" (str (second (clarify/normalize-questions [{"question" "a" "choices" "x"}])))))
+    (is (re-find #"questions\[0\]\.choices must be a list of strings" (str (second (clarify/normalize-questions [{"question" "a" "choices" [1]}])))))
+    (is (re-find #"over 8000 characters" (str (second (clarify/normalize-questions [{"question" "a" "choices" [(apply str (repeat 8001 "x"))]}])))))
+    (is (re-find #"all are blank" (str (second (clarify/normalize-questions [{"question" "a" "choices" ["  " ""]}])))))))
+
+(deftest normalize-shape
+  (let [[norm err] (clarify/normalize-questions [{"question" " Pick? " "choices" ["b" "a"] "multi_select" true}
+                                                 {"question" "Open"}])]
+    (is (nil? err))
+    (let [q0 (first norm) q1 (second norm)]
+      (is (= "q0" (get q0 "qid")))
+      (is (= "q1" (get q1 "qid")))
+      (is (= "Pick?" (get q0 "question")))
+      (testing "the first choice is marked, choices_offered stays bare"
+        (is (str/ends-with? (str (first (get q0 "choices"))) "(Recommended)"))
+        (is (= ["b" "a"] (get q0 "choices_offered"))))
+      (testing "multi_select only with choices"
+        (is (true? (get q0 "multi_select")))
+        (is (false? (get q1 "multi_select"))))
+      (testing "a lone choice is left untouched"
+        (let [[one _] (clarify/normalize-questions [{"question" "x" "choices" ["only"]}])]
+          (is (= ["only"] (get (first one) "choices"))))))))
+
+(deftest recommended-label-never-leaks
+  (is (= "b" (clarify/strip-recommended "b (Recommended)")))
+  (is (= ["b (Recommended)" "a"] (clarify/mark-recommended ["b" "a"])))
+  (testing "marking is idempotent"
+    (is (= (clarify/mark-recommended ["b" "a"])
+           (clarify/mark-recommended (clarify/mark-recommended ["b" "a"]))))))
+
+(deftest result-statuses
+  (let [[norm _] (clarify/normalize-questions [{"question" "A" "choices" ["yes" "no"]}
+                                               {"question" "B"}
+                                               {"question" "C"}])
+        reply {"answers" {"q0" "yes (Recommended)" "q2" ""}
+               "outcome" "answered"
+               "notice" "timed out"}
+        parsed (h/json-parse (clarify/result-json norm reply))]
+    (is (= "answered" (get-in parsed ["responses" 0 "status"])))
+    (is (= "yes" (get-in parsed ["responses" 0 "user_response"])))
+    (is (= "unanswered" (get-in parsed ["responses" 1 "status"])))
+    (is (nil? (get-in parsed ["responses" 1 "user_response"])))
+    (is (= "skipped" (get-in parsed ["responses" 2 "status"])))
+    (is (= "answered" (get parsed "outcome")))
+    (is (= "timed out" (get parsed "notice")))))
+
+(deftest ask-contracts
+  (testing "no callback -> the honest unavailability error"
+    (is (re-find #"not available in this execution context"
+                 (str (h/json-parse (clarify/ask! [{"question" "Q"}] nil))))))
+  (testing "a stub callback receives the normalized list and its reply is shaped"
+    (let [seen (atom nil)
+          out (h/json-parse (clarify/ask! [{"question" "Q" "choices" ["a" "b"]}]
+                                          (fn [norm]
+                                            (reset! seen norm)
+                                            {"answers" {"q0" "a"} "outcome" "answered"})))]
+      (is (= "q0" (get-in @seen [0 "qid"])))
+      (is (= "answered" (get-in out ["responses" 0 "status"])))
+      (is (= "a" (get-in out ["responses" 0 "user_response"])))))
+  (testing "bad input beats the callback (validation first)"
+    (let [called (atom false)]
+      (clarify/ask! [] (fn [_] (reset! called true)))
+      (is (false? @called)))))

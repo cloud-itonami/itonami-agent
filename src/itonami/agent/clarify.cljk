@@ -1,0 +1,156 @@
+(ns itonami.agent.clarify
+  "Hermes tools/clarify_tool.py, verbatim core: structured multiple-choice /
+  open-ended questions to the user. Schema and validation live here; the UI is
+  a platform-injected callback (chat readline / the bridge's request row), and
+  a run with no callback answers the honest unavailability string."
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]))
+
+(def max-choices 4)   ;; the UI always appends an Other row
+(def max-questions 5)
+(def max-choice-chars 8000)
+(def recommended-label "(Recommended)")
+(def unavailable "Clarify tool is not available in this execution context.")
+(def shape "Pass questions=[{question, choices?, multi_select?}]; a single question is a one-entry array.")
+
+(defn strip-recommended
+  "Remove the recommendation label so presentation never leaks into
+  `user_response`."
+  [text]
+  (let [s (str/trim (str text))
+        lab recommended-label]
+    (if (str/ends-with? (str/lower-case s) (str/lower-case lab))
+      (str/trim (subs s 0 (- (count s) (count lab))))
+      s)))
+
+(defn mark-recommended
+  "Suffix the first choice (schema says best-first) with the recommendation
+  label; idempotent, and a lone choice is left untouched."
+  [choices]
+  (let [choices (vec choices)
+        first0 (str/trim (str (first choices)))]
+    (if (or (< (count choices) 2)
+            (not= first0 (strip-recommended first0)))
+      choices
+      (into [(str first0 " " recommended-label)] (rest choices)))))
+
+(defn- clean-answer
+  "Strip presentation (the label, multi-select JSON) from a locked answer: a
+  multi-select answer is a list, a JSON array string, or one typed answer."
+  [raw multi?]
+  (if-not multi?
+    (strip-recommended raw)
+    (let [items (cond
+                  (array? raw) (vec raw)
+                  (sequential? raw) (vec raw)
+                  (string? raw) (try (let [p (h/json-parse raw)]
+                                       (if (array? p) (vec p) [raw]))
+                                     (catch :default _ [raw]))
+                  :else [raw])]
+      (mapv strip-recommended items))))
+
+(defn- normalize-item
+  "One question entry -> [entry error]."
+  [index item]
+  (let [text (str/trim (str (get item "question")))]
+    (cond
+      (not (map? item))
+      [nil (str "questions[" index "] must be an object. " shape)]
+
+      (str/blank? text)
+      [nil (str "questions[" index "].question must be non-empty text.")]
+
+      :else
+      (let [choices (get item "choices")]
+        (if (nil? choices)
+          [{"qid" (str "q" index)
+            "question" text
+            "choices" nil
+            "choices_offered" nil
+            "multi_select" false} nil]
+          (cond
+            (or (not (sequential? choices)) (some (fn [c] (not (string? c))) choices))
+            [nil (str "questions[" index "].choices must be a list of strings.")]
+
+            (some (fn [c] (< max-choice-chars (count (str/trim c)))) choices)
+            [nil (str "questions[" index "].choices contains an entry over " max-choice-chars
+                      " characters; the limit is " max-choice-chars
+                      ". Move detail into the question text and resend.")]
+
+            :else
+            (let [cleaned (vec (take max-choices (remove str/blank? (map str/trim choices))))]
+              (if (and (seq choices) (empty? cleaned))
+                [nil (str "questions[" index "].choices has " (count choices)
+                          " entries but all are blank. Send real labels, or omit choices to ask open-ended.")]
+                (let [offer (when (seq cleaned) cleaned)]
+                  [{"qid" (str "q" index)
+                    "question" text
+                    "choices" (when offer (mark-recommended offer))
+                    "choices_offered" offer
+                    "multi_select" (boolean (and (get item "multi_select") offer))} nil])))))))))
+
+(defn normalize-questions
+  "Hermes `_normalize_questions`: -> [normalized error]. Entries carry qid
+  (stable wire id q<index>), question, decorated choices, bare choices_offered
+  and multi_select."
+  [questions]
+  (cond
+    (or (not (sequential? questions)) (empty? questions))
+    [nil (str "questions must be a non-empty array. " shape)]
+
+    (< max-questions (count questions))
+    [nil (str "questions supports at most " max-questions " items.")]
+
+    :else
+    (reduce (fn [acc pair]
+              (let [index (first pair)
+                    item (second pair)
+                    [entry error] (normalize-item index item)]
+                (if error
+                  (reduced [nil error])
+                  (update acc 0 conj entry))))
+            [[] nil]
+            (map-indexed vector questions))))
+
+(defn- response-status
+  [qid answers multi?]
+  (let [raw (get answers qid)
+        cleaned (when-not (or (nil? raw) (= "" raw)) (clean-answer raw multi?))]
+    (if (and cleaned (if (sequential? cleaned) (seq cleaned) (not (str/blank? (str cleaned)))))
+      ["answered" cleaned]
+      [(if (contains? answers qid) "skipped" "unanswered") nil])))
+
+(defn result-json
+  "Hermes `_result`: every response carries status and user_response (null
+  unless answered); outcome says how the wait ended and notice (surface-
+  supplied) says why."
+  [normalized reply]
+  (let [answers (or (get reply "answers") {})
+        responses (mapv (fn [entry]
+                          (let [[status value] (response-status (get entry "qid") answers (get entry "multi_select"))]
+                            {"question" (get entry "question")
+                             "choices_offered" (get entry "choices_offered")
+                             "status" status
+                             "user_response" value}))
+                        normalized)
+        result (cond-> {"responses" responses "outcome" (get reply "outcome")}
+                 (not (str/blank? (str (get reply "notice")))) (assoc "notice" (str (get reply "notice"))))]
+    (h/json-str result)))
+
+(defn ask!
+  "Hermes `clarify_tool`: ask 1-5 questions in one call. `callback` is
+  platform-injected and receives the normalized list and answers with a reply
+  map whose `answers` key maps qid -> the raw answer (or nil), plus `outcome`
+  and an optional `notice`. No callback -> the honest unavailability string.
+  Errors are the standard tool-error JSON map, like every tool error."
+  [questions callback]
+  (let [[normalized error] (normalize-questions questions)]
+    (cond
+      error (h/json-str {"error" error})
+      (nil? callback) (h/json-str {"error" unavailable})
+      :else
+      (try
+        (let [reply (callback normalized)]
+          (result-json normalized (if (map? reply) reply {})))
+        (catch :default e
+          (h/json-str {"error" (str "clarify callback failed: " (or (.-message e) e))}))))))
