@@ -1,0 +1,56 @@
+(ns itonami.agent.feishu-plate-test
+  "JUN-471 feishu plate: the delivery send (pure request), the auth
+  transport (token exchange), and the inbound normalize — one platform
+  lands as inbound + lane + auth together."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [itonami.agent.host :as h]
+            [itonami.agent.platform-adapters :as platforms]
+            [itonami.agent.chat-platform :as chat]))
+
+(deftest feishu-requests-are-pure-and-correct
+  (testing "the send request is the im/v1/messages shape with a JSON-string content"
+    (let [r (platforms/feishu-request "tok" "oc_1" "hello")]
+      (is (str/includes? (:url r) "/im/v1/messages?receive_id_type=chat_id"))
+      (is (= "Bearer tok" (get-in r [:headers "Authorization"])))
+      (let [body (h/json-parse (:body r))]
+        (is (= "oc_1" (get body "receive_id")))
+        (is (= "text" (get body "msg_type")))
+        (is (= "hello" (get (h/json-parse (str (get body "content"))) "text"))))))
+  (testing "the auth transport is the tenant_access_token exchange"
+    (let [r (platforms/feishu-token-request "app-id" "app-secret")]
+      (is (str/includes? (:url r) "/auth/v3/tenant_access_token/internal"))
+      (let [body (h/json-parse (:body r))]
+        (is (= "app-id" (get body "app_id")))
+        (is (= "app-secret" (get body "app_secret")))))))
+
+(deftest feishu-normalize-maps-im-message-events
+  (let [event {"header" {"event_type" "im.message.receive_v1" "event_id" "evt1"}
+               "event" {"message" {"message_id" "m1" "chat_id" "oc_1" "message_type" "text"
+                                   "content" "{\"text\": \"hi there\"}" "thread_id" "t1"}
+                        "sender" {"sender_id" {"open_id" "ou_1"}}}}]
+    (testing "a text message becomes the platform-agnostic inbound map"
+      (let [m (chat/feishu-normalize event)]
+        (is (= "feishu" (get m "platform")))
+        (is (= "hi there" (get m "text")))
+        (is (= "oc_1" (get m "chat_id")))
+        (is (= "ou_1" (get m "user_id")))
+        (is (= "m1" (get m "message_id")))))
+    (testing "other event types and non-text messages carry no turn"
+      (is (nil? (chat/feishu-normalize (assoc-in event ["header" "event_type"] "im.chat.updated"))))
+      (is (nil? (chat/feishu-normalize (assoc-in event ["event" "message" "message_type"] "image")))))
+    (testing "the platform entry wires normalize"
+      (is (fn? (get-in chat/platform-adapters ["feishu" :normalize]))))))
+
+(deftest feishu-lane-resolves-with-token-or-exchange
+  (testing "a direct token (from the env default) and chat_id resolve an adapter"
+    (with-redefs [h/env (fn [k] (when (= k "FEISHU_TENANT_ACCESS_TOKEN") "tok"))]
+      (is (fn? (platforms/for-lane "feishu" {"delivery" {"feishu" {"chat_id" "oc_1"}}})))))
+  (testing "ENV app credentials resolve the exchange-backed adapter (never config)"
+    (with-redefs [h/env (fn [k] (case k "FEISHU_APP_ID" "a" "FEISHU_APP_SECRET" "s" nil))]
+      (is (fn? (platforms/for-lane "feishu" {"delivery" {"feishu" {"chat_id" "oc_1"}}})))
+      ;; and config-held credentials are NOT read at all
+      (with-redefs [h/env (fn [_] nil)]
+        (is (nil? (platforms/for-lane "feishu" {"delivery" {"feishu" {"chat_id" "oc_1" "app_id" "a" "app_secret" "s"}}}))))))
+  (testing "no chat_id means no adapter — never a send into the void"
+    (is (nil? (platforms/for-lane "feishu" {"delivery" {"feishu" {"app_id" "a" "app_secret" "s"}}})))))
