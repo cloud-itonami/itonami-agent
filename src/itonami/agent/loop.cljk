@@ -430,7 +430,13 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
   "The MERGED write itself — caller must hold the lock."
   []
   (let [on-disk (load-delegate-state)
-        merged-children (merge (get on-disk "children") @delegate-children)
+        ;; MERGE BY recency: a stale in-memory record must never overwrite a
+        ;; newer on-disk one (the R6 gate) — higher updated_at wins; records
+        ;; without a stamp lose to any stamped one
+        newer? (fn [a b] (>= (or (get a "updated_at") 0) (or (get b "updated_at") 0)))
+        merged-children (merge-with (fn [a b] (if (newer? a b) a b))
+                                    (get on-disk "children")
+                                    @delegate-children)
         merged-delivered (into (set (get on-disk "delivered")) @delegate-delivered)]
     (h/spit-atomic (delegate-state-file)
                    (h/json-str {"children" merged-children
@@ -486,7 +492,14 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                           (assoc c "subagent_id" id)))]
                        (when (seq pending)
                          (swap! delegate-delivered into (map #(get % "subagent_id") pending))
-                         (write-merged-registry!))
+                         ;; the ack write must not CRASH ask nor swallow the
+                         ;; results (the R6 gate): a delivery that happened
+                         ;; is returned even if persisting it failed — the
+                         ;; failure is loud, the alternative is losing the
+                         ;; results entirely
+                         (try (write-merged-registry!)
+                              (catch :default e
+                                (js/console.error (str "delegate delivery ack failed: " (or (.-message e) e))))))
                        pending)))]
      (if (= outcome ::busy)
        (throw (js/Error. "delegate registry busy — cannot fetch pending results safely"))
@@ -622,11 +635,11 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                          (swap! delegate-children assoc id {"goal" goal
                                                                             "status" (get base "status")
                                                                             "summary" (get base "summary")
-                                                                            ;; session scoping (the R2
-                                                                            ;; security gate): a result is
-                                                                            ;; delivered to its OWN
-                                                                            ;; session only
-                                                                            "session_key" (str (or (:session-key parent-options) ""))})
+                                                                            "session_key" (str (or (:session-key parent-options) ""))
+                                                                            ;; per-record stamp: the merge
+                                                                            ;; keeps the NEWER record (the
+                                                                            ;; R6 stale-writer gate)
+                                                                            "updated_at" (h/now-ms)})
                                          ;; the RESULT must survive the run
                                          ;; ending (the R1 gate: the success
                                          ;; path is the one that carries the

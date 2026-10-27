@@ -46,6 +46,17 @@
       ;; and neither session can pull the other's after delivery
       (is (= [] (vec (loop/delegate-pending-results! "sess-A")))))))
 
+(deftest merge-keeps-the-newer-record
+  ;; the R6 stale-writer gate: a stale in-memory record must never overwrite
+  ;; a NEWER on-disk one (updated_at decides)
+  (h/spit-atomic (loop/delegate-state-file)
+                 (h/json-str {"children" {"kid" {"goal" "g" "status" "completed" "summary" "newer on disk" "session_key" "" "updated_at" 2000}}
+                              "delivered" []}))
+  (with-redefs [loop/delegate-children (atom {"kid" {"goal" "g" "status" "running" "summary" "stale in memory" "session_key" "" "updated_at" 1000}})
+                loop/delegate-delivered (atom #{})]
+    (loop/persist-delegate-state!))
+  (is (= "newer on disk" (get-in (get (loop/load-delegate-state) "children") ["kid" "summary"]))))
+
 (deftest the-session-key-is-asserted-not-assumed
   (h/spit-atomic (loop/delegate-state-file) (h/json-str {"children" {} "delivered" []}))
   ;; kbb/SCI binds missing args to nil — the requirement must be RUNTIME
