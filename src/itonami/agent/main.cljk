@@ -26,6 +26,7 @@
     itonami-agent profile bundle <p>                        print the bundle CID and file list
     itonami-agent profile refresh-bundle <p>                recompute CID after profile files change
     itonami-agent gateway run [--interval 60]               tick every adopted profile (resident)
+    itonami-agent doctor [--profile P]          named findings, exit 1 when any
     itonami-agent sessions [list] [--limit N] | show <id> | resume <id>
     itonami-agent model | fallback [--profile P]   show the effective resolution
     itonami-agent status | pause [reason] | resume
@@ -66,6 +67,7 @@
             [itonami.agent.rails :as rails]
             [itonami.agent.provider :as provider]
             [itonami.agent.chat-platform :as chat]
+            [itonami.agent.platform-adapters :as platforms]
             [itonami.agent.pause :as pause]
             ["node:readline" :as readline]
             ["node:crypto" :as crypto]))
@@ -1078,6 +1080,50 @@
              "resumed — emergency stop lifted"
              "nothing to resume (not paused)")))
 
+(defn doctor-cmd
+  "Hermes `hermes doctor`: what is configured and what is missing — findings
+  named by code, exit 1 when any. Reads only (no secrets): it starts nothing
+  and changes no profile."
+  [opts _]
+  (p/let [loaded (try {:prof (profile/load-profile (or (:profile opts) "default") {:secrets? false})}
+                      (catch :default e
+                        {:failure (str (or (.-message e) e))}))
+          _ (when-let [f (:failure loaded)]
+              ;; a profile that will not load (e.g. a malformed jobs.json,
+              ;; which load-profile parses) is a NAMED finding, not a raw die
+              (println (str "profile-load-failed: " (subs f 0 (min 200 (count f)))))
+              (println "1 finding(s)")
+              (js/process.exit 1))
+          prof (:prof loaded)
+          home (:home prof)
+          cfg (:config prof)
+          readiness (vec (profile-readiness-issues prof))
+          ;; no PROFILE-level model resolves (job-level pins are per-job and
+          ;; not inspected here): cron.model -> model.default
+          model-issue (when (and (str/blank? (str (get-in cfg ["model" "default"])))
+                                 (str/blank? (str (get-in cfg ["cron" "model"])))
+                                 (str/blank? (str (:model opts))))
+                        {:code :no-model
+                         :detail "model.default is not set — resolution is unset"})
+          token-issues (when (map? (get cfg "delivery"))
+                         (for [[lane _c] (get cfg "delivery")
+                               :let [envn (platforms/token-env-name lane cfg)]
+                               :when (and envn (str/blank? (str (h/env envn))))]
+                           {:code :missing-token
+                            :detail (str "delivery." lane " needs env " envn " (unset)")}))
+          db-issue (when-not (h/file? (h/join home "state.db"))
+                     {:code :no-state-db
+                      :detail "state.db missing — sessions / session_search will be empty"})
+          pause-note (when (pause/active?)
+                       {:code :paused :detail (str "emergency stop is set (" (pause/since) ")")})
+          findings (vec (concat readiness
+                               (keep identity [model-issue db-issue pause-note])
+                               token-issues))]
+    (if (seq findings)
+      (do (doseq [f findings] (println (str (name (:code f)) ": " (:detail f))))
+          (println (str (count findings) " finding(s)"))
+          (js/process.exit 1))
+      (println "ok"))))
 (defn sessions-cmd
   "Hermes `hermes sessions` (list/show): this profile's conversations from
   state.db. `resume` lands with history re-entry."
@@ -1347,6 +1393,7 @@
               "dapps" (dapps-cmd opts (rest pos))
               "cron" (cron-cmd opts (rest pos))
               "profile" (profile-cmd opts (rest pos))
+              "doctor" (doctor-cmd opts (rest pos))
               "sessions" (sessions-cmd opts (rest pos))
               "model" (model-cmd opts (rest pos))
               "fallback" (fallback-cmd opts (rest pos))
