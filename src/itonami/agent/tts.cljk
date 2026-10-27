@@ -57,7 +57,8 @@
   bind it to nil under kbb/SCI). Resolves
   to a map naming path and format, or a map
   naming the error — a named outcome either way, never a guessed artifact."
-  [config home {:strs [text voice model] :as args} fetch writable?]
+  ([config home args fetch] (synthesize! config home args fetch nil))
+  ([config home {:strs [text voice model] :as args} fetch writable?]
   ;; `format` is pulled by key — destructuring it would shadow clojure.core
   (let [cfg (configured config)
         fmt-in (let [f (str (get args "format"))] (if (str/blank? f) "mp3" f))
@@ -99,8 +100,11 @@
                   ;; never fires and the fetch stays unbounded. (The timer is
                   ;; cleared on BOTH outcomes; p/finally is avoided: it
                   ;; breaks value propagation through p/catch in this build.)
-                  timer (js/setTimeout (fn [] (.abort ctl))
-                                       (* 1000 (or (:timeout-s hop) 900)))]
+                  ;; a non-numeric request_timeout_seconds must not throw
+                  ;; or NaN the delay — clamp like backoff-ms does
+                  timeout-s (let [t (:timeout-s hop)]
+                              (if (and (number? t) (pos? t)) t 900))
+                  timer (js/setTimeout (fn [] (.abort ctl)) (* 1000 timeout-s))]
               (-> (fetch (:url req) (clj->js {:method "POST"
                                               :headers (clj->js (:headers req))
                                               :body (:body req)
@@ -131,7 +135,12 @@
                                   (if (and writable? (not (writable? out-path)))
                                     {"error" "speech write refused: outside the permitted roots"}
                                     (do (h/mkdirs out-dir)
-                                        (fs/writeFileSync out-path (js/Buffer.from buf))
+                                        ;; tmp+rename: a concurrent
+                                        ;; reader never sees a
+                                        ;; half-written cache file
+                                        (let [tmp (str out-path ".tmp-" (.-pid js/process))]
+                                          (fs/writeFileSync tmp (js/Buffer.from buf))
+                                          (fs/renameSync tmp out-path))
                                         ;; the CALLER records this as a run
                                         ;; write (tools.cljk) — tts cannot
                                         ;; require tools (cycle)
@@ -143,4 +152,4 @@
                                         (js/clearTimeout timer)
                                         {"error" (str "speech read failed: " (or (.-message e) e))})))
                          (do (js/clearTimeout timer)
-                             {"error" (str "speech request failed: HTTP " (.-status r))})))))))))))))
+                             {"error" (str "speech request failed: HTTP " (.-status r))}))))))))))))))

@@ -591,7 +591,11 @@ plain: true
               cmds (filter #(string? (get % "cmd")) recs)]
           (is (every? #(= (name (confine/backend)) (get % "sandbox")) (filter #(= "terminal" (get % "tool")) recs)))
           (is (some #(and (get % "suspected_denial") (str/includes? (get % "cmd") "ENCRYPTED")) cmds))
-          (is (not (get (first (filter #(str/includes? (get % "cmd") "echo built") cmds)) "suspected_denial")))))
+          ;; assert the record EXISTS too — a filter match of nothing would
+          ;; pass the negation vacuously
+          (let [built (first (filter #(str/includes? (get % "cmd") "echo built") cmds))]
+            (is (some? built))
+            (is (not (get built "suspected_denial"))))))
 
       (testing "the per-run TMPDIR is writable and removed afterwards"
         (let [out (get (term ctx "echo t > \"$TMPDIR/t\" && cat \"$TMPDIR/t\" && echo \"$TMPDIR\"") "output")
