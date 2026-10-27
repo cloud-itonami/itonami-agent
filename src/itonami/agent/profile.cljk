@@ -202,14 +202,51 @@
 (defn- yaml-scalar
   "Write a value as a safe YAML scalar: plain ONLY when the project's own
   scalar reader will hand it back as the same string (reader-coerces? is
-  that reader's exact coercion set), otherwise a JSON double-quoted string
-  (YAML 1.2 superset) — `: `, `#` and newlines can never corrupt the line."
+  that reader's exact coercion set). Otherwise a DOUBLE-QUOTED scalar
+  escaped with exactly the four escapes the reader's unquote-double decodes
+  (backslash-n, backslash-t, backslash-quote, backslash-backslash) — a JSON
+  escape like backslash-r would round-trip to the WRONG string (the R9
+  gate). Any other control character cannot round-trip at all: the write is
+  refused, never silently corrupted."
   [v]
   (let [s (str v)]
     (if (and (re-matches #"[A-Za-z0-9._/-]+" s)
              (not (reader-coerces? s)))
       s
-      (js/JSON.stringify s))))
+      (do
+        (when (some #(re-matches #"[\x00-\x08\x0b-\x0d\x0e-\x1f\x7f]" (str %)) s)
+          (throw (js/Error. "this value contains a control character config.yaml cannot round-trip")))
+        (str (char 34)
+             (-> s
+                 (str/replace (str (char 92)) (str (char 92) (char 92)))
+                 (str/replace (str (char 34)) (str (char 92) (char 34)))
+                 (str/replace "\n" (str (char 92) "n"))
+                 (str/replace "\t" (str (char 92) "t")))
+             (char 34))))))
+
+(defn- line-unclosed-value?
+  "TRUE when this line's value is a quoted scalar the reader cannot close:
+  the first unescaped closing quote must be followed only by whitespace or a
+  comment to EOL (yaml.cljk's unclosed-quote?/join-raw fold contract). A
+  quoted value with trailing junk is UNCLOSABLE to the reader — it folds the
+  rest of the file into the value (the R9 gate)."
+  [l]
+  (let [v (second (re-find #"^\s*[^:]+:\s*(.*)$" l))
+        unclosed? (fn [v q esc-form?]
+                    (loop [i 1 esc? false]
+                      (cond
+                        (>= i (count v)) true
+                        esc? (recur (inc i) false)
+                        (and esc-form? (= (nth v i) \\)) (recur (inc i) true)
+                        (= (nth v i) q)
+                        (not (boolean (re-matches #"\s*(?:#.*)?" (subs v (inc i)))))
+                        :else (recur (inc i) false))))]
+    (boolean
+     (when v
+       (cond
+         (str/starts-with? v \") (unclosed? v \" true)
+         (str/starts-with? v \') (unclosed? v \' false)
+         :else false)))))
 
 (defn set-model-text
   "Hermes `hermes model NAME` writes the default model into config.yaml.
@@ -295,27 +332,7 @@
         ;; R7 gate — fail closed on shapes this editor cannot honor)
         folded? (fn [ls idx]
                   (let [l (nth ls idx)
-                        ;; unclosed-quote detection, ESCAPE-AWARE like
-                        ;; yaml.cljk's unclosed-quote?: \" does not close a
-                        ;; double-quoted scalar and '' does not close a
-                        ;; single-quoted one (the R8 gate)
-                        opens (let [v (second (re-find #"^\s*[^:]+:\s*(.*)$" l))
-                                    unclosed? (fn [v q esc-form?]
-                                                (loop [i 1 esc? false]
-                                                  (cond
-                                                    (>= i (count v)) true
-                                                    esc? (recur (inc i) false)
-                                                    (and esc-form? (= (nth v i) \\)) (recur (inc i) true)
-                                                    (= (nth v i) q)
-                                                    (if (and (not esc-form?) (= (get v (inc i)) q))
-                                                      (recur (+ i 2) false)
-                                                      false)
-                                                    :else (recur (inc i) false))))]
-                                (when v
-                                  (cond
-                                    (str/starts-with? v "\"") (unclosed? v \" true)
-                                    (str/starts-with? v "'") (unclosed? v \' false)
-                                    :else false)))
+                        opens (line-unclosed-value? l)
                         nxt (get ls (inc idx))
                         deeper? (fn [x] (when (and x (re-matches #"\s+\S.*" x)
                                                    (not (re-matches #"\s*#.*" x)))
@@ -361,6 +378,11 @@
                         (if (nil? idx)
                           (conj (vec ls) line)
                           (assoc (vec ls) idx line))))]
+    ;; BOTH paths refuse an unclosed-quote value ANYWHERE in the file: the
+    ;; reader folds it to EOF and would swallow the edit whole (the R9
+    ;; append-path gate)
+    (when (some line-unclosed-value? lines)
+      (throw (js/Error. "refusing to edit a folded multi-line value (an unclosed quote swallows the file) — unwrap it by hand first")))
     (cond
       (nil? start)
       (str (str text)

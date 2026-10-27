@@ -177,7 +177,24 @@
     (is (thrown-with-msg? js/Error #"refusing to edit a folded"
                           (profile/set-model-text "model:\n  default: 'it''s\n" "NEW" nil))))
   (testing "an escaped quote that CLOSES properly is not folded"
-    (is (string? (profile/set-model-text "model:\n  default: \"fo\\\"\"\n" "NEW" nil)))))
+    (is (string? (profile/set-model-text "model:\n  default: \"fo\\\"\"\n" "NEW" nil))))
+  (testing "a quoted value with TRAILING JUNK is unclosed to the reader (the R9 gate)"
+    ;; the reader folds the rest of the file into "a"x — the gate must
+    ;; refuse, never edit in place
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: \"a\"x\ncont-line\nnext: 1\n" "NEW" nil)))
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: \"a\" \"b\"\n" "NEW" nil))))
+  (testing "the APPEND path refuses too when any line's quote is unclosed"
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "foo: \"bar\n" "NEW" nil))))
+  (testing "control characters the escape set cannot carry are refused"
+    ;; raw CR breaks the reader's line scanning and the escape set cannot
+    ;; encode it — refuse CR and exotic controls, never corrupt
+    (is (thrown-with-msg? js/Error #"control character"
+                          (profile/set-model-text "" "a\rb" nil)))
+    (is (thrown-with-msg? js/Error #"control character"
+                          (profile/set-model-text "" "a\u0001b" nil)))))
 
 (deftest config-mode-is-preserved
   (let [home (str "/tmp/test-model-mode-" (.-pid js/process) "-" (random-uuid))]
