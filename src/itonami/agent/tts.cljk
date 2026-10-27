@@ -47,6 +47,17 @@
   (let [s (str f)]
     (when (re-matches #"[A-Za-z0-9]+" s) s)))
 
+(defn clamp-timeout-s
+  "The abort delay in seconds, floor AND cap (backoff-ms is
+  (min 600000 (max 1000 ...)) in ms): below the floor a tiny timeout would
+  abort instantly; above the cap Node collapses the setTimeout delay to
+  ~1 ms. Numeric strings coerce; unusable values land on the cap (everything
+  is bounded — the hop's own 900 s default is capped here too)."
+  [t0]
+  (let [t (if (string? t0) (js/Number t0) t0)
+        t (if (and (number? t) (js/isFinite t) (pos? t)) t 600)]
+    (min 600 (max 1 t))))
+
 (defn synthesize!
   "Run one synthesis and write the audio into <home>/workspace/tts/<sha>.<format>,
   where the hash covers text+voice+model+format+provider+base_url (same
@@ -57,7 +68,12 @@
   bind it to nil under kbb/SCI). Resolves
   to a map naming path and format, or a map
   naming the error — a named outcome either way, never a guessed artifact."
-  [config home {:strs [text voice model] :as args} fetch writable?]
+  ([config home args fetch]
+   ;; nil writable? = ungated, safe ONLY because out-path is fully
+   ;; determined by sha256-hex + safe-format's alphanumeric guard — no
+   ;; caller argument ever joins the path ungated
+   (synthesize! config home args fetch nil))
+  ([config home {:strs [text voice model] :as args} fetch writable?]
   ;; `format` is pulled by key — destructuring it would shadow clojure.core
   (let [cfg (configured config)
         fmt-in (let [f (str (get args "format"))] (if (str/blank? f) "mp3" f))
@@ -99,12 +115,23 @@
                   ;; never fires and the fetch stays unbounded. (The timer is
                   ;; cleared on BOTH outcomes; p/finally is avoided: it
                   ;; breaks value propagation through p/catch in this build.)
-                  timer (js/setTimeout (fn [] (.abort ctl))
-                                       (* 1000 (or (:timeout-s hop) 900)))]
-              (-> (fetch (:url req) (clj->js {:method "POST"
-                                              :headers (clj->js (:headers req))
-                                              :body (:body req)
-                                              :signal (.-signal ctl)}))
+                  ;; clamp like backoff-ms: floor AND CAP. Node collapses
+                  ;; setTimeout delays above 2^31-1 ms to ~1 ms, so an
+                  ;; uncapped large request_timeout_seconds (a plausible
+                  ;; ms/s unit mix-up) would abort every request instantly.
+                  ;; 600000 ms is backoff-ms' ceiling.
+                  timeout-s (clamp-timeout-s (:timeout-s hop))
+                  timer (js/setTimeout (fn [] (.abort ctl)) (* 1000 timeout-s))]
+              (-> (try
+                    (fetch (:url req) (clj->js {:method "POST"
+                                                :headers (clj->js (:headers req))
+                                                :body (:body req)
+                                                :signal (.-signal ctl)}))
+                    (catch :default e
+                      ;; a synchronously-throwing injected fetch must not
+                      ;; escape with the timer armed
+                      (js/clearTimeout timer)
+                      (js/Promise.reject e)))
                   (p/catch (fn [e]
                              (js/clearTimeout timer)
                              {"error" (str "speech request failed: " (or (.-message e) e))}))
@@ -113,9 +140,11 @@
                      ;; the timer is cleared at the INNERMOST completions —
                      ;; it must stay armed through the body read (.arrayBuffer),
                      ;; which is exactly where a slow drip stalls (the cited
-                     ;; chat-hop pattern keeps it armed past (.text r) too)
+                     ;; chat-hop pattern keeps it armed past (.text r) too).
+                     ;; The early error-map return clears it too (R1: the
+                     ;; 'both outcomes' claim must be literal).
                      (if (get r "error")
-                       r
+                       (do (js/clearTimeout timer) r)
                        (if (.-ok r)
                          (-> (.arrayBuffer r)
                              (p/then
@@ -131,7 +160,17 @@
                                   (if (and writable? (not (writable? out-path)))
                                     {"error" "speech write refused: outside the permitted roots"}
                                     (do (h/mkdirs out-dir)
-                                        (fs/writeFileSync out-path (js/Buffer.from buf))
+                                        ;; tmp+rename: a concurrent
+                                        ;; reader never sees a
+                                        ;; half-written cache file
+                                        (let [tmp (str out-path ".tmp-" (.-pid js/process))]
+                                          (try
+                                            (fs/writeFileSync tmp (js/Buffer.from buf))
+                                            (fs/renameSync tmp out-path)
+                                            (catch :default e
+                                              ;; no tmp litter on failure
+                                              (try (fs/unlinkSync tmp) (catch :default _ nil))
+                                              (throw e))))
                                         ;; the CALLER records this as a run
                                         ;; write (tools.cljk) — tts cannot
                                         ;; require tools (cycle)
@@ -143,4 +182,4 @@
                                         (js/clearTimeout timer)
                                         {"error" (str "speech read failed: " (or (.-message e) e))})))
                          (do (js/clearTimeout timer)
-                             {"error" (str "speech request failed: HTTP " (.-status r))})))))))))))))
+                             {"error" (str "speech request failed: HTTP " (.-status r))}))))))))))))))
