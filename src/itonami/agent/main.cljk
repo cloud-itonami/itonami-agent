@@ -68,16 +68,23 @@
             ["node:readline" :as readline]
             ["node:crypto" :as crypto]))
 
+(def ^:private boolean-flags
+  "Flags whose values are true/false — the ONLY keys opt-value coerces."
+  #{:force :verbose :trust})
+
 (defn- opt-value
-  "Shaping for GENERIC long flags (`--flag value` / `--flag=value`): toolsets
-  split on commas (both spellings must agree), literal true/false become
-  booleans for flag-like options. Named value flags (-p/-z/-m/--provider/-t)
-  bypass this — their values are arbitrary strings."
+  "Value shaping for the generic `--flag value` / `--flag=value` branch.
+  Semantics: a value is a value — everything is verbatim, EXCEPT toolsets
+  (comma split, both spellings agree) and the known boolean flags (literal
+  true/false coerce, so `--force=false` is false). Named value flags
+  (-p/-z/-m/--provider/--model/--provider) are arbitrary strings in BOTH
+  spellings; short flags never take `=`."
   [k v]
   (cond
     (= k :toolsets) (str/split (str v) #",")
-    (= "true" (str v)) true
-    (= "false" (str v)) false
+    (contains? boolean-flags k) (cond (= "true" (str v)) true
+                                      (= "false" (str v)) false
+                                      :else v)
     :else v))
 
 (defn parse-args
@@ -1102,7 +1109,9 @@
   [opts args]
   (let [platform (str/lower-case (str (or (:platform opts) "telegram")))
         chat-id (or (:chat-id opts) (die 2 "send: --chat-id is required"))
-        _ (when (or (boolean? chat-id) (str/blank? (str chat-id)))
+        _ (when (or (boolean? chat-id)
+                    (str/blank? (str chat-id))
+                    (contains? #{"true" "false"} (str chat-id)))
             (die 2 "send: --chat-id needs a chat id value (e.g. --chat-id -100123)"))
         text (str/trim (str/join " " args))]
     (when (str/blank? text) (die 2 "send: message text is required"))
@@ -1139,7 +1148,9 @@
                   ;; secrets (keychain helper) are resolved only when a job is due
                   (doseq [n adopted
                           :when (and (not (pause/active?))
-                                     (some #(cron/due? % (js/Date.)) (cron/read-jobs (profile/home n))))]
+                                     (some #(cron/due? % (js/Date.))
+                                           (try (cron/read-jobs (profile/home n))
+                                                (catch :default _ []))))]
                     (-> (p/let [r (cron/tick (profile/load-profile n) {:executor (executor opts)})]
                           (when (and (sequential? r) (seq r))
                             (println (str (h/iso-local) " " n " " (str/join ", " (map #(str (:job %) "=" (:status %)) r))))))
