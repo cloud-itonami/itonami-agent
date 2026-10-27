@@ -404,11 +404,14 @@
   "Split a reply into sendable segments of at most `limit` chars, preferring
   the last newline inside the window (a hard split only when one line is
   longer than the limit). The boundary newline stays with the earlier
-  segment, so concatenating every segment returns the original text."
+  segment, so concatenating every segment returns the original text.
+  `limit` must be a positive integer (a fractional limit would loop on a
+  zero-advance split) — anything else throws."
   ([text] (chunk-text text max-reply-chars))
   ([text limit]
-   (when-not (and (number? limit) (pos? limit))
-     ;; a non-positive limit would loop on zero-length segments forever
+   (when-not (and (integer? limit) (pos? limit))
+     ;; a fractional limit truncates subs to a zero-advance step and loops
+     ;; forever; the contract is a positive INTEGER
      (throw (js/Error. "chunk-text: limit must be a positive integer")))
    (let [s (str text)]
      (if (<= (count s) limit)
