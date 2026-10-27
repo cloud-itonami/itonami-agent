@@ -1,9 +1,10 @@
 (ns itonami.agent.clarify-test
   "Hermes tools/clarify_tool.py semantics: normalization errors name their
-  index, the recommendation label never leaks into user_response, and an
-  unavailable surface answers the honest string."
-  (:require [cljs.test :refer [deftest is testing]]
+  index, the recommendation label never leaks into user_response, async
+  callbacks are awaited, and an unavailable surface answers the honest string."
+  (:require [cljs.test :refer [deftest is testing async]]
             [clojure.string :as str]
+            [promesa.core :as p]
             [itonami.agent.clarify :as clarify]
             [itonami.agent.host :as h]))
 
@@ -17,7 +18,7 @@
     (is (re-find #"questions\[1\]\.question must be non-empty" (str (second (clarify/normalize-questions [{"question" "a"} {"question" "  "}])))))
     (is (re-find #"questions\[0\]\.choices must be a list of strings" (str (second (clarify/normalize-questions [{"question" "a" "choices" "x"}])))))
     (is (re-find #"questions\[0\]\.choices must be a list of strings" (str (second (clarify/normalize-questions [{"question" "a" "choices" [1]}])))))
-    (is (re-find #"over 8000 characters" (str (second (clarify/normalize-questions [{"question" "a" "choices" [(apply str (repeat 8001 "x"))]}])))))
+    (is (re-find #"choices\[0\] is over 8000 characters" (str (second (clarify/normalize-questions [{"question" "a" "choices" [(apply str (repeat 8001 "x"))]}])))))
     (is (re-find #"all are blank" (str (second (clarify/normalize-questions [{"question" "a" "choices" ["  " ""]}])))))))
 
 (deftest normalize-shape
@@ -62,19 +63,56 @@
     (is (= "timed out" (get parsed "notice")))))
 
 (deftest ask-contracts
-  (testing "no callback -> the honest unavailability error"
-    (is (re-find #"not available in this execution context"
-                 (str (h/json-parse (clarify/ask! [{"question" "Q"}] nil))))))
-  (testing "a stub callback receives the normalized list and its reply is shaped"
-    (let [seen (atom nil)
-          out (h/json-parse (clarify/ask! [{"question" "Q" "choices" ["a" "b"]}]
-                                          (fn [norm]
-                                            (reset! seen norm)
-                                            {"answers" {"q0" "a"} "outcome" "answered"})))]
-      (is (= "q0" (get-in @seen [0 "qid"])))
-      (is (= "answered" (get-in out ["responses" 0 "status"])))
-      (is (= "a" (get-in out ["responses" 0 "user_response"])))))
-  (testing "bad input beats the callback (validation first)"
-    (let [called (atom false)]
-      (clarify/ask! [] (fn [_] (reset! called true)))
-      (is (false? @called)))))
+  (async done
+    (-> (clarify/ask! [{"question" "Q"}] nil)
+        (p/then (fn [out]
+                  (testing "no callback -> the honest unavailability error"
+                    (is (re-find #"not available in this execution context"
+                                 (str (h/json-parse out)))))))
+        (p/then (fn [_]
+                  (let [seen (atom nil)]
+                    (clarify/ask! [{"question" "Q" "choices" ["a" "b"]}]
+                                  (fn [norm]
+                                    (reset! seen norm)
+                                    {"answers" {"q0" "a"} "outcome" "answered"}))
+                    (-> (clarify/ask! [{"question" "Q" "choices" ["a" "b"]}]
+                                      (fn [norm]
+                                        (reset! seen norm)
+                                        {"answers" {"q0" "a"} "outcome" "answered"}))
+                        (p/then (fn [out]
+                                  (let [parsed (h/json-parse out)]
+                                    (testing "a sync callback's reply is shaped"
+                                      (is (= "q0" (get-in @seen [0 "qid"])))
+                                      (is (= "answered" (get-in parsed ["responses" 0 "status"])))
+                                      (is (= "a" (get-in parsed ["responses" 0 "user_response"])))))))))))
+        (p/then (fn [_]
+                  (clarify/ask! [{"question" "Q"}]
+                                (fn [_] (p/resolved {"answers" {"q0" "typed"} "outcome" "answered"})))))
+        (p/then (fn [out]
+                  (let [parsed (h/json-parse out)]
+                    (testing "an ASYNC callback's reply is awaited — a Promise answer is an ANSWER"
+                      (is (= "answered" (get-in parsed ["responses" 0 "status"])))
+                      (is (= "typed" (get-in parsed ["responses" 0 "user_response"])))))))
+        (p/then (fn [_]
+                  (clarify/ask! [{"question" "A" "choices" ["yes" "no"] "multi_select" true}]
+                                (fn [_] {"answers" {"q0" ["yes (Recommended)" "" " "]} "outcome" "answered"}))))
+        (p/then (fn [out]
+                  (let [parsed (h/json-parse out)]
+                    (testing "multi-select answers drop blanks and the label (Hermes verbatim)"
+                      (is (= ["yes"] (get-in parsed ["responses" 0 "user_response"])))))))
+        (p/then (fn [_]
+                  (clarify/ask! [{"question" "Q"}]
+                                (fn [_] (js/Promise.reject (js/Error. "boom"))))))
+        (p/then (fn [out]
+                  (testing "a rejecting callback answers the Hermes failure wording"
+                    (is (re-find #"Failed to get user input: boom"
+                                 (str (h/json-parse out)))))))
+        (p/then (fn [_]
+                  (let [called (atom false)]
+                    (-> (clarify/ask! [] (fn [_] (reset! called true)))
+                        (p/then (fn [_]
+                                  (testing "bad input beats the callback (validation first)"
+                                    (is (false? @called))))
+                                (fn [e] (is false (str "unexpected: " (str e))) nil))))))
+        (p/then (fn [_] (done)))
+        (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done))))))

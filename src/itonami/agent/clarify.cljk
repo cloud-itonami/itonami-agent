@@ -4,6 +4,7 @@
   a platform-injected callback (chat readline / the bridge's request row), and
   a run with no callback answers the honest unavailability string."
   (:require [clojure.string :as str]
+            [promesa.core :as p]
             [itonami.agent.host :as h]))
 
 (def max-choices 4)   ;; the UI always appends an Other row
@@ -47,7 +48,11 @@
                                        (if (array? p) (vec p) [raw]))
                                      (catch :default _ [raw]))
                   :else [raw])]
-      (mapv strip-recommended items))))
+      ;; verbatim: strip the label AND drop blank items
+      (->> items
+           (map strip-recommended)
+           (remove #(str/blank? (str %)))
+           vec))))
 
 (defn- normalize-item
   "One question entry -> [entry error]."
@@ -73,8 +78,8 @@
             [nil (str "questions[" index "].choices must be a list of strings.")]
 
             (some (fn [c] (< max-choice-chars (count (str/trim c)))) choices)
-            [nil (str "questions[" index "].choices contains an entry over " max-choice-chars
-                      " characters; the limit is " max-choice-chars
+            [nil (str "questions[" index "].choices[" (count (take-while #(<= (count (str/trim %)) max-choice-chars) choices))
+                      "] is over " max-choice-chars " characters; the limit is " max-choice-chars
                       ". Move detail into the question text and resend.")]
 
             :else
@@ -146,11 +151,13 @@
   [questions callback]
   (let [[normalized error] (normalize-questions questions)]
     (cond
-      error (h/json-str {"error" error})
-      (nil? callback) (h/json-str {"error" unavailable})
+      error (p/resolved (h/json-str {"error" error}))
+      (nil? callback) (p/resolved (h/json-str {"error" unavailable}))
       :else
-      (try
-        (let [reply (callback normalized)]
-          (result-json normalized (if (map? reply) reply {})))
-        (catch :default e
-          (h/json-str {"error" (str "clarify callback failed: " (or (.-message e) e))}))))))
+      ;; the callback may be async (a readline, a chat round trip): p/let
+      ;; AWAITS a Promise reply — a Promise answer is an ANSWER, never a
+      ;; silent {} (p/resolved would wrap it unflattened)
+      (-> (p/let [reply (callback normalized)]
+            (result-json normalized (if (map? reply) reply {})))
+          (p/catch (fn [e]
+                     (h/json-str {"error" (str "Failed to get user input: " (or (.-message e) e))})))))))

@@ -279,14 +279,15 @@
                               (do (println (str "\n[clarify] " (get q "question")))
                                   (doseq [[ci c] (map-indexed vector (get q "choices"))]
                                     (println (str "  " (inc ci) ". " c)))
-                                  (when (seq (get q "choices")) (println "  0. Other (type your answer)"))
+                                  (when (seq (get q "choices")) (println "  (or type your own answer)"))
                                   (.question rl (str (get q "qid") "> ")
                                              (fn [line]
                                                (let [line (str/trim (str line))
                                                      choices (vec (get q "choices"))
                                                      multi? (true? (get q "multi_select"))
                                                      pick1 (fn [tok]
-                                                             (let [n (js/parseInt tok 10)]
+                                                             (let [tok (str/trim (str tok))
+                                                                   n (js/parseInt tok 10)]
                                                                (if (and (re-matches #"\d+" tok)
                                                                         (<= 1 n (count choices)))
                                                                  (nth choices (dec n))
