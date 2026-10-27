@@ -1098,18 +1098,19 @@
           home (:home prof)
           cfg (:config prof)
           readiness (vec (profile-readiness-issues prof))
-          ;; no model resolves anywhere: the chain's sources are job pin ->
-          ;; cron.model -> model.default; the CLI's -m is the same pin layer
+          ;; no PROFILE-level model resolves (job-level pins are per-job and
+          ;; not inspected here): cron.model -> model.default
           model-issue (when (and (str/blank? (str (get-in cfg ["model" "default"])))
                                  (str/blank? (str (get-in cfg ["cron" "model"])))
                                  (str/blank? (str (:model opts))))
                         {:code :no-model
                          :detail "model.default is not set — resolution is unset"})
-          token-issues (for [[lane _c] (get cfg "delivery")
-                             :let [envn (platforms/token-env-name lane cfg)]
-                             :when (and envn (str/blank? (str (h/env envn))))]
-                         {:code :missing-token
-                          :detail (str "delivery." lane " needs env " envn " (unset)")})
+          token-issues (when (map? (get cfg "delivery"))
+                         (for [[lane _c] (get cfg "delivery")
+                               :let [envn (platforms/token-env-name lane cfg)]
+                               :when (and envn (str/blank? (str (h/env envn))))]
+                           {:code :missing-token
+                            :detail (str "delivery." lane " needs env " envn " (unset)")}))
           db-issue (when-not (h/file? (h/join home "state.db"))
                      {:code :no-state-db
                       :detail "state.db missing — sessions / session_search will be empty"})

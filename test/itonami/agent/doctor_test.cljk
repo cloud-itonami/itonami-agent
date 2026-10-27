@@ -12,5 +12,10 @@
     (is (nil? (platforms/token-env-name "discord" {"delivery" {"discord" {"webhook_url" "https://d/h"}}}))))
   (testing "a discord BOT lane does use the token env"
     (is (= "DISCORD_BOT_TOKEN" (platforms/token-env-name "discord" {"delivery" {"discord" {"channel_id" "c1"}}}))))
+  (testing "mattermost is ALWAYS webhook-style: a configured token_env is dead and never demanded"
+    (is (nil? (platforms/token-env-name "mattermost" {"delivery" {"mattermost" {"token_env" "MM"}}})))
+    (is (nil? (platforms/token-env-name "mattermost" {"delivery" {"mattermost" {"webhook_url" "https://mm/h" "token_env" "MM"}}}))))
+  (testing "a discord webhook lane ignores a dead token_env too"
+    (is (nil? (platforms/token-env-name "discord" {"delivery" {"discord" {"webhook_url" "https://d/h" "token_env" "DT"}}}))))
   (testing "an unknown lane resolves to nothing — never a guess"
     (is (nil? (platforms/token-env-name "feishu" {})))))

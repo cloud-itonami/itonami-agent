@@ -152,14 +152,16 @@
 
 (defn token-env-name
   "The env var that carries this lane's token, or nil when the lane needs no
-  token: a webhook lane (mattermost, discord with webhook_url) is configured
-  by its webhook, not by a token."
+  token: a webhook lane (mattermost ALWAYS, discord when webhook_url is set)
+  is configured by its webhook, not by a token — a configured token_env on
+  such a lane is dead and must not be demanded."
   [lane config]
   (let [lane (str/lower-case (str lane))
         c (get-in config ["delivery" lane])]
-    (cond
-      (and (= "discord" lane) (not (str/blank? (str (get c "webhook_url"))))) nil
-      :else (or (get c "token_env") (get token-env-defaults lane)))))
+    (when-not (or (= "mattermost" lane)
+                  (and (= "discord" lane)
+                       (not (str/blank? (str (get c "webhook_url"))))))
+      (or (get c "token_env") (get token-env-defaults lane)))))
 
 (defn for-lane
   "The built-in adapter for a deliver lane, or nil when this lane has no
