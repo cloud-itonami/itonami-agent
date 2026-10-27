@@ -41,6 +41,20 @@
         (is (nil? (:error (main/claim-pid! dir "gateway.pid"))) (str "pid " v))))
     (fs/rmSync dir #js {:recursive true :force true})))
 
+(deftest edge-paths-name-what-stopped-them
+  (let [dir (str "/tmp/test-pid-guard4-" (.-pid js/process) "-" (random-uuid))]
+    (.mkdirSync fs dir #js {:recursive true})
+    (testing "a dead owner with no retries left is NOT reported as running"
+      (h/spit (h/join dir "gateway.pid") "999999999")
+      (let [r (main/claim-pid! dir "gateway.pid" 0)]
+        (is (re-find #"stale takeover attempts exhausted" (str (:error r))))
+        (is (not (re-find #"already running" (str (:error r)))))))
+    (testing "a non-regular file at the pid path is named, not 'keeps reappearing'"
+      (fs/rmSync (h/join dir "gateway.pid") #js {:force true})
+      (.mkdirSync fs (h/join dir "gateway.pid"))
+      (is (re-find #"not a regular file" (str (:error (main/claim-pid! dir "gateway.pid" 1))))))
+    (fs/rmSync dir #js {:recursive true :force true})))
+
 (deftest claim-pid-claims-a-free-slot
   (let [dir (str "/tmp/test-pid-guard2-" (.-pid js/process) "-" (random-uuid))]
     (.mkdirSync fs dir #js {:recursive true})
