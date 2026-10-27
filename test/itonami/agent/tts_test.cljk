@@ -51,7 +51,7 @@
 
 (deftest synthesize-hardening
   (async done
-    (let [home "/tmp/tts-hardening"
+    (let [home (h/join (h/tmp-dir) (str "test-tts-hardening-" (.-pid js/process) "-" (h/random-hex 4)))
           config {"tts" {"provider" "p1" "model" "tts-1" "voice" "nova"}
                   "providers" {"p1" {"base_url" "https://api.x/v1" "key_env" "X_TOKEN"}}}
           fake-ok (fn [_ _] (p/resolved #js {:ok true :status 200
@@ -71,6 +71,12 @@
                     (-> (tts/synthesize! config home {"text" "same" "voice" "v2"} fake-ok)
                         (p/then (fn [r2]
                                   (testing "same text with a different voice lands in a different file"
+                                    (is (not= (get r1 "path") (get r2 "path")))))))))
+          (p/then (fn [_] (tts/synthesize! config home {"text" "a|b" "voice" "c"} fake-ok)))
+          (p/then (fn [r1]
+                    (-> (tts/synthesize! config home {"text" "a" "voice" "b|c"} fake-ok)
+                        (p/then (fn [r2]
+                                  (testing "delimiter-bearing fields cannot collide on one path"
                                     (is (not= (get r1 "path") (get r2 "path")))))))))
           (p/then (fn [_]
                     (js-delete (.-env js/process) "X_TOKEN")

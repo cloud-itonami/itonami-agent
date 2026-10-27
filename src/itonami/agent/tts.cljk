@@ -50,9 +50,10 @@
   different request, different file). Injected `fetch` for tests. Resolves to
   a map naming path and format, or a map naming the error — a named outcome
   either way, never a guessed artifact."
-  [config home {:strs [text voice model format]} fetch]
+  [config home {:strs [text voice model] :as args} fetch]
+  ;; `format` is pulled by key — destructuring it would shadow clojure.core
   (let [cfg (configured config)
-        fmt-in (let [f (str format)] (if (str/blank? f) "mp3" f))
+        fmt-in (let [f (str (get args "format"))] (if (str/blank? f) "mp3" f))
         fmt (safe-format fmt-in)
         voice (let [v (str voice)] (if (str/blank? v) (get cfg :voice) v))
         model (let [m (str model)] (if (str/blank? m) (get cfg :model) m))]
@@ -80,7 +81,9 @@
           :else
           (let [req (speech-request (assoc hop :token token) voice text fmt)
                 out-dir (h/join home "workspace" "tts")
-                out-path (h/join out-dir (str (h/sha256-hex (str text "|" voice "|" model "|" fmt)) "." fmt))]
+                ;; json encoding is delimiter-unambiguous: distinct requests
+                ;; cannot collide on one path
+                out-path (h/join out-dir (str (h/sha256-hex (h/json-str [text voice model fmt])) "." fmt))]
             (-> (fetch (:url req) (clj->js {:method "POST"
                                             :headers (clj->js (:headers req))
                                             :body (:body req)}))

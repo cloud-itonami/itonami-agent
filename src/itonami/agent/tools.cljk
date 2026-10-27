@@ -2992,9 +2992,10 @@
 
 (defn text-to-speech
   "Hermes text_to_speech, slice 1: provider-backed synthesis (tts.cljk)."
-  [ctx {:strs [text voice model format]}]
+  [ctx {:strs [text voice model] :as args}]
   (-> (tts/synthesize! (:config ctx) (:home ctx)
-                       {"text" text "voice" voice "model" model "format" format}
+                       {"text" text "voice" voice "model" model
+                        "format" (get args "format")}
                        js/fetch)
       (p/then (fn [r]
                 (if-let [e (get r "error")]
