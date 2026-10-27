@@ -19,6 +19,7 @@
   A profile with an itonami.edn is an *itonami profile*. It stays a valid
   Hermes-format profile: deleting itonami.edn returns it to plain Hermes."
   (:require [clojure.string :as str]
+            ["node:fs" :as fs]
             [cljs.reader :as reader]
             [itonami.agent.host :as h]
             [itonami.agent.manifest :as manifest]
@@ -179,6 +180,304 @@
 (def host-local-config-keys
   "Same set scripts/hermes-profile-repo.cljk keeps on the host."
   #{"secrets" "command_allowlist" "onboarding" "terminal" "skills"})
+
+
+(defn- reader-coerces?
+  "TRUE when yaml.cljk's scalar reader would turn this PLAIN token into a
+  non-string (or throw on it). The exclusion set is exactly that reader's
+  behavior — ints, floats, its null/bool spellings, its sequence/map shapes,
+  its refused block-scalar/anchor markers — not YAML-1.1 folklore."
+  [s]
+  (or (= s "")
+      (contains? #{"~" "null" "Null" "NULL"
+                   "true" "True" "TRUE" "false" "False" "FALSE"
+                   "[]"} s)
+      (= s "{}")
+      (and (str/starts-with? s "[") (str/ends-with? s "]"))
+      (re-matches #"-?\d+" s)
+      (re-matches #"-?\d+\.\d+([eE][-+]?\d+)?" s)
+      (contains? #{"|" ">" "|-" ">-"} s)
+      (or (str/starts-with? s "&") (str/starts-with? s "*") (str/starts-with? s "!"))))
+
+(defn- yaml-scalar
+  "Write a value as a safe YAML scalar: plain ONLY when the project's own
+  scalar reader will hand it back as the same string (reader-coerces? is
+  that reader's exact coercion set). Otherwise a DOUBLE-QUOTED scalar
+  escaped with exactly the four escapes the reader's unquote-double decodes
+  (backslash-n, backslash-t, backslash-quote, backslash-backslash) — a JSON
+  escape like backslash-r would round-trip to the WRONG string (the R9
+  gate). Any other control character cannot round-trip at all: the write is
+  refused, never silently corrupted."
+  [v]
+  (let [s (str v)]
+    (if (and (re-matches #"[A-Za-z0-9._/-]+" s)
+             (not (reader-coerces? s)))
+      s
+      (do
+        (when (some #(re-matches #"[\x00-\x08\x0b-\x0d\x0e-\x1f\x7f]" (str %)) s)
+          (throw (js/Error. "this value contains a control character config.yaml cannot round-trip")))
+        (str (char 34)
+             (-> s
+                 (str/replace (str (char 92)) (str (char 92) (char 92)))
+                 (str/replace (str (char 34)) (str (char 92) (char 34)))
+                 (str/replace "\n" (str (char 92) "n"))
+                 (str/replace "\t" (str (char 92) "t")))
+             (char 34))))))
+
+(defn- line-unclosed-value?
+  "TRUE when this line's value is a quoted scalar the reader cannot close:
+  the first unescaped closing quote must be followed only by whitespace or a
+  comment to EOL (yaml.cljk's unclosed-quote?/join-raw fold contract). A
+  quoted value with trailing junk is UNCLOSABLE to the reader — it folds the
+  rest of the file into the value (the R9 gate)."
+  [l]
+  ;; the value comes from ANY of the reader's head-value shapes: `key: v`
+  ;; (bare, or a quoted key that may contain colons) and `- v` sequence
+  ;; items — yaml.cljk's head-value alternatives, each of which can open a
+  ;; fold (the R11 gate)
+  (let [v (or (second (re-find #"^\s*(?:-\s+)?(?:\"[^\"]*\"|'[^']*'|[^:]+)\s*:\s*(.*)$" l))
+              (second (re-find #"^\s*-\s+(\S.*)$" l)))
+        unclosed? (fn [v q esc-form?]
+                    (loop [i 1 esc? false]
+                      (cond
+                        (>= i (count v)) true
+                        esc? (recur (inc i) false)
+                        (and esc-form? (= (nth v i) \\)) (recur (inc i) true)
+                        ;; single quotes close at '' too (the reader's
+                        ;; escaped-quote pair)
+                        (= (nth v i) q)
+                        (if (and (not esc-form?) (= (get v (inc i)) q))
+                          (recur (+ i 2) false)
+                          (not (boolean (re-matches #"\s*(?:#.*)?" (subs v (inc i))))))
+                        :else (recur (inc i) false))))]
+    (boolean
+     (when v
+       (cond
+         (str/starts-with? v \") (unclosed? v \" true)
+         (str/starts-with? v \') (unclosed? v \' false)
+         :else false)))))
+
+(defn set-model-text
+  "Hermes `hermes model NAME` writes the default model into config.yaml.
+  The edit is TEXTUAL (like bundle-config-text): comments, formatting and
+  keys outside model.default/model.provider survive verbatim. The block is
+  the top-level `model:` opener (a bare key, or one carrying a trailing
+  comment); its END is the next non-blank COLUMN-0 NON-COMMENT, non-`---`
+  line (any top-level key shape, including dotted/quoted keys) — comments
+  and `---` separators are TRANSPARENT here exactly as the reader treats
+  them. Keys are
+  replaced IN PLACE at the block's child indent (derived from the first
+  non-comment indented line) — a provider not given here is kept."
+  [text model provider]
+  (let [lines (str/split-lines (str text))
+        ;; comments are TRANSPARENT to the reader (comment-only lines are
+        ;; stripped before parsing), so they must not end the block — only a
+        ;; column-0 non-comment line does (the R4 silent-no-op gate)
+        ;; mirror the reader's `lines`: strip the comment FIRST, then drop
+        ;; '---' — so `--- # note` and `---\t#c` are transparent too (the R6
+        ;; silent-no-op class)
+        strip-comment (fn [l]
+                        (loop [i 0 in-q nil esc? false]
+                          (if (>= i (count l))
+                            l
+                            (let [c (nth l i)]
+                              (cond
+                                esc? (recur (inc i) in-q false)
+                                (and (= in-q \") (= c \"))
+                                (recur (inc i) nil false)
+                                (and (= in-q \') (= c \'))
+                                (recur (inc i) nil false)
+                                (and (not in-q) (= c \#)
+                                     (or (zero? i) (re-matches #"\s" (str (nth l (dec i))))))
+                                (subs l 0 i)
+                                (and (not in-q) (or (= c \") (= c \')))
+                                (recur (inc i) c false)
+                                (and (= in-q \") (= c \\))
+                                (recur (inc i) in-q true)
+                                :else (recur (inc i) in-q false))))))
+        top-line? (fn [l]
+                    (let [s (strip-comment l)]
+                      ;; a line that strips to blank IS a comment —
+                      ;; transparent; `---` (with or without a trailing
+                      ;; comment) is transparent too
+                      (and (not (str/blank? l))
+                           (not (str/blank? s))
+                           (not (re-matches #"\s+.*" l))
+                           (not (str/starts-with? (str/trim s) "#"))
+                           (not= "---" (str/trim s)))))
+        ;; the top-level model: opener: `model:` alone, or with a trailing
+        ;; comment (the reader's strip-comment accepts both). LAST wins —
+        ;; the reader keeps the last duplicate mapping (the R4 block gate)
+        start (last (keep-indexed (fn [i l]
+                                    (when (and (top-line? l)
+                                               ;; whitespace or end before
+                                               ;; any comment: `model:#c` is
+                                               ;; a scalar value to the
+                                               ;; reader, not this opener
+                                               (re-matches #"(?:\"model\"|'model'|model)\s*:(\s+(#.*)?)?" l))
+                                      i))
+                                  lines))
+        block-end (if (nil? start)
+                    nil
+                    (or (first (for [i (range (inc start) (count lines))
+                                     :let [l (nth lines i)]
+                                     :when (top-line? l)]
+                                 i))
+                        (count lines)))
+        body (when start (vec (subvec (vec lines) start block-end)))
+        ;; the block BODY must be a MAPPING: a sequence-valued `model:`
+        ;; (`- item` children) is a shape this editor cannot honor — refuse
+        ;; like a folded value, never rewrite into unparseable YAML (the R13
+        ;; gate)
+        ;; INDENTED seq items only (`  - x`): a column-0 `---` is a
+        ;; separator and a column-0 `- x` ends the block as a top line
+        _ (when (and body (some (fn [l] (boolean (re-matches #"^\s+-.*" l))) body))
+            (throw (js/Error. "refusing to edit a model block that is a sequence, not a mapping")))
+        ;; the block's child indent comes from the first indented NON-COMMENT
+        ;; line — a differently-indented comment must not set it
+        child-indent (when body (or (first (for [l (rest body)
+                                                 :when (and (re-matches #"\s+\S.*" l)
+                                                            (not (re-matches #"\s*#.*" l)))]
+                                             (count (re-find #"^\s*" l))))
+                                    2))
+        pad (apply str (repeat child-indent " "))
+        ;; SYMMETRIC quotes only, matching split-key's three shapes exactly
+        key-rx (fn [k] (re-pattern (str "^" pad "(?:\"" k "\"|'" k "'|" k ")\\s*:.*$")))
+        ;; the reader FOLDS multi-line scalars into one logical line; this
+        ;; edit is physical-line based, so a wrapped value would be silently
+        ;; miswritten (or leave the file unparseable). Refuse instead (the
+        ;; R7 gate — fail closed on shapes this editor cannot honor)
+        folded? (fn [ls idx]
+                  (let [l (nth ls idx)
+                        opens (line-unclosed-value? l)
+                        nxt (get ls (inc idx))
+                        ;; a BLOCK-SCALAR opener (|, >, |-, >-) folds BLANK lines before
+                        ;; its body (join-raw's block branch) — the immediate-next-line check
+                        ;; alone misses it (the R12 gate)
+                        ;; the reader's block trigger is on the COMMENT-STRIPPED value and
+                        ;; the full [|>][-+]? marker set (the R14 gate: |+/>+ chomping and
+                        ;; `| # note` slipped past an exact-set match on the raw line)
+                        block-scalar? (let [c (str/index-of l ":")]
+                                        (when c
+                                          (let [val (str/trim (strip-comment (subs l (inc c))))]
+                                            (and (seq val)
+                                                 (contains? #{\| \>} (first val))
+                                                 (every? #{\- \+} (rest val))
+                                                 (<= (count val) 2)))))
+                        deeper? (fn [x] (when (and x (re-matches #"\s+\S.*" x)
+                                                   (not (re-matches #"\s*#.*" x)))
+                                          (> (count (re-find #"^\s*" x))
+                                             (count (re-find #"^\s*" l)))))
+                        any-deeper? (when block-scalar?
+                                      (some (fn [x] (and x (re-matches #"\s+\S.*" x) (deeper? x)))
+                                            (drop 1 ls)))]
+                                    (or opens any-deeper? (deeper? nxt))))
+        ;; the SAME scanner as the reader's strip-comment (single quotes
+        ;; open too, backslash escapes inside double quotes, any whitespace
+        ;; before '#') — the comment tail is exactly what the reader would
+        ;; strip
+        trailing-comment (fn [l]
+                           (loop [i 0 in-q nil esc? false]
+                             (if (>= i (count l))
+                               nil
+                               (let [c (nth l i)]
+                                 (cond
+                                   esc? (recur (inc i) in-q false)
+                                   (and (= in-q \") (= c \"))
+                                   (recur (inc i) nil false)
+                                   (and (= in-q \') (= c \'))
+                                   (recur (inc i) nil false)
+                                   (and (not in-q) (= c \#)
+                                        (or (zero? i) (re-matches #"\s" (str (nth l (dec i))))))
+                                   (subs l i)
+                                   (and (not in-q) (or (= c \") (= c \')))
+                                   (recur (inc i) c false)
+                                   (and (= in-q \") (= c \\))
+                                   (recur (inc i) in-q true)
+                                   :else (recur (inc i) in-q false))))))
+        replace-key (fn [ls k value]
+                      (let [rx (key-rx k)
+                            hits (keep-indexed (fn [i l] (when (re-matches rx l) i)) ls)
+                            ;; the reader keeps the LAST duplicate key —
+                            ;; replace THAT one and drop the earlier ones
+                            idx (last hits)
+                            keep (remove (set (butlast hits)) (vec (range (count ls))))
+                            ls (mapv #(nth ls %) keep)
+                            idx (last (keep-indexed (fn [i l] (when (re-matches rx l) i)) ls))
+                            comment (when idx (trailing-comment (nth ls idx)))
+                            line (str pad k ": " (yaml-scalar value)
+                                      (when comment
+                                        (if (str/starts-with? comment " ") comment (str " " comment))))]
+                        (if (nil? idx)
+                          (conj (vec ls) line)
+                          (assoc (vec ls) idx line))))]
+    ;; BOTH paths refuse an unclosed-quote value ANYWHERE in the file: the
+    ;; reader folds it to EOF and would swallow the edit whole (the R9
+    ;; append-path gate)
+    (when (some line-unclosed-value? lines)
+      (throw (js/Error. "refusing to edit a folded multi-line value (an unclosed quote swallows the file) — unwrap it by hand first")))
+    (cond
+      (nil? start)
+      (str (str text)
+           ;; the separator is needed whenever text does not already end in
+           ;; a newline (whitespace-only input parses to {} — gluing the
+           ;; block onto it makes the output unparseable, the R14 gate)
+           (when (and (pos? (count (str text)))
+                      (not (str/ends-with? (str text) "\n")))
+             "\n")
+           (str/join "\n" (filter some? ["model:"
+                                          (str "  default: " (yaml-scalar model))
+                                          (when-not (str/blank? (str provider))
+                                            (str "  provider: " (yaml-scalar provider)))]))
+           "\n")
+
+      :else
+      (let [key-idxs (fn [k] (keep-indexed (fn [i l] (when (re-matches (key-rx k) l) i)) body))
+            ;; EVERY occurrence is checked (the R8 gate: replace-key drops
+            ;; the earlier duplicate LINES but their continuations would
+            ;; survive as orphans)
+            _ (doseq [k (cond-> ["default"] (not (str/blank? (str provider))) (conj "provider"))
+                        idx (key-idxs k)
+                        :when (folded? body idx)]
+                (throw (js/Error. (str "refusing to edit a folded multi-line model." k
+                                       " — unwrap it by hand first"))))]
+        ;; replace-key replaces IN PLACE when the key exists (the R2 gate: no
+        ;; drop-then-append, so comments stay attached to their keys and the
+        ;; key order is preserved); a model-only write never touches provider
+        (let [body (cond-> body
+                     true (replace-key "default" model)
+                     (not (str/blank? (str provider))) (replace-key "provider" provider))]
+        (str (str/join "\n" (concat (subvec (vec lines) 0 start) body (subvec (vec lines) block-end)))
+             (when (seq lines) "\n")))))))
+
+(defn set-config-model!
+  "Persist the default model (and optional provider) in the profile's
+  config.yaml. Atomic: write to a sibling temp file, then rename. The file's
+  MODE is preserved (config.yaml can hold literal auth headers — the repo
+  convention for such files is 0600, and a rename-replace would otherwise
+  silently loosen a stricter operator mode to umask 0644); a  symlink is
+  followed to its target so the link itself is normally not replaced (a
+  DANGLING link cannot be followed and is replaced — documented)."
+  [home model provider]
+  (let [p (h/join home "config.yaml")
+        st (try (fs/lstatSync p) (catch :default _ nil))
+        p (if (and st (.-isSymbolicLink st))
+            (try (fs/realpathSync p) (catch :default _ p))
+            p)
+        mode (try (bit-and 511 (.-mode (fs/statSync p))) (catch :default _ 384))
+        text (if (h/file? p) (h/slurp p) "")
+        tmp (str p ".tmp-" (.-pid js/process) "-" (h/random-hex 4))]
+    ;; the tmp file is created at the TARGET's mode before any secret
+    ;; content lands (a new config is 0600; an existing file keeps its
+    ;; operator-set mode) and renamed into place
+    (try
+      (fs/writeFileSync tmp (set-model-text text model provider) #js {:mode mode :flag "wx"})
+      (fs/renameSync tmp p)
+      (fs/chmodSync p mode)
+      (catch :default e
+        (try (fs/unlinkSync tmp) (catch :default _ nil))
+        (throw e)))
+    p))
 
 (def job-definition-keys
   #{"id" "name" "prompt" "skills" "skill" "script" "no_agent" "schedule" "deliver" "enabled"

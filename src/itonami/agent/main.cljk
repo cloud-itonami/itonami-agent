@@ -1225,14 +1225,38 @@
 
       (die 2 "usage: itonami-agent sessions [list] [--limit N] | show <id> | resume <id>"))))
 (defn model-cmd
-  "Hermes `hermes model` (show): the effective model/provider resolution with
-  the config layer each came from, and the hop chain. The setter lands with
-  config writing."
-  [opts _]
+  "Hermes `hermes model` (show) / `hermes model NAME` (set): the effective
+  model/provider resolution with the config layer each came from, and the hop
+  chain. Setting writes model.default (and model.provider with --provider)
+  into config.yaml textually — comments and formatting survive."
+  [opts args]
+  (when (< 1 (count args))
+    (die 2 "usage: itonami-agent model [NAME] [--provider P] [--profile P]"))
+  ;; -m/--model is a RUN-TIME override of the resolution display: writing the
+  ;; default while showing a different effective model would mislead
+  (when (and (seq args) (:model opts))
+    (die 2 "model NAME and -m/--model cannot combine: NAME writes the default, -m overrides one run"))
+  ;; --provider keeps a VERBATIM string in both spellings (opt-value is not
+  ;; boolean here), so validate the VALUE: a flag-looking token (the
+  ;; `--provider --verbose` shape) or a blank is refused on the SHOW path
+  ;; too, where it feeds provider/resolution
+  ;; the KEY being present with a nil value is the bare `--provider` shape
+  ;; (parse-args stores nil) — refuse it like any invalid value
+  (when (contains? opts :provider)
+    (when (or (not (string? (:provider opts)))
+              (str/blank? (:provider opts))
+              (str/starts-with? (str (:provider opts)) "-"))
+      (die 2 "--provider must be a provider name")))
+  (when-let [model-name (first args)]
+    (when (str/blank? (str/trim model-name))
+      (die 2 "model name must be non-empty"))
+    (let [home (:home (profile/load-profile (or (:profile opts) "default") {:secrets? false}))]
+      (profile/set-config-model! home (str/trim model-name) (:provider opts))))
   (p/let [prof (profile/load-profile (or (:profile opts) "default") {:secrets? false})
           r (provider/resolution (:config prof) {:model (:model opts) :provider (:provider opts)})]
     (println (str "model:     " (get-in r [:model :value]) "   (" (get-in r [:model :source]) ")"))
     (println (str "provider:  " (get-in r [:provider :value]) "   (" (get-in r [:provider :source]) ")"))
+    (when (seq args) (println "(written to config.yaml)"))
     (println (str "chain:"))
     (doseq [[i h] (map-indexed vector (:hops r))]
       (println (str "  " (inc i) ". " (:provider h) "/" (:model h))))))

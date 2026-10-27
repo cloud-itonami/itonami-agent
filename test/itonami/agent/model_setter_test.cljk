@@ -1,0 +1,249 @@
+(ns itonami.agent.model-setter-test
+  "hermes model NAME: the config.yaml edit is textual — comments and
+  formatting outside the touched keys survive verbatim."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            ["node:fs" :as fs]
+            [itonami.agent.yaml :as yaml]
+            [itonami.agent.host :as h]
+            [itonami.agent.profile :as profile]))
+
+(defn parse-yaml [s] (yaml/parse s))
+
+(deftest set-model-text-edits-in-place
+  (testing "the default line is replaced; comments and sibling keys survive"
+    (let [in "# top comment\nmodel:\n  # what to run\n  provider: openrouter\n  default: old/model\nfallback:\n  - x\n"
+          out (profile/set-model-text in "new/model" nil)]
+      (is (str/includes? out "# top comment"))
+      (is (str/includes? out "# what to run"))
+      (is (str/includes? out "  default: new/model"))
+      (is (not (str/includes? out "old/model")))
+      (is (str/includes? out "fallback:\n  - x"))))
+
+  (testing "provider is written when given"
+    (let [out (profile/set-model-text "model:\n  default: a\n" "b" "prov")]
+      (is (str/includes? out "  provider: prov"))
+      (is (str/includes? out "  default: b"))))
+
+  (testing "no model block: one is appended after the existing text"
+    (let [out (profile/set-model-text "cron:\n  model: z\n" "m1" nil)]
+      (is (str/includes? out "cron:\n  model: z"))
+      (is (str/includes? out "model:\n  default: m1"))))
+
+  (testing "an empty config gets exactly the block"
+    (is (= "model:\n  default: m\n" (profile/set-model-text "" "m" nil))))
+
+  (testing "unknown keys in the block survive the rewrite"
+    (let [out (profile/set-model-text "model:\n  custom: keep\n  default: old\n" "new" nil)]
+      (is (str/includes? out "  custom: keep"))
+      (is (str/includes? out "  default: new")))))
+
+(deftest nested-blocks-and-keys-are-untouched
+  (testing "a nested `model:` key is NOT the top-level block"
+    (let [in "gateway:\n  model:\n    default: g\n"
+          out (profile/set-model-text in "NEW" nil)]
+      ;; gateway.model.default survives; the new block is appended
+      (is (str/includes? out "gateway:\n  model:\n    default: g"))
+      (is (str/includes? out "model:\n  default: NEW"))))
+
+  (testing "default/provider at OTHER depths inside the block survive verbatim"
+    (let [in "model:\n  provider: openrouter\n  extra:\n    provider: x\n    default: y\n"
+          out (profile/set-model-text in "NEW" nil)]
+      (is (str/includes? out "    provider: x"))
+      (is (str/includes? out "    default: y"))
+      (is (str/includes? out "  provider: openrouter"))
+      (is (str/includes? out "  default: NEW"))))
+
+  (testing "a comment between keys stays put"
+    (let [in "model:\n  # keep\n  default: old\n"
+          out (profile/set-model-text in "NEW" nil)]
+      (is (str/includes? out "  # keep")))))
+
+(deftest yaml-shape-edges
+  (testing "a model: opener with a trailing comment is the block (no duplicate block)"
+    (let [out (profile/set-model-text "model:  # inference\n  default: old\n" "NEW" nil)]
+      (is (= 1 (count (re-seq #"(?m)^model:" out))))
+      (is (str/includes? out "  default: NEW"))
+      (is (not (str/includes? out "old")))))
+
+  (testing "exact in-place replacement keeps key order and comment attachment"
+    (let [out (profile/set-model-text "model:\n  default: old\n  # provider line\n  provider: x\n" "NEW" nil)]
+      (is (= "model:\n  default: NEW\n  # provider line\n  provider: x\n" out))))
+
+  (testing "a differently-indented comment does not set the child indent"
+    (let [out (profile/set-model-text "model:\n      # deep comment\n  default: old\n" "NEW" nil)]
+      (is (str/includes? out "  default: NEW"))
+      (is (not (str/includes? out "    default: NEW")))))
+
+  (testing "a dotted top-level key ends the block (no cross-section edits)"
+    (let [in "model:\n  default: old\nx.y:\n  default: keep\n"
+          out (profile/set-model-text in "NEW" nil)]
+      (is (str/includes? out "x.y:\n  default: keep"))
+      (is (str/includes? out "  default: NEW"))))
+
+  (testing "coercible shapes (null/true/yes) are quoted, never bare"
+    (let [out (profile/set-model-text "" "true" nil)]
+      (is (str/includes? out "  default: \"true\"")))
+    (let [cfg (parse-yaml (profile/set-model-text "" "true" nil))]
+      (is (= "true" (get-in cfg ["model" "default"]))))))
+
+(deftest values-cannot-corrupt-the-yaml
+  (testing "a value with : or # is written as a safe quoted scalar"
+    (let [out (profile/set-model-text "" "a: b # c" nil)]
+      (is (str/includes? out "  default: \"a: b # c\"")))
+    ;; and the produced text parses back to the exact value
+    (let [text (profile/set-model-text "" "a: b # c" nil)
+          cfg (parse-yaml text)]
+      (is (= "a: b # c" (get-in cfg ["model" "default"]))))))
+
+(deftest reader-coercion-and-key-shapes
+  (testing "numeric-shaped values are quoted (the reader would coerce them)"
+    (doseq [v ["7" "1.5" "-3"]]
+      (let [cfg (parse-yaml (profile/set-model-text "" v nil))]
+        (is (= v (get-in cfg ["model" "default"])) (str "value " v)))))
+
+  (testing "quoted and space-before-colon child keys are replaced, not duplicated"
+    (doseq [line ["  \"default\": old" "  'default': old" "  default : old"]]
+      (let [out (profile/set-model-text (str "model:\n" line "\n") "NEW" nil)]
+        (is (= 1 (count (re-seq #"(?m)^\s+\"?\x27?default" out))) (str "line " line))
+        (is (str/includes? out "NEW"))
+        (is (not (str/includes? out "old"))))))
+
+  (testing "duplicate default keys: the LAST is what the reader keeps — replace it"
+    (let [out (profile/set-model-text "model:\n  default: first\n  default: second\n" "NEW" nil)]
+      (is (not (str/includes? out "first")))
+      (is (not (str/includes? out "second")))
+      (is (= 1 (count (re-seq #"(?m)^\s+default:" out))))))
+
+  (testing "a trailing comment on the replaced line survives"
+    (is (= "model:\n  default: NEW # pinned\n"
+           (profile/set-model-text "model:\n  default: old # pinned\n" "NEW" nil)))))
+
+(deftest comments-are-transparent-and-last-block-wins
+  (testing "a column-0 comment inside the block does NOT end it (the reader strips comments)"
+    (let [out (profile/set-model-text "model:\n# c\n  default: old\n" "NEW" nil)]
+      (is (= 1 (count (re-seq #"(?m)^\s+default:" out))) "no duplicate default key")
+      (is (str/includes? out "  default: NEW"))
+      (is (not (str/includes? out "old")) "the old value must be gone — not a silent no-op")))
+
+  (testing "duplicate top-level model: blocks: the LAST is what the reader keeps"
+    (let [out (profile/set-model-text "model:\n  default: first\nmodel:\n  default: second\n" "NEW" nil)]
+      (is (str/includes? out "  default: first") "the ignored first block is left alone")
+      (is (str/includes? out "  default: NEW"))
+      (is (not (str/includes? out "second")))
+      (is (= "NEW" (get-in (parse-yaml out) ["model" "default"])) "the reader resolves NEW"))))
+
+(deftest separators-are-transparent-and-comments-stay-real
+  (testing "'---' between opener and children does not end the block (the reader drops it)"
+    (let [out (profile/set-model-text "model:\n---\n  default: old\n" "NEW" nil)]
+      (is (= 1 (count (re-seq #"(?m)^\s+default:" out))))
+      (is (str/includes? out "  default: NEW"))
+      (is (not (str/includes? out "old")))))
+
+  (testing "'---' with a trailing comment is transparent too (the reader strips first)"
+    (doseq [sep ["--- # note" "---\t#c"]]
+      (let [out (profile/set-model-text (str "model:\n" sep "\n  default: old\n") "NEW" nil)]
+        (is (= 1 (count (re-seq #"(?m)^\s+default:" out))) (str "sep " sep))
+        (is (not (str/includes? out "old")) (str "sep " sep)))))
+
+  (testing "single-quoted values: a # inside is not a comment start"
+    (let [out (profile/set-model-text "model:\n  default: 'a # b'\n" "NEW" nil)]
+      (is (= "model:\n  default: NEW\n" out))))
+
+  (testing "a # inside a quoted value is not a comment start (no fabricated comments)"
+    (let [out (profile/set-model-text "model:\n  default: \"a # b\"\n" "NEW" nil)]
+      (is (= "model:\n  default: NEW\n" out)))
+    (let [out (profile/set-model-text "model:\n  default: \"a # b\" # real\n" "NEW" nil)]
+      (is (= "model:\n  default: NEW # real\n" out)))))
+
+(deftest folded-values-are-refused-not-rewritten
+  ;; the R7 gate: the reader folds multi-line scalars into one logical line;
+  ;; this editor is physical-line based, so a wrapped value must be REFUSED
+  ;; (fail closed), never silently miswritten as NEW + continuation
+  (testing "a value continuing on a deeper line is refused"
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: old\n    /v2\n" "NEW" nil))))
+  (testing "an unclosed quote value is refused"
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: \"old\n" "NEW" nil))))
+  (testing "a closed scalar with a trailing comment is NOT folded (no false refusal)"
+    (is (string? (profile/set-model-text "model:\n  default: \"a # b\" # real\n" "NEW" nil))))
+  (testing "an EARLIER duplicate's folded value is refused too (the R8 gate)"
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: old\n    /v2\n  default: second\n" "NEW" nil))))
+  (testing "escaped-quote unclosed scalars are refused (escape-aware)"
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: \"fo\\\"\n" "NEW" nil)))
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: 'it''s\n" "NEW" nil))))
+  (testing "an escaped quote that CLOSES properly is not folded"
+    (is (string? (profile/set-model-text "model:\n  default: \"fo\\\"\"\n" "NEW" nil))))
+  (testing "a quoted value with TRAILING JUNK is unclosed to the reader (the R9 gate)"
+    ;; the reader folds the rest of the file into "a"x — the gate must
+    ;; refuse, never edit in place
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: \"a\"x\ncont-line\nnext: 1\n" "NEW" nil)))
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: \"a\" \"b\"\n" "NEW" nil))))
+  (testing "the APPEND path refuses too when any line's quote is unclosed"
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "foo: \"bar\n" "NEW" nil))))
+  (testing "the reader's OTHER fold triggers are guarded too (the R11 gate)"
+    ;; sequence items and quoted keys with embedded colons open folds the
+    ;; key: value regex alone would miss
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "list:\n  - \"unclosed\nmodel:\n  default: old\n" "NEW" nil)))
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "\"a:b\": \"unclosed\nmodel:\n  default: old\n" "NEW" nil))))
+  (testing "the '' single-quote pair closes per the reader (no false refusal)"
+    (is (string? (profile/set-model-text "model:\n  default: 'it''s'\n" "NEW" nil))))
+  (testing "a BLOCK-SCALAR body separated by blank lines is folded (the R12 gate)"
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: |\n\n    body\n  provider: x\n" "NEW" nil))))
+  (testing "ALL block-scalar markers are guarded (the R14 gate: |+, >+, and comments)"
+    (doseq [v ["|+" ">+" "| # note" "> # note"]]
+      (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                            (profile/set-model-text (str "model:\n  default: " v "\n\n    body\n  provider: x\n") "NEW" nil))
+          (str "marker " v))))
+  (testing "whitespace-only text still yields parseable output (the R14 separator gate)"
+    (is (= "   \nmodel:\n  default: NEW\n" (profile/set-model-text "   " "NEW" nil))))
+  (testing "a SEQUENCE-valued model block is refused (the R13 gate)"
+    (is (thrown-with-msg? js/Error #"refusing to edit a model block that is a sequence"
+                          (profile/set-model-text "model:\n  - a\n" "NEW" nil)))
+    (is (thrown-with-msg? js/Error #"refusing to edit a model block that is a sequence"
+                          (profile/set-model-text "model:\n  - a\n  - b\n" "NEW" nil))))
+  (testing "the seq-item + colon-in-quoted-key COMBINATION is guarded (the R12 gate)"
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "list:\n  - \"a:b\": \"unclosed\nmodel:\n  default: old\n" "NEW" nil))))
+  (testing "control characters the escape set cannot carry are refused"
+    ;; raw CR breaks the reader's line scanning and the escape set cannot
+    ;; encode it — refuse CR and exotic controls, never corrupt
+    (is (thrown-with-msg? js/Error #"control character"
+                          (profile/set-model-text "" "a\rb" nil)))
+    (is (thrown-with-msg? js/Error #"control character"
+                          (profile/set-model-text "" "a\u0001b" nil)))))
+
+(deftest config-mode-is-preserved
+  (let [home (str "/tmp/test-model-mode-" (.-pid js/process) "-" (random-uuid))]
+    (.mkdirSync fs home #js {:recursive true})
+    (profile/set-config-model! home "first/model" nil)
+    (testing "a new config lands owner-only (0600), the token-bearing convention"
+      (is (= 384 (bit-and 511 (.-mode (fs/statSync (str home "/config.yaml")))))))
+    (testing "a stricter operator mode is preserved across a set"
+      (fs/chmodSync (str home "/config.yaml") 256) ;; 0400
+      (profile/set-config-model! home "second/model" nil)
+      (is (= 256 (bit-and 511 (.-mode (fs/statSync (str home "/config.yaml"))))))
+      (is (= "second/model" (get-in (parse-yaml (h/slurp (str home "/config.yaml"))) ["model" "default"]))))
+    (fs/rmSync home #js {:recursive true :force true})))
+
+(deftest set-config-model-writes-and-reads-back
+  (let [home (str "/tmp/test-model-setter-" (.-pid js/process) "-" (random-uuid))]
+    (.mkdirSync fs home #js {:recursive true})
+    (profile/set-config-model! home "first/model" "prov1")
+    (let [cfg (profile/read-yaml-file (str home "/config.yaml"))]
+      (is (= "first/model" (get-in cfg ["model" "default"])))
+      (is (= "prov1" (get-in cfg ["model" "provider"]))))
+    (profile/set-config-model! home "second/model" nil)
+    (let [cfg (profile/read-yaml-file (str home "/config.yaml"))]
+      (is (= "second/model" (get-in cfg ["model" "default"])))
+      (is (= "prov1" (get-in cfg ["model" "provider"]))))))
