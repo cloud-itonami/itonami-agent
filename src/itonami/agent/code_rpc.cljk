@@ -170,6 +170,16 @@
             failure-hint-rules))))
 
 
+(defn hint-on-failure
+  "Hermes' failure-only gating (code_kernel.py: the hint is built for cells
+  whose status is `error`): a recovery hint belongs to a FAILED run — non-zero
+  exit or timeout — never to a success whose output merely mentions an error
+  wording. Note the scan window is stderr, a harmless superset of Hermes'
+  traceback-only scan."
+  [exit timed-out? stderr enabled]
+  (when (or (true? timed-out?) (not= 0 exit))
+    (failure-hint stderr enabled)))
+
 (defn generate-hermes-tools
   "Source of the hermes_tools.py stub module for SANDBOX_ALLOWED_TOOLS ∩
   `enabled` — byte-identical to

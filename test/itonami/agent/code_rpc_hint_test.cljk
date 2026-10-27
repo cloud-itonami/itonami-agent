@@ -4,7 +4,7 @@
   (:require [cljs.test :refer [deftest is testing]]
             [itonami.agent.code-rpc :as code-rpc]))
 
-(deftest failure-hint-rules
+(deftest failure-hint-basics
   (testing "a missing hermes_tools name lists what IS importable"
     (let [h (code-rpc/failure-hint "ImportError: cannot import name 'zebra' from 'hermes_tools'" ["terminal" "read_file"])]
       (is (re-find #"'zebra' is not available" h))
@@ -28,6 +28,12 @@
                  (code-rpc/failure-hint (str "ModuleNotFoundError: No module named 'numpy'\n"
                                              "TypeError: string indices must be integers")
                                         nil))))
+  (testing "the hint belongs to FAILED runs only (Hermes gates on error status)"
+    (let [err "ModuleNotFoundError: No module named 'x'"]
+      (is (re-find #"'x' is not installed" (code-rpc/hint-on-failure 1 false err nil)))
+      (is (re-find #"'x' is not installed" (code-rpc/hint-on-failure 0 true err nil)))
+      (is (nil? (code-rpc/hint-on-failure 0 false err nil)))
+      (is (re-find #"not installed" (code-rpc/hint-on-failure nil false err nil)))))
   (testing "no match, blank, and oversized stderr never throw — hint or nil"
     (is (nil? (code-rpc/failure-hint "something else entirely" nil)))
     (is (nil? (code-rpc/failure-hint "" nil)))
