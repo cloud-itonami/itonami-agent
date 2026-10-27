@@ -240,6 +240,19 @@
                (sids (call ctx {"query" "modpack" "limit" 5 "exclude_session_ids" ["s_newest"]}))))))
     (h/rm root)))
 
+(deftest fts-syntax-errors-degrade-but-io-errors-surface
+  ;; the R1 gate: only fts5 SYNTAX errors become "no content rows"; a
+  ;; blanket catch would turn corruption/IO into a successful empty result
+  (testing "an unbalanced-quote query degrades to empty content rows, not a throw"
+    (let [root (h/join (h/tmp-dir) (str "itonami-fts-degrade-" (h/random-hex 4)))
+          work (h/join root "profiles" "work")]
+      (make-state-db! (h/join work "state.db")
+                      [{:id "s1" :title "don't panic" :started 100}]
+                      [{:id 1 :session "s1" :role "user" :content "don't panic"}])
+      (let [res (call {:home work :cwd work} {"query" "don't"})]
+        (is (nil? (get res "error")) "an fts5 syntax error is not a tool error")
+        (is (map? res))))))
+
 (deftest exclusion-drops-whole-lineage
   ;; Hermes test_exclude_session_ids_drops_whole_lineage (`_excluded_lineage_roots`):
   ;; a child id also hides its parent chain, and the exclusion backfills from the

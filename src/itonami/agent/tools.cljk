@@ -1828,9 +1828,11 @@
   (Hermes' canonical \"Bot Chat\" exception is Bot Mode identity routing and has
   no counterpart here.)"
   [db title]
-  (let [exact (get (first (sqlite-records db "SELECT id FROM sessions WHERE title = ?" title)) "id")
+  ;; both queries filter visibility: a hidden session must not swallow the
+  ;; title of a visible one sharing it (the R1 suggestion)
+  (let [exact (get (first (sqlite-records db "SELECT id FROM sessions WHERE title = ? AND COALESCE(hidden, 0) = 0" title)) "id")
         numbered (sqlite-records db
-                   "SELECT id FROM sessions WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC"
+                   "SELECT id FROM sessions WHERE title LIKE ? ESCAPE '\\' AND COALESCE(hidden, 0) = 0 ORDER BY started_at DESC"
                    (str (session-escape-like title) " #%"))]
     (or (get (first numbered) "id") exact)))
 
@@ -1840,10 +1842,18 @@
   [value]
   (cond
     (or (nil? value) (boolean? value)) nil
-    (number? value) (int value)
-    :else (let [text (str/trim (str value))]
-            (if (re-matches #"-?\d+(?:\.\d+)?" text)
-              (int (js/parseFloat text))
+    ;; Math.trunc, NOT int: CLJS int is 32-bit and wraps after 2038
+    ;; (Python int() is unbounded); trunc matches int()'s toward-zero cut
+    (number? value) (js/Math.trunc value)
+    :else (let [text (str/trim (str value))
+                n (js/Number text)]
+            ;; any finite numeric form Python's int(float(text)) accepts,
+            ;; exponents included ("1e5")
+            ;; the shape Python's float() accepts (no hex/octal/binary —
+            ;; js/Number would take those, Python raises)
+            (if (and (re-matches #"-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?" text)
+                     (js/isFinite n))
+              (js/Math.trunc n)
               (try (session-parse-iso-bound text) (catch :default _ nil))))))
 
 (defn- session-in-time-window
@@ -2038,12 +2048,19 @@
                                               hidden-filter " AND " source-filter " AND m.role IN (" role-sql ") "
                                               window-sql " " order-sql " LIMIT ?")
                                          (into [query] (conj window-params session-discover-scan-limit)))
-                                       ;; hermes_state_search.py search_messages: an FTS5
-                                       ;; syntax error is "no content rows", never a tool
-                                       ;; error (Hermes sanitizes `_sanitize_fts5_query`
-                                       ;; first, which is still unported here) — a quoted
-                                       ;; remembered title must not blow up the scan.
-                                       (catch :default _ []))]
+                                       ;; hermes_state_search.py search_messages splits
+                                       ;; its failures: an FTS5 SYNTAX error is "no
+                                       ;; content rows" (Hermes sanitizes
+                                       ;; `_sanitize_fts5_query` first, still unported) —
+                                       ;; a quoted remembered title must not blow up the
+                                       ;; scan — while IO/corruption failures are NOT
+                                       ;; silently empty (the R1 gate: a blanket catch
+                                       ;; turned them into a successful no-result). Only
+                                       ;; fts5 syntax degrades; everything else surfaces.
+                                       (catch :default e
+                                         (if (str/includes? (str (.-message e)) "fts5:")
+                                           []
+                                           (throw e))))]
                             ;; `_discover`'s dedup: one hit per lineage (lineage root ->
                             ;; first surviving scan row, `parent_session_id` grouping the
                             ;; child under its root) up to `limit` — parent/child runs of
