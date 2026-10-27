@@ -1,0 +1,34 @@
+(ns itonami.agent.pause
+  "Hermes `hermes pause` / `resume` — the emergency stop — as a marker under
+  the itonami root. One flag for the whole store: cron dispatch, `gateway
+  serve` turns, and manual cron runs all gate on it (Hermes: 'pause cron/kanban
+  dispatch and new gateway turns'). One-shot `-z` is not a gateway turn and is
+  left alone, exactly as Hermes leaves the CLI."
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]
+            [itonami.agent.p2p :as p2p]))
+
+(defn- marker [] (h/join (p2p/itonami-dir) "paused"))
+
+(defn pause!
+  "Set the emergency stop. `reason` is recorded with the timestamp (never
+  secrets). Idempotent."
+  ([] (pause! nil))
+  ([reason]
+   (h/mkdirs (p2p/itonami-dir))
+   (h/spit (marker) (str (h/iso-local) (when-not (clojure.string/blank? (str reason)) (str " " reason)) "\n"))
+   true))
+
+(defn resume!
+  "Lift the emergency stop. Idempotent; returns whether a stop was lifted."
+  []
+  (let [existed? (h/file? (marker))]
+    (when existed? (h/rm (marker)))
+    existed?))
+
+(defn active? [] (h/file? (marker)))
+
+(defn since
+  "The pause record (timestamp + reason) when the stop is active, else nil."
+  []
+  (when (h/file? (marker)) (clojure.string/trim (h/slurp (marker)))))
