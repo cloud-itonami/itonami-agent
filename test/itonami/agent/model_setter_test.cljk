@@ -156,6 +156,19 @@
     (let [out (profile/set-model-text "model:\n  default: \"a # b\" # real\n" "NEW" nil)]
       (is (= "model:\n  default: NEW # real\n" out)))))
 
+(deftest folded-values-are-refused-not-rewritten
+  ;; the R7 gate: the reader folds multi-line scalars into one logical line;
+  ;; this editor is physical-line based, so a wrapped value must be REFUSED
+  ;; (fail closed), never silently miswritten as NEW + continuation
+  (testing "a value continuing on a deeper line is refused"
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: old\n    /v2\n" "NEW" nil))))
+  (testing "an unclosed quote value is refused"
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: \"old\n" "NEW" nil))))
+  (testing "a closed scalar with a trailing comment is NOT folded (no false refusal)"
+    (is (string? (profile/set-model-text "model:\n  default: \"a # b\" # real\n" "NEW" nil)))))
+
 (deftest config-mode-is-preserved
   (let [home (str "/tmp/test-model-mode-" (.-pid js/process) "-" (random-uuid))]
     (.mkdirSync fs home #js {:recursive true})

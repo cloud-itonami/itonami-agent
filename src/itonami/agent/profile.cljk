@@ -268,7 +268,7 @@
                                                ;; any comment: `model:#c` is
                                                ;; a scalar value to the
                                                ;; reader, not this opener
-                                               (re-matches #"model:(\s+(#.*)?)?" l))
+                                               (re-matches #"(?:\"model\"|'model'|model)\s*:(\s+(#.*)?)?" l))
                                       i))
                                   lines))
         block-end (if (nil? start)
@@ -287,9 +287,30 @@
                                              (count (re-find #"^\s*" l))))
                                     2))
         pad (apply str (repeat child-indent " "))
-        ;; the key shapes the reader's split-key accepts: quoted (double or
-        ;; single) or bare, with optional spaces before the colon
-        key-rx (fn [k] (re-pattern (str "^" pad "(?:\"|')?" k "(?:\"|')?\\s*:.*$")))
+        ;; SYMMETRIC quotes only, matching split-key's three shapes exactly
+        key-rx (fn [k] (re-pattern (str "^" pad "(?:\"" k "\"|'" k "'|" k ")\\s*:.*$")))
+        ;; the reader FOLDS multi-line scalars into one logical line; this
+        ;; edit is physical-line based, so a wrapped value would be silently
+        ;; miswritten (or leave the file unparseable). Refuse instead (the
+        ;; R7 gate — fail closed on shapes this editor cannot honor)
+        folded? (fn [ls idx]
+                  (let [l (nth ls idx)
+                        after (subs l (dec (count l)))
+                        ;; unclosed-quote detection: the value OPENS a quote
+                        ;; that never closes — a closed scalar with a trailing
+                        ;; comment is fine (the R7 false-positive gate)
+                        opens (let [v (second (re-find #"^\s*[^:]+:\s*(.*)$" l))]
+                                (when v
+                                  (or (and (str/starts-with? v "\"")
+                                           (nil? (str/index-of (subs v 1) "\"")))
+                                      (and (str/starts-with? v "'")
+                                           (nil? (str/index-of (subs v 1) "'"))))))
+                        nxt (get ls (inc idx))
+                        deeper? (fn [x] (when (and x (re-matches #"\s+\S.*" x)
+                                                   (not (re-matches #"\s*#.*" x)))
+                                          (> (count (re-find #"^\s*" x))
+                                             (count (re-find #"^\s*" l)))))]
+                    (or opens (deeper? nxt))))
         ;; the SAME scanner as the reader's strip-comment (single quotes
         ;; open too, backslash escapes inside double quotes, any whitespace
         ;; before '#') — the comment tail is exactly what the reader would
@@ -340,14 +361,20 @@
            "\n")
 
       :else
-      ;; replace-key replaces IN PLACE when the key exists (the R2 gate: no
-      ;; drop-then-append, so comments stay attached to their keys and the
-      ;; key order is preserved); a model-only write never touches provider
-      (let [body (cond-> body
-                   true (replace-key "default" model)
-                   (not (str/blank? (str provider))) (replace-key "provider" provider))]
+      (let [key-idx (fn [k] (last (keep-indexed (fn [i l] (when (re-matches (key-rx k) l) i)) body)))
+            _ (doseq [k (cond-> ["default"] (not (str/blank? (str provider))) (conj "provider"))
+                        :let [idx (key-idx k)]
+                        :when (and idx (folded? body idx))]
+                (throw (js/Error. (str "refusing to edit a folded multi-line model." k
+                                       " — unwrap it by hand first"))))]
+        ;; replace-key replaces IN PLACE when the key exists (the R2 gate: no
+        ;; drop-then-append, so comments stay attached to their keys and the
+        ;; key order is preserved); a model-only write never touches provider
+        (let [body (cond-> body
+                     true (replace-key "default" model)
+                     (not (str/blank? (str provider))) (replace-key "provider" provider))]
         (str (str/join "\n" (concat (subvec (vec lines) 0 start) body (subvec (vec lines) block-end)))
-             (when (seq lines) "\n"))))))
+             (when (seq lines) "\n")))))))
 
 (defn set-config-model!
   "Persist the default model (and optional provider) in the profile's
