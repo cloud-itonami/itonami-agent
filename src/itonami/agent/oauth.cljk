@@ -78,7 +78,7 @@
 
 ;; ---------------------------------------------------------------- token store
 
-(defn- store-name [server]
+(defn store-name [server]
   (subs (str/replace (str server) #"[^A-Za-z0-9_]" "_") 0 128))
 
 (defn save-login!

@@ -18,6 +18,7 @@
             [itonami.agent.webguard :as webguard]
             [itonami.agent.process :as process]
             [itonami.agent.code-rpc :as code-rpc]
+            [itonami.agent.connections :as connections]
             [itonami.agent.homeassistant :as homeassistant]
             [itonami.agent.profile :as profile]
             [itonami.agent.provider :as provider]
@@ -352,6 +353,12 @@
               {"domain" {"type" "string"} "service" {"type" "string"}
                "entity_id" {"type" "string"} "data" {"type" "string"}}
               ["domain" "service"])
+   "manage_connections"
+   (fn-schema "manage_connections"
+     "Check or describe connection surfaces. Two kinds exist: hosted connector accounts (a tool-gateway integration, answered here with a named error) and local MCP servers (configured state plus cached OAuth auth). Slice 1 is read-only; installing or authorizing a connection is a later slice. Pass connectors=[{name, mcp?}]; with none, every configured surface is listed."
+     {"connections" {"type" "array"
+                     "description" "Connector requests: [{\"name\": ..., \"mcp\": bool}]. Omit to list everything configured."}}
+     [])
    "computer_use" (computer-use/schema)})
 
 (def hermes-core-tools
@@ -2981,6 +2988,15 @@
 (defn- vault-filled? [r]
   (true? (get-in (h/json-parse r) ["result" "result" "value"])))
 
+(defn manage-connections
+  "Hermes manage_connections, slice 1: read-only connection surfaces
+  (connections.cljk)."
+  [ctx {:strs [connections]}]
+  (let [rows (connections/connection-status (:config ctx) (:tool-env ctx) (:home ctx) connections)]
+    (if-let [e (get rows "error")]
+      (err e)
+      (ok {"connections" rows}))))
+
 (defn browser-vault-list [ctx _args]
   (let [home (:home ctx)
         items (->> (keys (vault/load-logins home))
@@ -3068,7 +3084,7 @@
    "browser_press" browser/press "browser_get_images" browser/get-images
    "browser_console" browser/console-output
    "browser_cdp" browser/cdp-send "browser_dialog" browser/dialog
-   "browser_vault_list" browser-vault-list "browser_vault_unlock" browser-vault-unlock
+   "manage_connections" manage-connections "browser_vault_list" browser-vault-list "browser_vault_unlock" browser-vault-unlock
    "browser_vault_save_login" browser-vault-save-login "browser_vault_enter_code" browser-vault-enter-code
    "browser_vault_fill" browser-vault-fill "browser_exec" browser/exec-code
    "browser_vision" browser-vision
