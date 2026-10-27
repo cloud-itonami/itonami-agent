@@ -1305,12 +1305,13 @@
 
 (defn- pid-live?
   "A pid file's owner is LIVE unless kill says ESRCH. EPERM means the process
-  EXISTS but is ours no more — that is still live (the R1 gate: treating
-  every kill failure as dead lets a foreign owner be overwritten). 0 and 1
-  are never a gateway owner."
+  EXISTS but is ours no more — that is still live (the R1 gate). Only pids in
+  2..2^31-1 are checkable at all: out-of-int32 numerics make process.kill
+  throw ERR_INVALID_ARG_TYPE and must read as garbage, not as a live owner
+  (the R2 gate). 0 and 1 are never a gateway owner."
   [s]
   (let [n (when (and s (re-matches #"\d+" s)) (js/parseInt s 10))]
-    (if (or (nil? n) (< n 2))
+    (if (or (nil? n) (< n 2) (> n 2147483647))
       false
       (try (js/process.kill n 0)
            true
@@ -1325,21 +1326,45 @@
   taken over. Returns {:pid ...} on claim, {:error ...} on refusal."
   ([dir name] (claim-pid! dir name 3))
   ([dir name attempts]
-   (let [p (h/join dir name)]
+   (let [p (h/join dir name)
+         me (str (.-pid js/process))]
      (try
        (let [fd (fs/openSync p "wx")]
-         (try (fs/writeSync fd (str (.-pid js/process)))
+         (try (fs/writeSync fd me)
               (finally (fs/closeSync fd)))
-         {:pid (.-pid js/process)})
+         ;; VERIFY-AFTER-CLAIM: a stale-reclaim race can still let another
+         ;; starter unlink our fresh file and claim after us. Re-read after a
+         ;; grace delay; if the file is no longer OURS, we lost — re-run and
+         ;; let the liveness check sort out the winner (one survivor).
+         (js/Atomics.wait (js/Int32Array. (js/SharedArrayBuffer. 4)) 0 0 60)
+         (if (= me (try (str/trim (h/slurp p)) (catch :default _ nil)))
+           {:pid (.-pid js/process)}
+           (if (pos? attempts)
+             (claim-pid! dir name (dec attempts))
+             {:error (str name " claim was raced away; not starting")})))
        (catch :default e
          (cond
            (not= "EEXIST" (.-code e))
            {:error (str name " pid file cannot be claimed: " (or (.-message e) e))}
 
+           (not (h/file? p))
+           ;; vanished between open and read: retry the claim
+           (if (pos? attempts) (claim-pid! dir name (dec attempts))
+               {:error (str name " pid file keeps reappearing; not claiming")})
+
            (pos? attempts)
-           (let [existing (try (str/trim (h/slurp p)) (catch :default _ nil))]
-             (if (pid-live? existing)
+           (let [existing (try (str/trim (h/slurp p))
+                               (catch :default _ ::read-failed))]
+             (cond
+               ;; an EXISTS-but-unreadable pid file is not proven stale:
+               ;; refuse (the R2 gate — never delete on a read failure)
+               (= ::read-failed existing)
+               {:error (str name " pid file exists but is unreadable; not claiming")}
+
+               (pid-live? existing)
                {:error (str name " is already running (pid " existing ")")}
+
+               :else
                (do (try (fs/unlinkSync p) (catch :default _ nil))
                    (claim-pid! dir name (dec attempts)))))
 

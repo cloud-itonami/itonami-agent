@@ -32,6 +32,9 @@
             second-claim (main/claim-pid! dir "gateway.pid")]
         (is (= (.-pid js/process) (:pid first-claim)))
         (is (re-find #"already running" (str (:error second-claim))))))
+    (testing "out-of-int32 numeric content is garbage, not a live owner"
+      (h/spit (h/join dir "gateway.pid") "2147483648")
+      (is (nil? (:error (main/claim-pid! dir "gateway.pid")))))
     (testing "pid 0 and 1 are never a live owner"
       (doseq [v ["0" "1"]]
         (h/spit (h/join dir "gateway.pid") v)
@@ -41,4 +44,5 @@
   (let [dir (str "/tmp/test-pid-guard2-" (.-pid js/process) "-" (random-uuid))]
     (.mkdirSync fs dir #js {:recursive true})
     (let [claim (main/claim-pid! dir "gateway-serve.pid")]
-      (is (= (.-pid js/process) (:pid claim))))))
+      (is (= (.-pid js/process) (:pid claim))))
+    (fs/rmSync dir #js {:recursive true :force true})))
