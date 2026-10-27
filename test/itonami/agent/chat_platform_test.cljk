@@ -172,3 +172,39 @@
                     (is (re-find #"/botTOKEN/getUpdates" @fetched))
                     (done)))
           (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
+
+(deftest dispatch-send-failure-is-not-replied
+  (async done
+    (let [home (tmp-home "sendfail")
+          profiles [{:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}} :home home}]
+          dispatch (chat/make-dispatcher
+                    {:profiles profiles
+                     :executor (stub-executor (atom []) "A" nil)
+                     :run-opts (fn [_ _] {})
+                     :send! (fn [_ _ _] (p/resolved "boom"))})]
+      (-> (dispatch "telegram" (tg-update 1 "c1" "hi"))
+          (p/then (fn [r]
+                    (testing "a failed send is never reported as replied"
+                      (is (= :send-failed (:status r)))
+                      (is (= "boom" (:error r))))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
+
+(deftest dispatch-corrupt-history-does-not-hang
+  (async done
+    (let [home (tmp-home "corrupt")
+          profiles [{:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}} :home home}]
+          dispatch (chat/make-dispatcher
+                    {:profiles profiles
+                     :executor (stub-executor (atom []) "A" nil)
+                     :run-opts (fn [_ _] {})
+                     :send! (fn [_ _ _] (p/resolved nil))})]
+      ;; a corrupt transcript line: load-history's json-parse throws synchronously
+      (h/mkdirs (h/join home "chat"))
+      (h/spit (h/join home "chat" "telegram-c1.jsonl") "{not json\n")
+      (-> (dispatch "telegram" (tg-update 1 "c1" "hi"))
+          (p/then (fn [r]
+                    (testing "the turn answers with a failure status instead of hanging"
+                      (is (= :turn-failed (:status r))))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "hung or crashed: " (.-message e))) (done)))))))

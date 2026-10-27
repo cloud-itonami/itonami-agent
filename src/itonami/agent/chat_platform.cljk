@@ -149,8 +149,7 @@
   the caller names the platform it received the update from."
   [{:keys [profiles executor run-opts send! on-event]}]
   (let [seen (atom #{})
-        busy (atom {})
-        queues (atom {})
+        state (atom {:queues {} :busy #{}})
         emit (fn [e] (when on-event (on-event e)))
         chat-key (fn [m] (str (get m "platform") ":" (get m "chat_id")))
         run-one (fn [msg]
@@ -174,30 +173,61 @@
                                         (emit {:event :turn :msg msg :exit-reason (:exit-reason r)})
                                         (if (= "completed" (:exit-reason r))
                                           (-> (send! prof msg final)
-                                              (p/then (fn [_] {:status :replied :reply final})))
+                                              (p/then (fn [res]
+                                                        (if (nil? res)
+                                                          {:status :replied :reply final}
+                                                          {:status :send-failed :reply final :error (str res)}))))
                                           (-> (send! prof msg (str "The turn failed: " (:exit-reason r)
                                                               (when-let [e (get-in r [:error :error])] (str " — " e))))
-                                              (p/then (fn [_] {:status :turn-failed :exit-reason (:exit-reason r)})))))))
+                                              (p/then (fn [res]
+                                                        {:status :turn-failed :exit-reason (:exit-reason r)
+                                                         :notice (if (nil? res) :delivered (str res))})))))))
                             (p/catch (fn [e]
                                        (emit {:event :turn-error :msg msg :error (.-message e)})
                                        (p/resolved {:status :turn-failed :error (.-message e)}))))))))
         pop-next! (fn [k]
-                    (let [nxt (atom nil)]
-                      (swap! queues (fn [qs]
-                                      (let [q (get qs k)]
-                                        (if (seq q)
-                                          (do (reset! nxt (first q))
-                                              (assoc qs k (vec (rest q))))
-                                          qs))))
-                      @nxt))
+                    ;; atomic: one compare-and-set takes the head, never a
+                    ;; side effect inside swap!
+                    (loop []
+                      (let [st @state
+                            q (get-in st [:queues k])
+                            nxt (first q)]
+                        (if (nil? nxt)
+                          nil
+                          (if (compare-and-set! state st (assoc-in st [:queues k] (vec (rest q))))
+                            nxt
+                            (recur))))))
+        claim! (fn [k]
+                 ;; true = this caller owns the chat's pump
+                 (loop []
+                   (let [st @state]
+                     (cond
+                       (contains? (:busy st) k) false
+                       (compare-and-set! state st (update st :busy conj k)) true
+                       :else (recur)))))
+        release! (fn [k]
+                   ;; one atomic transition: drop the claim only while the
+                   ;; queue is empty. true = released; false = a message
+                   ;; arrived meanwhile and the claim is kept.
+                   (loop []
+                     (let [st @state]
+                       (cond
+                         (seq (get-in st [:queues k])) false
+                         (compare-and-set! state st (update st :busy disj k)) true
+                         :else (recur)))))
         pump! (fn pump! [k]
-                (if-let [{:keys [msg resolve]} (pop-next! k)]
-                  (-> (run-one msg)
-                      (p/then (fn [r] (resolve r) (pump! k)))
+                (if-let [{:keys [msg res-fn]} (pop-next! k)]
+                  ;; run-one enters through a promise boundary: a synchronous
+                  ;; throw (corrupt history, a bad injected fn) becomes a
+                  ;; rejection the catch below answers — never a hung caller
+                  (-> (p/resolved nil)
+                      (p/then (fn [_] (run-one msg)))
+                      (p/then (fn [r] (res-fn r) (pump! k)))
                       (p/catch (fn [e]
-                                 (resolve {:status :turn-failed :error (.-message e)})
+                                 (res-fn {:status :turn-failed :error (.-message e)})
                                  (pump! k))))
-                  (swap! busy dissoc k)))]
+                  (when-not (release! k)
+                    (pump! k))))]
     ;; dispatch resolves when THIS message's turn (and reply) finished, even
     ;; when it waited behind another message in the same chat
     (fn dispatch [platform raw]
@@ -210,11 +240,10 @@
               (do (emit {:event :drop :reason (:drop g)})
                   (p/resolved {:status :dropped :reason (:drop g)}))
               (let [k (chat-key msg)
-                    resolve (atom nil)
-                    done (js/Promise. (fn [res] (reset! resolve res)))]
-                (swap! queues update k (fnil conj []) {:msg msg :resolve @resolve})
-                (when-not (contains? @busy k)
-                  (swap! busy assoc k true)
+                    res-fn (atom nil)
+                    done (js/Promise. (fn [res] (reset! res-fn res)))]
+                (swap! state update-in [:queues k] (fnil conj []) {:msg msg :res-fn @res-fn})
+                (when (claim! k)
                   (pump! k))
                 done))))))))
 
