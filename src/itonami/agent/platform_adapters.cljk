@@ -451,7 +451,10 @@
           agent-id (get c "agent_id")
           chat-id (get c "chat_id")]
       (when (and (not (str/blank? (str chat-id)))
-                 (some? agent-id)
+                 ;; agentid is NUMERIC on the wire (the R1 gate: (some?)
+                 ;; accepted "" and false, sending an agentid the API
+                 ;; rejects); numbers and numeric strings both pass
+                 (re-matches #"\d+" (str agent-id))
                  (or (not (str/blank? (str token)))
                      (and (not (str/blank? (str corp-id)))
                           (not (str/blank? (str corp-secret))))))

@@ -46,7 +46,12 @@
       (is (fn? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" 10 "chat_id" "u1"}}}))))
     (with-redefs [h/env (fn [_] nil)]
       (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" 10 "chat_id" "u1" "corp_id" "cid" "corp_secret" "s"}}})))))
-  (testing "agent_id is required on every request; no chat_id means no adapter"
+  (testing "agent_id is required AND numeric on every request; no chat_id means no adapter"
     (with-redefs [h/env (fn [k] (when (= k "WECOM_ACCESS_TOKEN") "tok"))]
-      (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"chat_id" "u1"}}}))))
+      (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"chat_id" "u1"}}})))
+      (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" "" "chat_id" "u1"}}}))
+          "an empty agent_id is not an identity")
+      (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" false "chat_id" "u1"}}})))
+      (is (fn? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" "1000002" "chat_id" "u1"}}}))
+          "a numeric string is a valid agent_id"))
     (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" 10}}})))))
