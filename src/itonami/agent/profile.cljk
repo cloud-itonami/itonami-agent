@@ -235,7 +235,7 @@
   ;; (bare, or a quoted key that may contain colons) and `- v` sequence
   ;; items — yaml.cljk's head-value alternatives, each of which can open a
   ;; fold (the R11 gate)
-  (let [v (or (second (re-find #"^\s*(?:\"[^\"]*\"|'[^']*'|[^:]+)\s*:\s*(.*)$" l))
+  (let [v (or (second (re-find #"^\s*(?:-\s+)?(?:\"[^\"]*\"|'[^']*'|[^:]+)\s*:\s*(.*)$" l))
               (second (re-find #"^\s*-\s+(\S.*)$" l)))
         unclosed? (fn [v q esc-form?]
                     (loop [i 1 esc? false]
@@ -343,11 +343,19 @@
                   (let [l (nth ls idx)
                         opens (line-unclosed-value? l)
                         nxt (get ls (inc idx))
+                        ;; a BLOCK-SCALAR opener (|, >, |-, >-) folds BLANK lines before
+                        ;; its body (join-raw's block branch) — the immediate-next-line check
+                        ;; alone misses it (the R12 gate)
+                        block-scalar? (when-let [v (second (re-find #"^\s*[^:]+:\s*(.*)$" l))]
+                                        (contains? #{"|" ">" "|-" ">-"} (str/trim v)))
                         deeper? (fn [x] (when (and x (re-matches #"\s+\S.*" x)
                                                    (not (re-matches #"\s*#.*" x)))
                                           (> (count (re-find #"^\s*" x))
-                                             (count (re-find #"^\s*" l)))))]
-                    (or opens (deeper? nxt))))
+                                             (count (re-find #"^\s*" l)))))
+                        any-deeper? (when block-scalar?
+                                      (some (fn [x] (and x (re-matches #"\s+\S.*" x) (deeper? x)))
+                                            (drop 1 ls)))]
+                                    (or opens any-deeper? (deeper? nxt))))
         ;; the SAME scanner as the reader's strip-comment (single quotes
         ;; open too, backslash escapes inside double quotes, any whitespace
         ;; before '#') — the comment tail is exactly what the reader would
