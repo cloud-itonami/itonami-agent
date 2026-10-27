@@ -354,8 +354,16 @@
                         ;; a BLOCK-SCALAR opener (|, >, |-, >-) folds BLANK lines before
                         ;; its body (join-raw's block branch) — the immediate-next-line check
                         ;; alone misses it (the R12 gate)
-                        block-scalar? (when-let [v (second (re-find #"^\s*[^:]+:\s*(.*)$" l))]
-                                        (contains? #{"|" ">" "|-" ">-"} (str/trim v)))
+                        ;; the reader's block trigger is on the COMMENT-STRIPPED value and
+                        ;; the full [|>][-+]? marker set (the R14 gate: |+/>+ chomping and
+                        ;; `| # note` slipped past an exact-set match on the raw line)
+                        block-scalar? (let [c (str/index-of l ":")]
+                                        (when c
+                                          (let [val (str/trim (strip-comment (subs l (inc c))))]
+                                            (and (seq val)
+                                                 (contains? #{\| \>} (first val))
+                                                 (every? #{\- \+} (rest val))
+                                                 (<= (count val) 2)))))
                         deeper? (fn [x] (when (and x (re-matches #"\s+\S.*" x)
                                                    (not (re-matches #"\s*#.*" x)))
                                           (> (count (re-find #"^\s*" x))
@@ -411,7 +419,12 @@
     (cond
       (nil? start)
       (str (str text)
-           (when-not (str/blank? (str text)) "\n")
+           ;; the separator is needed whenever text does not already end in
+           ;; a newline (whitespace-only input parses to {} — gluing the
+           ;; block onto it makes the output unparseable, the R14 gate)
+           (when (and (pos? (count (str text)))
+                      (not (str/ends-with? (str text) "\n")))
+             "\n")
            (str/join "\n" (filter some? ["model:"
                                           (str "  default: " (yaml-scalar model))
                                           (when-not (str/blank? (str provider))
@@ -460,10 +473,10 @@
     (try
       (fs/writeFileSync tmp (set-model-text text model provider) #js {:mode mode :flag "wx"})
       (fs/renameSync tmp p)
+      (fs/chmodSync p mode)
       (catch :default e
         (try (fs/unlinkSync tmp) (catch :default _ nil))
         (throw e)))
-    (fs/chmodSync p mode)
     p))
 
 (def job-definition-keys

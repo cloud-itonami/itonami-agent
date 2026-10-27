@@ -200,6 +200,13 @@
   (testing "a BLOCK-SCALAR body separated by blank lines is folded (the R12 gate)"
     (is (thrown-with-msg? js/Error #"refusing to edit a folded"
                           (profile/set-model-text "model:\n  default: |\n\n    body\n  provider: x\n" "NEW" nil))))
+  (testing "ALL block-scalar markers are guarded (the R14 gate: |+, >+, and comments)"
+    (doseq [v ["|+" ">+" "| # note" "> # note"]]
+      (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                            (profile/set-model-text (str "model:\n  default: " v "\n\n    body\n  provider: x\n") "NEW" nil))
+          (str "marker " v))))
+  (testing "whitespace-only text still yields parseable output (the R14 separator gate)"
+    (is (= "   \nmodel:\n  default: NEW\n" (profile/set-model-text "   " "NEW" nil))))
   (testing "a SEQUENCE-valued model block is refused (the R13 gate)"
     (is (thrown-with-msg? js/Error #"refusing to edit a model block that is a sequence"
                           (profile/set-model-text "model:\n  - a\n" "NEW" nil)))
