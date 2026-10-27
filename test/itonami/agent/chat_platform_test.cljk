@@ -40,17 +40,17 @@
 
 (deftest intake-guards
   (let [seen (atom [])
-        msg {:x 1 :platform "telegram" :update_id "1" :text "hi"}
+        msg {"x" 1 "platform" "telegram" "update_id" "1" "text" "hi"}
         g (chat/guard-message seen msg)]
     (is (= {:ok msg} g))
     (testing "a message already seen is dropped"
       (is (= "duplicate" (:drop (chat/guard-message seen
-                                                    {:platform "telegram" :update_id "1" :text "hi"}))))))
+                                                    {"platform" "telegram" "update_id" "1" "text" "hi"}))))))
   (let [seen (atom [])]
     (testing "empty and oversized texts are dropped"
-      (is (= "empty" (:drop (chat/guard-message seen {:platform "t" :update_id "1" :text "  "}))))
-      (is (= "oversized" (:drop (chat/guard-message seen {:platform "t" :update_id "2"
-                                                          :text (apply str (repeat (inc chat/max-text-chars) "a"))})))))))
+      (is (= "empty" (:drop (chat/guard-message seen {"platform" "t" "update_id" "1" "text" "  "}))))
+      (is (= "oversized" (:drop (chat/guard-message seen {"platform" "t" "update_id" "2"
+                                                          "text" (apply str (repeat (inc chat/max-text-chars) "a"))})))))))
 
 (deftest route-chat-ownership
   (let [profiles [{:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}}}
@@ -97,7 +97,7 @@
                      :run-opts (fn [_ _] {})
                      :send! (fn [_prof msg text] (swap! sent conj [(get msg "chat_id") text])
                                         (p/resolved nil))})]
-      (-> (dispatch (tg-update 1 "c1" "hello"))
+      (-> (dispatch "telegram" (tg-update 1 "c1" "hello"))
           (p/then (fn [r]
                     (is (= :replied (:status r)))
                     (is (= ["hello"] @calls))
@@ -120,11 +120,11 @@
                      :executor (stub-executor calls "A" nil)
                      :run-opts (fn [_ _] {})
                      :send! (fn [_ _ text] (swap! sent conj text) (p/resolved nil))})]
-      (-> (dispatch (tg-update 1 "cX" "nobody owns this chat"))
+      (-> (dispatch "telegram" (tg-update 1 "cX" "nobody owns this chat"))
           (p/then (fn [r] (is (= :unrouted (:status r)))))
-          (p/then (fn [_] (dispatch (tg-update 2 "c1" "hi"))))
+          (p/then (fn [_] (dispatch "telegram" (tg-update 2 "c1" "hi"))))
           (p/then (fn [r] (is (= :replied (:status r)))))
-          (p/then (fn [_] (dispatch (tg-update 2 "c1" "hi"))))
+          (p/then (fn [_] (dispatch "telegram" (tg-update 2 "c1" "hi"))))
           (p/then (fn [r]
                     (is (= :dropped (:status r)))
                     (is (= "duplicate" (:reason r)))
@@ -145,9 +145,9 @@
                      :executor (stub-executor calls "A" gate)
                      :run-opts (fn [_ _] {})
                      :send! (fn [_ _ text] (swap! sent conj text) (p/resolved nil))})
-          first-done (dispatch (tg-update 1 "c1" "one"))]
+          first-done (dispatch "telegram" (tg-update 1 "c1" "one"))]
       ;; this message arrives while the first turn is still running
-      (-> (p/then (dispatch (tg-update 2 "c1" "two"))
+      (-> (p/then (dispatch "telegram" (tg-update 2 "c1" "two"))
                   (fn [_] first-done))
           (p/then (fn [_]
                     (testing "the second message waited its turn instead of interleaving"

@@ -123,9 +123,10 @@
   transcript between requests, nothing else)."
   [home platform chat-id rows]
   (when (seq rows)
-    (let [f (history-path home platform chat-id)]
+    (let [f (history-path home platform chat-id)
+          prior (if (h/file? f) (h/slurp f) "")]
       (h/mkdirs (h/join home "chat"))
-      (h/spit f (str (str/join "" (for [r rows] (str (h/json-str r) "\n"))))))))
+      (h/spit f (str prior (str/join "" (for [r rows] (str (h/json-str r) "\n"))))))))
 
 ;; ---------------------------------------------------------------- dispatch
 
@@ -143,8 +144,9 @@
                   send adapter
     `on-event`    optional (fn [event]) log hook (:drop / :unrouted / :turn)
 
-  Returns a fn: (dispatch raw) -> promise of {:status :queued|:dropped|:unrouted|
-  :replied|:turn-failed ...}."
+  Returns a fn: (dispatch platform raw) -> promise of {:status :queued|:dropped|:unrouted|
+  :replied|:turn-failed ...}. The transport update carries no platform label —
+  the caller names the platform it received the update from."
   [{:keys [profiles executor run-opts send! on-event]}]
   (let [seen (atom #{})
         busy (atom {})
@@ -178,7 +180,7 @@
                                               (p/then (fn [_] {:status :turn-failed :exit-reason (:exit-reason r)})))))))
                             (p/catch (fn [e]
                                        (emit {:event :turn-error :msg msg :error (.-message e)})
-                                       (p/resolved {:status :turn-failed :error (.-message e)})))))))
+                                       (p/resolved {:status :turn-failed :error (.-message e)}))))))))
         pop-next! (fn [k]
                     (let [nxt (atom nil)]
                       (swap! queues (fn [qs]
@@ -198,8 +200,8 @@
                   (swap! busy dissoc k)))]
     ;; dispatch resolves when THIS message's turn (and reply) finished, even
     ;; when it waited behind another message in the same chat
-    (fn dispatch [raw]
-      (let [msg (normalize (get raw "platform") raw)]
+    (fn dispatch [platform raw]
+      (let [msg (normalize platform raw)]
         (if (nil? msg)
           (do (emit {:event :drop :reason "no-turn"})
               (p/resolved {:status :dropped :reason "no-turn"}))
