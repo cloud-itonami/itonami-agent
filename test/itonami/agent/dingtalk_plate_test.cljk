@@ -31,8 +31,9 @@
       (let [m (chat/dingtalk-normalize event)]
         (is (= "dingtalk" (get m "platform")))
         (is (= "hi there" (get m "text")))
-        (is (= "c1" (get m "chat_id")))
-        (is (= "u1" (get m "user_id")))))
+        (is (= "u1" (get m "chat_id")) "chat_id is the REPLY route: the sender user id batchSend addresses")
+        (is (= "u1" (get m "user_id")))
+        (is (= "c1" (get m "thread_id")) "the conversation rides as the thread")))
     (testing "non-text messages carry no turn"
       (is (nil? (chat/dingtalk-normalize (dissoc event "text")))))
     (testing "the dedup id is msgId, then createAt — never the msgtype string"

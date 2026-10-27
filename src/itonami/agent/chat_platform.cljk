@@ -70,10 +70,14 @@
     (when (and m (string? (get m "content")) (not (str/blank? (str uid))))
       {"update_id" (str uid)
        "platform" "dingtalk"
-       "chat_id" (str (get raw "conversationId"))
+       ;; chat_id is the reply ROUTE: oToMessages/batchSend addresses
+       ;; userIds — a user identifier — so the reply lands on the SENDER,
+       ;; not the conversation (the R2 round-trip gate). The conversation
+       ;; id rides along as the thread.
+       "chat_id" (str (or (get raw "senderStaffId") ""))
        "user_id" (str (or (get raw "senderStaffId") ""))
        "user_name" (str (or (get raw "senderNick") ""))
-       "thread_id" ""
+       "thread_id" (str (or (get raw "conversationId") ""))
        "message_id" (str (or (get raw "msgId") ""))
        "text" (get m "content")})))
 
