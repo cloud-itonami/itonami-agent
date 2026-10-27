@@ -49,11 +49,12 @@
 
 (defn synthesize!
   "Run one synthesis and write the audio into <home>/workspace/tts/<sha>.<format>,
-  where the hash covers text+voice+model+format+provider (same request, same
-  bytes; different request, different file). Injected `fetch` for tests;
+  where the hash covers text+voice+model+format+provider+base_url (same
+  request, same bytes; different request, different file). Injected `fetch` for tests;
   `writable?` (a path predicate from the tool ctx) is consulted BEFORE the
   write — a path outside the permitted roots is refused, exactly as
-  write (a nil predicate means ungated — legacy 4-arg call sites). Resolves
+  write-file does (a nil predicate means ungated — legacy 4-arg call sites
+  bind it to nil under kbb/SCI). Resolves
   to a map naming path and format, or a map
   naming the error — a named outcome either way, never a guessed artifact."
   [config home {:strs [text voice model] :as args} fetch writable?]
