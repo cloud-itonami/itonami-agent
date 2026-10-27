@@ -81,6 +81,27 @@
        "message_id" (str (or (get raw "msgId") ""))
        "text" (get m "content")})))
 
+(defn wecom-normalize
+  "WeCom message-push callback (JSON) -> the platform-agnostic inbound
+  message, or nil when the event carries no turn. The dedup id needs a
+  UNIQUE value (MsgId, else CreateTime) — the dingtalk R1 lesson: a
+  type-string fallback silently drops distinct turns. chat_id is the
+  REPLY route (FromUserName — the user id message/send's touser speaks),
+  per the dingtalk R2 lesson."
+  [raw]
+  (let [uid (let [a (get raw "MsgId")] (if (str/blank? (str a)) (get raw "CreateTime") a))]
+    (when (and (= "text" (get raw "MsgType"))
+               (string? (get raw "Content"))
+               (not (str/blank? (str uid))))
+      {"update_id" (str uid)
+       "platform" "wecom"
+       "chat_id" (str (get raw "FromUserName"))
+       "user_id" (str (get raw "FromUserName"))
+       "user_name" (str (or (get raw "FromUserName") ""))
+       "thread_id" (str (or (get raw "ConversationId") ""))
+       "message_id" (str (or (get raw "MsgId") ""))
+       "text" (get raw "Content")})))
+
 (def platform-adapters
   "One entry per platform. `:normalize` turns one raw transport update into
   the inbound message map above (nil = carries no turn). The send half lives
@@ -88,7 +109,8 @@
   entry here — nothing else changes."
   {"telegram" {:normalize telegram-normalize}
    "feishu" {:normalize feishu-normalize}
-   "dingtalk" {:normalize dingtalk-normalize}})
+   "dingtalk" {:normalize dingtalk-normalize}
+   "wecom" {:normalize wecom-normalize}})
 
 (defn normalize
   "The inbound message in `raw` for `platform`, or nil."
