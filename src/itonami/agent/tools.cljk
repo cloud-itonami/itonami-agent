@@ -1489,6 +1489,68 @@
 (def ^:private session-source-filter "COALESCE(s.source, '') NOT IN ('tool', 'delegate', 'kanban')")
 (def ^:private session-hidden-filter "COALESCE(s.hidden, 0) = 0")
 
+(defn bounded-limit
+  "A query LIMIT from raw CLI input: a whole positive integer, capped at
+  `cap`. Anything else is nil (the caller refuses by name) — never NaN
+  (which SQLite throws on) and never negative (SQLite treats a negative
+  LIMIT as unbounded)."
+  [raw cap]
+  (when-not (nil? raw)
+    (when (and (<= (count (str raw)) 9) (re-matches #"\d+" (str raw)))
+      (let [n (js/parseInt (str raw) 10)]
+        (when (and (js/isFinite n) (pos? n))
+          (min cap n))))))
+
+(defn sessions-browse
+  "The `sessions list` rows (also session_search's browse shape): the visible
+  conversations of a profile's state.db, newest activity first — the same
+  filters as discovery (non-tool/delegate/kanban, not hidden). Read-only.
+  Returns {:rows [...]} or {:error ...} — a missing or corrupt state.db is a
+  named error, never a raw throw (session_search's read path contract)."
+  ([db-path] (sessions-browse db-path 20))
+  ([db-path limit]
+   (cond
+     (not (h/file? db-path)) {:error "state.db missing"}
+     :else
+     (let [db (atom nil)]
+       (try
+         (reset! db (sqlite/DatabaseSync. db-path #js {:readOnly true}))
+         (.exec @db "PRAGMA query_only = ON")
+         {:rows (sqlite-records @db
+                               (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count "
+                                    "FROM sessions s WHERE " session-hidden-filter " AND " session-source-filter " "
+                                    "ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC LIMIT ?")
+                               limit)}
+         (catch :default e {:error (str "state.db unreadable: " (.-message e))})
+         (finally (when @db (.close @db))))))))
+
+(defn session-latest-messages
+  "The `sessions show` body: the newest `limit` messages of one session,
+  returned oldest-first for reading. Read-only. Returns {:rows [...]} — an
+  empty :rows is an unknown session — or {:error ...} for a missing or
+  corrupt state.db."
+  [db-path session-id limit]
+  (cond
+    (not (h/file? db-path)) {:error "state.db missing"}
+    :else
+    (let [db (atom nil)]
+      (try
+        (reset! db (sqlite/DatabaseSync. db-path #js {:readOnly true}))
+        (.exec @db "PRAGMA query_only = ON")
+        {:rows (->> (sqlite-records @db
+                                    (str "SELECT m.id, m.role, m.content, m.timestamp FROM messages m "
+                                         "JOIN sessions s ON s.id = m.session_id WHERE s.id = ? AND "
+                                         session-hidden-filter " AND " session-source-filter " "
+                                         ;; ordering by m.id mirrors session_search's
+                                         ;; read path (rowid-ordered transcript) — do
+                                         ;; not 'fix' it to timestamp without both
+                                         "ORDER BY m.id DESC LIMIT ?")
+                                    session-id limit)
+                    reverse
+                    vec)}
+        (catch :default e {:error (str "state.db unreadable: " (.-message e))})
+        (finally (when @db (.close @db)))))))
+
 (defn- session-suggest-profile-name [nm]
   (let [candidate (-> (str/lower-case (str/trim (str nm)))
                       (str/replace #"[^a-z0-9_-]+" "-")
