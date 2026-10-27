@@ -23,10 +23,10 @@
   (testing "empty text is one empty send, not zero sends"
     (is (= [""] (chat/chunk-text ""))))
   (testing "a non-positive or fractional limit refuses instead of looping forever"
-    (is (thrown? js/Error (chat/chunk-text "abc" 0)))
-    (is (thrown? js/Error (chat/chunk-text "abc" -1)))
-    (is (thrown? js/Error (chat/chunk-text "abc" 0.5)))
-    (is (thrown? js/Error (chat/chunk-text "abc" nil)))))
+    (is (thrown-with-msg? js/Error #"limit must be a positive integer" (chat/chunk-text "abc" 0)))
+    (is (thrown-with-msg? js/Error #"limit must be a positive integer" (chat/chunk-text "abc" -1)))
+    (is (thrown-with-msg? js/Error #"limit must be a positive integer" (chat/chunk-text "abc" 0.5)))
+    (is (thrown-with-msg? js/Error #"limit must be a positive integer" (chat/chunk-text "abc" nil)))))
 
 (deftest send-reply-chunks-in-order
   (async done
@@ -51,7 +51,7 @@
     (let [called (atom false)
           fake-fetch (fn [_ _] (reset! called true) (p/resolved #js {:ok true :status 200}))
           prof {:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}} :home "/tmp"}]
-      (-> (chat/send-reply! prof {"platform" "telegram" "chat_id" "c1"} nil fake-fetch)
+      (-> (chat/send-reply! prof {"platform" "telegram" "chat_id" "c1"} "   " fake-fetch)
           (p/then (fn [res]
                     (is (re-find #"reply is empty" (str res)))
                     (is (false? @called))))
