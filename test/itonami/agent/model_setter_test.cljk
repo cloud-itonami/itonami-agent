@@ -4,7 +4,10 @@
   (:require [cljs.test :refer [deftest is testing]]
             [clojure.string :as str]
             ["node:fs" :as fs]
+            [itonami.agent.yaml :as yaml]
             [itonami.agent.profile :as profile]))
+
+(defn parse-yaml [s] (yaml/parse s))
 
 (deftest set-model-text-edits-in-place
   (testing "the default line is replaced; comments and sibling keys survive"
@@ -33,6 +36,36 @@
     (let [out (profile/set-model-text "model:\n  custom: keep\n  default: old\n" "new" nil)]
       (is (str/includes? out "  custom: keep"))
       (is (str/includes? out "  default: new")))))
+
+(deftest nested-blocks-and-keys-are-untouched
+  (testing "a nested `model:` key is NOT the top-level block"
+    (let [in "gateway:\n  model:\n    default: g\n"
+          out (profile/set-model-text in "NEW" nil)]
+      ;; gateway.model.default survives; the new block is appended
+      (is (str/includes? out "gateway:\n  model:\n    default: g"))
+      (is (str/includes? out "model:\n  default: NEW"))))
+
+  (testing "default/provider at OTHER depths inside the block survive verbatim"
+    (let [in "model:\n  provider: openrouter\n  extra:\n    provider: x\n    default: y\n"
+          out (profile/set-model-text in "NEW" nil)]
+      (is (str/includes? out "    provider: x"))
+      (is (str/includes? out "    default: y"))
+      (is (str/includes? out "  provider: openrouter"))
+      (is (str/includes? out "  default: NEW"))))
+
+  (testing "a comment between keys stays put"
+    (let [in "model:\n  # keep\n  default: old\n"
+          out (profile/set-model-text in "NEW" nil)]
+      (is (str/includes? out "  # keep")))))
+
+(deftest values-cannot-corrupt-the-yaml
+  (testing "a value with : or # is written as a safe quoted scalar"
+    (let [out (profile/set-model-text "" "a: b # c" nil)]
+      (is (str/includes? out "  default: \"a: b # c\"")))
+    ;; and the produced text parses back to the exact value
+    (let [text (profile/set-model-text "" "a: b # c" nil)
+          cfg (parse-yaml text)]
+      (is (= "a: b # c" (get-in cfg ["model" "default"]))))))
 
 (deftest set-config-model-writes-and-reads-back
   (let [home (str "/tmp/test-model-setter-" (.-pid js/process) "-" (random-uuid))]

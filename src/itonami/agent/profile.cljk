@@ -181,52 +181,67 @@
   #{"secrets" "command_allowlist" "onboarding" "terminal" "skills"})
 
 
+(defn- yaml-scalar
+  "Write a value as a safe YAML scalar: plain when it is a safe token,
+  otherwise a JSON double-quoted string (YAML 1.2 superset) — `: `, `#` and
+  newlines can never corrupt the line."
+  [v]
+  (let [s (str v)]
+    (if (re-matches #"[A-Za-z0-9._/-]+" s) s (js/JSON.stringify s))))
+
 (defn set-model-text
   "Hermes `hermes model NAME` writes the default model into config.yaml.
-  The edit is TEXTUAL (like bundle-config-text): comments and formatting
-  outside the touched keys survive verbatim. Sets model.default and, when
-  given, model.provider — inside the existing model block, or a new block
-  appended at the end."
+  The edit is TEXTUAL (like bundle-config-text): comments, formatting and
+  keys outside model.default/model.provider survive verbatim. Only the
+  TOP-LEVEL model block is touched (the same top-level test bundle-config-text
+  uses), and only keys at the block's own child indent — nested keys at other
+  depths are never matched. Keys are replaced IN PLACE; a provider not given
+  here is kept."
   [text model provider]
   (let [lines (str/split-lines (str text))
-        ;; locate the top-level model: block
-        start (first (keep-indexed (fn [i l] (when (= "model:" (str/trim l)) i)) lines))
+        top-key? (fn [l] (boolean (re-matches #"[A-Za-z_][A-Za-z0-9_-]*:.*" l)))
+        ;; the top-level model: block: an unindented bare `model:` line
+        start (first (keep-indexed (fn [i l] (when (re-matches #"model:\s*" l) i)) lines))
         block-end (if (nil? start)
                     nil
                     (or (first (for [i (range (inc start) (count lines))
                                      :let [l (nth lines i)]
-                                     :when (and (re-matches #"^[A-Za-z_].*" l) (not (str/blank? l)))]
+                                     :when (and (top-key? l) (not (str/blank? l)))]
                                  i))
                         (count lines)))
-        set-key (fn [ls key value]
-                  (let [rx (re-pattern (str "^\\s+" key ":.*$"))
-                        idx (first (keep-indexed (fn [i l] (when (re-matches rx l) i)) ls))
-                        line (str "  " key ": " value)]
-                    (if (nil? idx)
-                      (conj (vec ls) line)
-                      (assoc (vec ls) idx line))))
-        new-block (cond-> ["model:"]
-                    true (set-key "default" model)
-                    (not (str/blank? (str provider))) (set-key "provider" provider))]
+        body (when start (vec (subvec (vec lines) start block-end)))
+        ;; the block's child indent = the indent of its first indented line
+        child-indent (when body (or (first (for [l (rest body)
+                                                 :when (re-matches #"\s+\S.*" l)]
+                                             (count (re-find #"^\s*" l))))
+                                    2))
+        key-rx (fn [k] (re-pattern (str "^" (apply str (repeat child-indent " ")) k ":.*$")))
+        replace-key (fn [ls k value]
+                      (let [rx (key-rx k)
+                            idx (first (keep-indexed (fn [i l] (when (re-matches rx l) i)) ls))
+                            line (str (apply str (repeat child-indent " ")) k ": " (yaml-scalar value))]
+                        (if (nil? idx)
+                          (conj (vec ls) line)
+                          (assoc (vec ls) idx line))))
+        drop-default? (fn [l] (boolean (re-matches (key-rx "default") l)))]
     (cond
       (nil? start)
-      (str (str/trim-newline (str text))
+      (str (str text)
            (when-not (str/blank? (str text)) "\n")
-           (str/join "\n" new-block) "\n")
+           (str/join "\n" (filter some? ["model:"
+                                          (str "  default: " (yaml-scalar model))
+                                          (when-not (str/blank? (str provider))
+                                            (str "  provider: " (yaml-scalar provider)))]))
+           "\n")
 
       :else
-      (let [head (subvec (vec lines) 0 start)
-            body (subvec (vec lines) start block-end)
-            tail (subvec (vec lines) block-end)
-            ;; keep any other keys in the block; default/provider are
-            ;; replaced in place — but a provider NOT given here is KEPT
-            ;; (a model-only write must not drop the configured provider)
-            old-provider (first (filter #(re-matches #"^\s+provider:.*$" %) body))
-            body (cond-> (vec (remove #(re-matches #"^\s+(default|provider):.*$" %) body))
-                   true (into (filter some? [(or (when-not (str/blank? (str provider)) (str "  provider: " provider))
-                                                 old-provider)
-                                             (str "  default: " model)])))]
-        (str (str/join "\n" (concat head body tail))
+      (let [;; replace the default line IN PLACE (or append); touch the
+            ;; provider line only when a new one is given — a model-only
+            ;; write keeps the existing provider line verbatim
+            body (cond-> (filterv (complement drop-default?) body)
+                   true (replace-key "default" model)
+                   (not (str/blank? (str provider))) (replace-key "provider" provider))]
+        (str (str/join "\n" (concat (subvec (vec lines) 0 start) body (subvec (vec lines) block-end)))
              (when (seq lines) "\n"))))))
 
 (defn set-config-model!
