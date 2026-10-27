@@ -1,0 +1,76 @@
+(ns itonami.agent.connections
+  "Hermes manage_connections, slice 1: the connection SURFACES, read-only.
+  Hermes has two kinds — hosted connector accounts (a Nous tool-gateway
+  integration; not portable here, answered with a named error) and local MCP
+  servers. This slice reports the local MCP surface (configured servers and
+  their cached OAuth auth state) and the dapp surface; install/authorize is
+  slice 2 (config writing plus human approval)."
+  (:require [clojure.string :as str]
+            [itonami.agent.host :as h]
+            [itonami.agent.oauth :as oauth]
+            [itonami.agent.dapps :as dapps]))
+
+(def hosted-error
+  "Honest unavailability for the kind this world has no substrate for."
+  "hosted connector accounts need a tool gateway - not configured here")
+
+(defn- auth-status
+  "The cached OAuth state for one server: the mcp-tokens store the Hermes MCP
+  token cache reads (issuer-bound). File presence and expiry only — never a
+  token value."
+  [home server]
+  (let [f (h/join home "mcp-tokens" (str (oauth/store-name server) ".json"))]
+    (if (h/file? f)
+      (try
+        (let [rec (h/json-parse (h/slurp f))
+              exp (get rec "expires_at")]
+          ;; policy: a record WITHOUT expires_at is a no-expiry token
+          ;; (token-cached); the boundary itself counts as expired; a
+          ;; PRESENT but non-numeric expires_at is corrupt -> token-unreadable
+          ;; (a corrupt record must never read as healthy)
+          (cond
+            (nil? exp) "token-cached"
+            (number? exp) (if (<= exp (quot (h/now-ms) 1000)) "token-expired" "token-cached")
+            :else "token-unreadable"))
+        (catch :default _ "token-unreadable"))
+      "needs-login")))
+
+(defn connection-status
+  "One row per requested connector — or every configured surface when none is
+  named. Each row names its kind and either its state or its error; a hosted
+  connector answers the named unavailability, never a silent fallback."
+  [config env home requested]
+  (let [mcp-names (set (keys (get config "mcp_servers")))
+        req (if (and (sequential? requested) (seq requested)) (vec requested) nil)]
+    (cond
+      (and (some? requested) (not (sequential? requested)))
+      {"error" "connections must be a list of objects like {name, mcp}"}
+
+      (and req (some (fn [i] (not (map? i))) req))
+      {"error" "connections must be a list of objects like {name, mcp}"}
+
+      :else
+      (if (nil? req)
+        ;; nothing named: every configured surface
+        (vec (concat
+              (for [n (sort mcp-names)]
+                {"name" n "kind" "mcp" "configured" true "auth" (auth-status home n)})
+              (for [row (dapps/status env)]
+                ;; normalize the row identity to "name" like every other row
+                (cond-> (assoc row "kind" "dapp")
+                  (and (get row "server") (not (get row "name"))) (assoc "name" (get row "server"))))))
+        (mapv (fn [item]
+                (let [n (str (get item "name"))
+                      mcp? (or (true? (get item "mcp")) (contains? mcp-names n))]
+                  (cond
+                    (str/blank? n)
+                    {"name" n "error" "a connection needs a name"}
+
+                    mcp?
+                    {"name" n "kind" "mcp"
+                     "configured" (contains? mcp-names n)
+                     "auth" (if (contains? mcp-names n) (auth-status home n) "needs-login")}
+
+                    :else
+                    {"name" n "kind" "hosted" "error" hosted-error})))
+              req)))))
