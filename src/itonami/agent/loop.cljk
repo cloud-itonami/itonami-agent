@@ -429,7 +429,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
 (defn- merge-children
   "MERGE BY recency — shared by the write AND the fetch paths (the R7 gate:
   a stale in-memory record must never mask a newer on-disk one anywhere).
-  Higher updated_at wins; ties keep the ON-DISK record."
+  Higher updated_at wins; ties keep the IN-MEMORY record (the owner's live
+  state — the R8 gate)."
   [on-disk mem]
   ;; ties prefer the in-MEMORY record: a done/failed stamped in the same
   ;; millisecond as its running record must not tie-lose to it (the R8 gate
