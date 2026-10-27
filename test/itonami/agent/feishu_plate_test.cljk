@@ -46,7 +46,11 @@
   (testing "a direct token (from the env default) and chat_id resolve an adapter"
     (with-redefs [h/env (fn [k] (when (= k "FEISHU_TENANT_ACCESS_TOKEN") "tok"))]
       (is (fn? (platforms/for-lane "feishu" {"delivery" {"feishu" {"chat_id" "oc_1"}}})))))
-  (testing "app credentials resolve the exchange-backed adapter without a token"
-    (is (fn? (platforms/for-lane "feishu" {"delivery" {"feishu" {"chat_id" "oc_1" "app_id" "a" "app_secret" "s"}}}))))
+  (testing "ENV app credentials resolve the exchange-backed adapter (never config)"
+    (with-redefs [h/env (fn [k] (case k "FEISHU_APP_ID" "a" "FEISHU_APP_SECRET" "s" nil))]
+      (is (fn? (platforms/for-lane "feishu" {"delivery" {"feishu" {"chat_id" "oc_1"}}})))
+      ;; and config-held credentials are NOT read at all
+      (with-redefs [h/env (fn [_] nil)]
+        (is (nil? (platforms/for-lane "feishu" {"delivery" {"feishu" {"chat_id" "oc_1" "app_id" "a" "app_secret" "s"}}}))))))
   (testing "no chat_id means no adapter — never a send into the void"
     (is (nil? (platforms/for-lane "feishu" {"delivery" {"feishu" {"app_id" "a" "app_secret" "s"}}})))))
