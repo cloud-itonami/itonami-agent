@@ -19,7 +19,6 @@
             [itonami.agent.mcp :as mcp]
             [itonami.agent.dapps :as dapps]
             [itonami.agent.yaml :as yaml]
-            [itonami.agent.p2p :as p2p]
             [itonami.agent.confine :as confine]))
 
 (def wrapup-notice
@@ -418,13 +417,14 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         {"children" {} "delivered" #{}}))
     (catch :default _ {"children" {} "delivered" #{}})))
 
-(def delegate-children
-  "subagent_id -> {goal status summary}. Children are registered while they
+;; ONE load for both atoms (two reads could disagree on a racing write)
+(let [st (load-delegate-state)]
+  (def delegate-children
+    "subagent_id -> {goal status summary}. Children are registered while they
   run and kept afterwards, so action=list stays truthful. Loaded from the
   persisted registry at startup (cross-run re-entry)."
-  (atom (get (load-delegate-state) "children")))
-
-(def delegate-delivered (atom (get (load-delegate-state) "delivered")))
+    (atom (get st "children")))
+  (def delegate-delivered (atom (get st "delivered"))))
 
 (defn persist-delegate-state!
   "Atomically persist the registry after every mutation (the cross-run
