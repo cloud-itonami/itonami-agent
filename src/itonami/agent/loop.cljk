@@ -434,20 +434,28 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
     (h/spit-atomic (delegate-state-file)
                    (h/json-str {"children" @delegate-children
                                 "delivered" (vec @delegate-delivered)}))
-    (catch :default _ nil)))
+    (catch :default e
+      ;; a silently failed write would void the re-entry guarantee
+      (js/console.error (str "delegate registry persist failed: " (or (.-message e) e))))))
 
 (defn delegate-pending-results!
-  "Finished background children not yet delivered — one message per call, as
-  Hermes delivers background results between turns. Marked delivered."
-  []
-  (let [pending (vec (for [[id c] @delegate-children
-                           :when (and (not= "running" (get c "status"))
-                                      (not (contains? @delegate-delivered id)))]
-                       (assoc c "subagent_id" id)))]
+  "Finished background children not yet delivered TO THIS SESSION — one
+  message per call, as Hermes delivers background results between turns.
+  Session-scoped (the R2 security gate): a result belongs to the session
+  that spawned its child and is never injected into another. Marked
+  delivered."
+  ([] (delegate-pending-results! ""))
+  ([session-key]
+   (let [sk (str session-key)
+         pending (vec (for [[id c] @delegate-children
+                            :when (and (not= "running" (get c "status"))
+                                       (not (contains? @delegate-delivered id))
+                                       (= sk (str (get c "session_key" ""))))]
+                        (assoc c "subagent_id" id)))]
     (when (seq pending)
       (swap! delegate-delivered into (map #(get % "subagent_id") pending))
       (persist-delegate-state!))
-    pending))
+    pending)))
 
 (def delegate-ctl
   "subagent_id -> {:steer (atom [message]) :cancel (atom bool)}. steer queues
@@ -578,7 +586,12 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                           "error" (get-in result [:error :error])} extra)]
                                          (swap! delegate-children assoc id {"goal" goal
                                                                             "status" (get base "status")
-                                                                            "summary" (get base "summary")})
+                                                                            "summary" (get base "summary")
+                                                                            ;; session scoping (the R2
+                                                                            ;; security gate): a result is
+                                                                            ;; delivered to its OWN
+                                                                            ;; session only
+                                                                            "session_key" (str (or (:session-key parent-options) ""))})
                                          ;; the RESULT must survive the run
                                          ;; ending (the R1 gate: the success
                                          ;; path is the one that carries the
@@ -589,7 +602,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                          ;; the record moves to the bounded recent FIFO
                                          (proc/unregister-subagent-attribution! id)
                                          base))]
-                            (swap! delegate-children assoc id {"goal" goal "status" "running"})
+                            (swap! delegate-children assoc id {"goal" goal "status" "running"
+                                                               "session_key" (str (or (:session-key parent-options) ""))})
                             (persist-delegate-state!)
                             (swap! delegate-ctl assoc id ctl)
                             ;; Hermes tools/delegate_tool_registry._register_child:
@@ -612,7 +626,8 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                     (p/then (fn [r2] (done r2 (delegate-validate-schema schema (:final r2)))))
                                                     (p/catch (fn [_] (done result v)))))))))
                                 (p/catch (fn [e]
-                                           (swap! delegate-children assoc id {"goal" goal "status" "failed"})
+                                           (swap! delegate-children assoc id {"goal" goal "status" "failed"
+                                                                              "session_key" (str (or (:session-key parent-options) ""))})
                                            (persist-delegate-state!)
                                            (proc/unregister-subagent-attribution! id)
                                            {"subagent_id" id "goal" goal "status" "failed" "error" (.-message e)})))))
@@ -626,5 +641,11 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                        "status" "running"}))}))
             (p/then (p/all child-runs)
                     (fn [results]
+                      ;; joined children return INLINE — mark them delivered
+                      ;; so the registry never re-delivers them as duplicates
+                      ;; on a later run (the R2 gate)
+                      (swap! delegate-delivered into
+                             (map #(get % "subagent_id") results))
+                      (persist-delegate-state!)
                       (h/json-str {"results" (vec results)
                                    "total_duration_seconds" (/ (- (h/now-ms) t0) 1000)})))))))))
