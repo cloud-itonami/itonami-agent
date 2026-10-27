@@ -1,0 +1,30 @@
+(ns itonami.agent.pid-guard-test
+  "gateway single-instance guard: a LIVE owner refuses the claim, a dead
+  owner's stale file is taken over."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            ["node:fs" :as fs]
+            [itonami.agent.host :as h]
+            [itonami.agent.main :as main]))
+
+(deftest claim-pid-refuses-a-live-owner
+  (let [dir (str "/tmp/test-pid-guard-" (.-pid js/process) "-" (random-uuid))]
+    (.mkdirSync fs dir #js {:recursive true})
+    (h/spit (h/join dir "gateway.pid") (str (.-pid js/process)))
+    (testing "a live owner (ourselves) blocks the claim"
+      (is (re-find #"already running" (str (:error (main/claim-pid! dir "gateway.pid"))))))
+    (testing "a dead owner is stale: the claim takes over"
+      (h/spit (h/join dir "gateway.pid") "999999999")
+      (let [claim (main/claim-pid! dir "gateway.pid")]
+        (is (nil? (:error claim)))
+        (is (= (.-pid js/process) (:pid claim)))
+        (is (= (str (.-pid js/process)) (str/trim (h/slurp (h/join dir "gateway.pid")))))))
+    (testing "garbage in the pid file is stale too"
+      (h/spit (h/join dir "gateway.pid") "not-a-pid")
+      (is (nil? (:error (main/claim-pid! dir "gateway.pid")))))))
+
+(deftest claim-pid-claims-a-free-slot
+  (let [dir (str "/tmp/test-pid-guard2-" (.-pid js/process) "-" (random-uuid))]
+    (.mkdirSync fs dir #js {:recursive true})
+    (let [claim (main/claim-pid! dir "gateway-serve.pid")]
+      (is (= (.-pid js/process) (:pid claim))))))

@@ -1302,6 +1302,23 @@
         (println (str "sent to " platform ":" chat-id))
         (die 1 (str "send failed: " res))))))
 
+(defn claim-pid!
+  "Single-instance guard (Hermes' pid file + liveness check): claim
+  <itonami-dir>/<name> for this process. Refuses when a LIVE process of ours
+  still owns it; a dead owner's file is stale and taken over. Returns
+  {:pid ...} on claim, {:error ...} on refusal — callers die."
+  [dir name]
+  (let [p (h/join dir name)
+        existing (try (when (h/file? p) (str/trim (h/slurp p))) (catch :default _ nil))
+        live? (when (and existing (re-matches #"\d+" existing))
+                (try (js/process.kill (js/parseInt existing 10) 0)
+                     true
+                     (catch :default _ false)))]
+    (if live?
+      {:error (str name " is already running (pid " existing ")")}
+      (do (h/spit p (str (.-pid js/process)))
+          {:pid (.-pid js/process)}))))
+
 (defn gateway-run [opts]
   (let [interval (let [sec (js/parseInt (or (:interval opts) "60") 10)]
                    ;; --interval is the tick period in seconds: a floor of 1 s
@@ -1332,7 +1349,8 @@
                         (p/catch (fn [e] (println (str (h/iso-local) " " n " tick failed: " (.-message e)))))))
                   (js/setTimeout cycle interval)))]
     (println (str "itonami-agent gateway: ticking adopted profiles every " (/ interval 1000) "s"))
-    (h/spit (h/join (p2p/itonami-dir) "gateway.pid") (str (.-pid js/process)))
+    (let [claim (claim-pid! (p2p/itonami-dir) "gateway.pid")]
+      (when-let [e (:error claim)] (die 2 e)))
     (cycle)))
 
 (defn gateway-serve
@@ -1362,7 +1380,8 @@
                 :send! (fn [prof msg text] (chat/send-reply! prof msg text))
                 :on-event log-event})]
         (println (str "itonami-agent gateway serve: " platform " -> " (count profiles) " profiles"))
-        (h/spit (h/join (p2p/itonami-dir) "gateway-serve.pid") (str (.-pid js/process)))
+        (let [claim (claim-pid! (p2p/itonami-dir) "gateway-serve.pid")]
+          (when-let [e (:error claim)] (die 2 e)))
         (chat/serve! {:fetch (fn [url o] (js/fetch url o))
                       :token token
                       :offset-file (h/join (p2p/itonami-dir) "gateway-serve-offset.json")
