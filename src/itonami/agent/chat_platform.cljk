@@ -404,9 +404,15 @@
   "Split a reply into sendable segments of at most `limit` chars, preferring
   the last newline inside the window (a hard split only when one line is
   longer than the limit). The boundary newline stays with the earlier
-  segment, so concatenating every segment returns the original text."
+  segment, so concatenating every segment returns the original text.
+  `limit` must be a positive integer (a fractional limit would loop on a
+  zero-advance split) — anything else throws."
   ([text] (chunk-text text max-reply-chars))
   ([text limit]
+   (when-not (and (integer? limit) (pos? limit))
+     ;; a fractional limit truncates subs to a zero-advance step and loops
+     ;; forever; the contract is a positive INTEGER
+     (throw (js/Error. "chunk-text: limit must be a positive integer")))
    (let [s (str text)]
      (if (<= (count s) limit)
        [s]
@@ -428,7 +434,8 @@
   rides along as the platform's thread target where one exists (telegram:
   message_thread_id). A reply longer than `max-reply-chars` is sent as
   ordered newline-preferring segments; the first failing segment stops the
-  send and its error is returned. `prof` is the owning profile (same position
+  send and its error is returned; blank replies are refused outright.
+  `prof` is the owning profile (same position
   as send!'s first argument). Resolves to nil on success or the adapter's
   error string."
   ([prof msg text] (send-reply! prof msg text nil))
@@ -439,6 +446,9 @@
      (cond
        (str/blank? chat)
        (p/resolved (str platform " reply names no chat - refusing to fall back to the configured delivery chat"))
+
+       (str/blank? (str text))
+       (p/resolved (str platform " reply is empty - refusing to send"))
 
        (nil? adapter)
        (p/resolved (str platform " send adapter not configured"))

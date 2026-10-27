@@ -21,7 +21,12 @@
       (is (= text (apply str (chat/chunk-text text 37))))
       (is (every? #(<= (count %) 37) (chat/chunk-text text 37)))))
   (testing "empty text is one empty send, not zero sends"
-    (is (= [""] (chat/chunk-text "")))))
+    (is (= [""] (chat/chunk-text ""))))
+  (testing "a non-positive or fractional limit refuses instead of looping forever"
+    (is (thrown? js/Error (chat/chunk-text "abc" 0)))
+    (is (thrown? js/Error (chat/chunk-text "abc" -1)))
+    (is (thrown? js/Error (chat/chunk-text "abc" 0.5)))
+    (is (thrown? js/Error (chat/chunk-text "abc" nil)))))
 
 (deftest send-reply-chunks-in-order
   (async done
@@ -39,6 +44,18 @@
                     (is (< 1 (count @sent)))
                     (is (= text (apply str @sent)))))
           (p/finally (fn [] (js-delete (.-env js/process) "TELEGRAM_BOT_TOKEN") (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
+(deftest send-reply-refuses-a-blank-reply
+  (async done
+    (let [called (atom false)
+          fake-fetch (fn [_ _] (reset! called true) (p/resolved #js {:ok true :status 200}))
+          prof {:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}} :home "/tmp"}]
+      (-> (chat/send-reply! prof {"platform" "telegram" "chat_id" "c1"} nil fake-fetch)
+          (p/then (fn [res]
+                    (is (re-find #"reply is empty" (str res)))
+                    (is (false? @called))))
+          (p/then (fn [_] (done)))
           (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
 
 (deftest send-reply-stops-at-the-first-failing-segment
