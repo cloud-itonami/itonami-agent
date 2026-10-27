@@ -1,0 +1,62 @@
+(ns itonami.agent.wecom-plate-test
+  "JUN-471 wecom plate (3/4): delivery send, env-only auth transport,
+  inbound normalize — one platform, one plate."
+  (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as str]
+            [itonami.agent.host :as h]
+            [itonami.agent.platform-adapters :as platforms]
+            [itonami.agent.chat-platform :as chat]))
+
+(deftest wecom-requests-are-pure-and-correct
+  (testing "the send request is the message/send shape with touser + required agentid"
+    (let [r (platforms/wecom-request "tok" "u1" 1000002 "hello")]
+      (is (str/includes? (:url r) "cgi-bin/message/send?access_token=tok"))
+      (let [body (h/json-parse (:body r))]
+        (is (= "u1" (get body "touser")))
+        (is (= "text" (get body "msgtype")))
+        (is (= 1000002 (get body "agentid")))
+        (is (number? (get body "agentid")) "agentid is a JSON number, never a string")
+        (is (= "hello" (get-in (js->clj (get body "text")) ["content"]))))))
+  (testing "the auth transport is the gettoken exchange"
+    (let [r (platforms/wecom-token-request "cid" "secret")]
+      (is (str/includes? (:url r) "gettoken?corpid=cid&corpsecret=secret")))))
+
+(deftest wecom-normalize-maps-text-pushes
+  (let [event {"MsgType" "text" "Content" "hi there" "MsgId" "m1"
+               "FromUserName" "u1" "CreateTime" "123" "ConversationId" "c1"}]
+    (testing "a text push becomes the platform-agnostic inbound map"
+      (let [m (chat/wecom-normalize event)]
+        (is (= "wecom" (get m "platform")))
+        (is (= "hi there" (get m "text")))
+        (is (= "u1" (get m "chat_id")) "chat_id is the REPLY route: the user id message/send touser speaks")
+        (is (= "m1" (get m "update_id")))))
+    (testing "the dedup id is MsgId, else CreateTime; neither refuses the turn"
+      (is (= "123" (get (chat/wecom-normalize (dissoc event "MsgId")) "update_id")))
+      (is (nil? (chat/wecom-normalize (-> event (dissoc "MsgId") (dissoc "CreateTime"))))))
+    (testing "non-text pushes carry no turn"
+      (is (nil? (chat/wecom-normalize (assoc event "MsgType" "image")))))
+    (testing "the platform entry wires normalize"
+      (is (fn? (get-in chat/platform-adapters ["wecom" :normalize]))))))
+
+(deftest wecom-lane-resolves-by-token-or-env-exchange
+  (testing "a direct token + agent_id + chat_id resolve an adapter"
+    (with-redefs [h/env (fn [k] (when (= k "WECOM_ACCESS_TOKEN") "tok"))]
+      (is (fn? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" 10 "chat_id" "u1"}}})))))
+  (testing "ENV corp credentials resolve the exchange adapter; config-held ones are not read"
+    (with-redefs [h/env (fn [k] (case k "WECOM_CORP_ID" "cid" "WECOM_CORP_SECRET" "s" nil))]
+      (is (fn? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" 10 "chat_id" "u1"}}}))))
+    (with-redefs [h/env (fn [_] nil)]
+      (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" 10 "chat_id" "u1" "corp_id" "cid" "corp_secret" "s"}}})))))
+  (testing "agent_id is required AND numeric on every request; no chat_id means no adapter"
+    (with-redefs [h/env (fn [k] (when (= k "WECOM_ACCESS_TOKEN") "tok"))]
+      (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"chat_id" "u1"}}})))
+      (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" "" "chat_id" "u1"}}}))
+          "an empty agent_id is not an identity")
+      (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" false "chat_id" "u1"}}})))
+      (is (fn? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" "1000002" "chat_id" "u1"}}}))
+          "a numeric string is a valid agent_id")))
+  (testing "a numeric-string agent_id goes out as a JSON NUMBER"
+    (let [body (h/json-parse (:body (platforms/wecom-request "tok" "u1" "1000002" "hello")))]
+      (is (number? (get body "agentid")))
+      (is (= 1000002 (get body "agentid")))))
+      (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" 10}}}))))

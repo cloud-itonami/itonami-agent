@@ -150,7 +150,8 @@
    "mattermost" nil
    "matrix" "MATRIX_ACCESS_TOKEN"
    "feishu" "FEISHU_TENANT_ACCESS_TOKEN"
-   "dingtalk" "DINGTALK_ACCESS_TOKEN"})
+   "dingtalk" "DINGTALK_ACCESS_TOKEN"
+   "wecom" "WECOM_ACCESS_TOKEN"})
 
 (defn token-env-name
   "The env var that carries this lane's token, or nil when the lane needs no
@@ -296,6 +297,78 @@
                          (str "dingtalk token exchange failed: HTTP " (.-status res)))))
               (.catch (fn [e] (str "dingtalk token exchange failed: " (.-message e))))))))))
 
+
+;; ---------------------------------------------------------------- wecom
+
+(defn wecom-token-request
+  "The WeCom gettoken exchange (the lane's AUTH transport). Pure.
+  Credentials are env-only (WECOM_CORP_ID / WECOM_CORP_SECRET), per this
+  ns's contract."
+  [corp-id corp-secret]
+  {:url (str "https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid="
+             (js/encodeURIComponent (str corp-id)) "&corpsecret="
+             (js/encodeURIComponent (str corp-secret)))
+   :method "GET"})
+
+(defn wecom-request
+  "The WeCom message/send request (access token). Pure. touser is a USER
+  identifier — the reply route — and agentid is required on every request."
+  [token touser agent-id text]
+  {:url (str "https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token="
+             (js/encodeURIComponent (str token)))
+   :headers {"Content-Type" "application/json; charset=utf-8"}
+   :body (h/json-str {"touser" (str touser)
+                      "msgtype" "text"
+                      ;; agentid is a JSON NUMBER on the wire (the R2 gate:
+                      ;; a numeric-string config value must not go out as a
+                      ;; JSON string) — coerced like the telegram thread-id
+                      ;; precedent
+                      "agentid" (if (number? agent-id) agent-id (js/parseInt (str agent-id) 10))
+                      "text" {"content" (str text)}})})
+
+(defn- wecom-send! [fetch-fn token touser agent-id content]
+  (let [r (wecom-request token touser agent-id content)]
+    (-> (fetch-fn (:url r) #js {:method "POST"
+                                :headers (clj->js (:headers r))
+                                :body (:body r)})
+        (.then (fn [res]
+                 (if (.-ok res)
+                   (.then (.json res)
+                          (fn [j]
+                            (if (zero? (or (aget j "errcode") -1))
+                              nil
+                              (str "wecom message/send failed: "
+                                   (or (aget j "errmsg") "unknown error")))))
+                   (str "wecom message/send failed: HTTP " (.-status res)))))
+        (.catch (fn [e] (str "wecom message/send failed: " (.-message e)))))))
+
+(defn- wecom-adapter
+  "delivery.wecom: auth via direct token (token_env default
+  WECOM_ACCESS_TOKEN) OR the corp-credential exchange per send (the
+  JUN-471 auth transport). The agent identity (agentid) is ALWAYS required
+  — message/send rejects a body without it (the dingtalk R2 lesson). ALL
+  credentials are env-only — never config."
+  [token corp-id corp-secret agent-id chat-id]
+  (fn [_job _lane content opts]
+    (let [fetch-fn (or (:fetch opts) js/fetch)
+          chat-override (str (:chat-id opts))
+          chat (if (str/blank? chat-override) (str chat-id) chat-override)
+          send (fn [tok] (wecom-send! fetch-fn tok chat agent-id content))]
+      (if (not (str/blank? (str token)))
+        (send token)
+        (let [r (wecom-token-request corp-id corp-secret)]
+          (-> (fetch-fn (:url r) #js {:method "GET" :headers #js {}})
+              (.then (fn [res]
+                       (if (.-ok res)
+                         (.then (.json res)
+                                (fn [j]
+                                  (let [tok (aget j "access_token")]
+                                    (if (str/blank? (str tok))
+                                      "wecom token exchange failed: response carried no access_token"
+                                      (send tok)))))
+                         (str "wecom token exchange failed: HTTP " (.-status res)))))
+              (.catch (fn [e] (str "wecom token exchange failed: " (.-message e))))))))))
+
 (defn for-lane
   "The built-in adapter for a deliver lane, or nil when this lane has no
   configured platform. `config` is the profile's config.yaml map.
@@ -371,4 +444,23 @@
                  (or (not (str/blank? (str token)))
                      (not (str/blank? (str app-secret)))))
         (dingtalk-adapter token app-key app-secret chat-id)))
+    "wecom"
+    ;; direct token OR the corp-credential exchange; credentials ENV-ONLY
+    ;; (WECOM_CORP_ID / WECOM_CORP_SECRET — never config). agentid is
+    ;; required on every request (message/send rejects a body without it).
+    (let [c (get-in config ["delivery" "wecom"])
+          token (h/env (token-env-name "wecom" config))
+          corp-id (h/env "WECOM_CORP_ID")
+          corp-secret (h/env "WECOM_CORP_SECRET")
+          agent-id (get c "agent_id")
+          chat-id (get c "chat_id")]
+      (when (and (not (str/blank? (str chat-id)))
+                 ;; agentid is NUMERIC on the wire (the R1 gate: (some?)
+                 ;; accepted "" and false, sending an agentid the API
+                 ;; rejects); numbers and numeric strings both pass
+                 (re-matches #"\d+" (str agent-id))
+                 (or (not (str/blank? (str token)))
+                     (and (not (str/blank? (str corp-id)))
+                          (not (str/blank? (str corp-secret))))))
+        (wecom-adapter token corp-id corp-secret agent-id chat-id)))
     nil))
