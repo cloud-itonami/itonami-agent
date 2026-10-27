@@ -295,16 +295,27 @@
         ;; R7 gate — fail closed on shapes this editor cannot honor)
         folded? (fn [ls idx]
                   (let [l (nth ls idx)
-                        after (subs l (dec (count l)))
-                        ;; unclosed-quote detection: the value OPENS a quote
-                        ;; that never closes — a closed scalar with a trailing
-                        ;; comment is fine (the R7 false-positive gate)
-                        opens (let [v (second (re-find #"^\s*[^:]+:\s*(.*)$" l))]
+                        ;; unclosed-quote detection, ESCAPE-AWARE like
+                        ;; yaml.cljk's unclosed-quote?: \" does not close a
+                        ;; double-quoted scalar and '' does not close a
+                        ;; single-quoted one (the R8 gate)
+                        opens (let [v (second (re-find #"^\s*[^:]+:\s*(.*)$" l))
+                                    unclosed? (fn [v q esc-form?]
+                                                (loop [i 1 esc? false]
+                                                  (cond
+                                                    (>= i (count v)) true
+                                                    esc? (recur (inc i) false)
+                                                    (and esc-form? (= (nth v i) \\)) (recur (inc i) true)
+                                                    (= (nth v i) q)
+                                                    (if (and (not esc-form?) (= (get v (inc i)) q))
+                                                      (recur (+ i 2) false)
+                                                      false)
+                                                    :else (recur (inc i) false))))]
                                 (when v
-                                  (or (and (str/starts-with? v "\"")
-                                           (nil? (str/index-of (subs v 1) "\"")))
-                                      (and (str/starts-with? v "'")
-                                           (nil? (str/index-of (subs v 1) "'"))))))
+                                  (cond
+                                    (str/starts-with? v "\"") (unclosed? v \" true)
+                                    (str/starts-with? v "'") (unclosed? v \' false)
+                                    :else false)))
                         nxt (get ls (inc idx))
                         deeper? (fn [x] (when (and x (re-matches #"\s+\S.*" x)
                                                    (not (re-matches #"\s*#.*" x)))
@@ -361,10 +372,13 @@
            "\n")
 
       :else
-      (let [key-idx (fn [k] (last (keep-indexed (fn [i l] (when (re-matches (key-rx k) l) i)) body)))
+      (let [key-idxs (fn [k] (keep-indexed (fn [i l] (when (re-matches (key-rx k) l) i)) body))
+            ;; EVERY occurrence is checked (the R8 gate: replace-key drops
+            ;; the earlier duplicate LINES but their continuations would
+            ;; survive as orphans)
             _ (doseq [k (cond-> ["default"] (not (str/blank? (str provider))) (conj "provider"))
-                        :let [idx (key-idx k)]
-                        :when (and idx (folded? body idx))]
+                        idx (key-idxs k)
+                        :when (folded? body idx)]
                 (throw (js/Error. (str "refusing to edit a folded multi-line model." k
                                        " — unwrap it by hand first"))))]
         ;; replace-key replaces IN PLACE when the key exists (the R2 gate: no

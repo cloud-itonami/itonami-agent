@@ -167,7 +167,17 @@
     (is (thrown-with-msg? js/Error #"refusing to edit a folded"
                           (profile/set-model-text "model:\n  default: \"old\n" "NEW" nil))))
   (testing "a closed scalar with a trailing comment is NOT folded (no false refusal)"
-    (is (string? (profile/set-model-text "model:\n  default: \"a # b\" # real\n" "NEW" nil)))))
+    (is (string? (profile/set-model-text "model:\n  default: \"a # b\" # real\n" "NEW" nil))))
+  (testing "an EARLIER duplicate's folded value is refused too (the R8 gate)"
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: old\n    /v2\n  default: second\n" "NEW" nil))))
+  (testing "escaped-quote unclosed scalars are refused (escape-aware)"
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: \"fo\\\"\n" "NEW" nil)))
+    (is (thrown-with-msg? js/Error #"refusing to edit a folded"
+                          (profile/set-model-text "model:\n  default: 'it''s\n" "NEW" nil))))
+  (testing "an escaped quote that CLOSES properly is not folded"
+    (is (string? (profile/set-model-text "model:\n  default: \"fo\\\"\"\n" "NEW" nil)))))
 
 (deftest config-mode-is-preserved
   (let [home (str "/tmp/test-model-mode-" (.-pid js/process) "-" (random-uuid))]
