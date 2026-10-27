@@ -1167,6 +1167,14 @@ plain: true
           (p/catch (fn [e] (is (nil? e) (str "drain test crashed: " (.-message e)))))
           (p/finally (fn [_ _] (done)))))))
 
+(deftest the-review-fork-activation-flows
+  ;; the R-staged seam: ITONAMI_SKILL_REVIEW=1 is the ONLY switch for the
+  ;; skill staged-review guards; normal runs are never gated
+  (with-redefs [h/env (fn [k] (when (= k "ITONAMI_SKILL_REVIEW") "1"))]
+    (is (true? (agent-loop/review-context?))))
+  (with-redefs [h/env (fn [_] nil)]
+    (is (false? (agent-loop/review-context?)))))
+
 (deftest delegate-pending-results-delivered-once
   ;; background results re-enter as one message between turns and are
   ;; marked delivered

@@ -51,6 +51,13 @@ Work until the task is done, then answer with a short report: what changed, what
 ## Tool use
 Use tools to act; do not describe a tool call instead of making it. Independent tool calls may be made in one turn.")
 
+(defn review-context?
+  "The CURATOR REVIEW-FORK activation (Hermes skill_provenance's process
+  context): a run marked ITONAMI_SKILL_REVIEW=1 runs skill_manage under the
+  staged-review guards. Nothing else activates them."
+  []
+  (contains? #{"1" "true"} (str (h/env "ITONAMI_SKILL_REVIEW"))))
+
 (defn- skills-index [home]
   (let [root (h/join home "skills")
         files (if (h/dir? root) (h/walk-files root (fn [_] false)) [])
@@ -255,6 +262,12 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
         session-key (or session-key "")
         ctx {:cwd cwd :home (:home prof) :profile (:name prof) :roots roots :writes writes :tool-env env
              :clarify-fn clarify-fn
+             ;; the CURATOR REVIEW-FORK activation (Hermes
+             ;; skill_provenance's process context): a run marked for skill
+             ;; review sets :review?, which switches on skill_manage's
+             ;; staged-review guards (read-before-write, curator delete
+             ;; refusal). Nothing else sets it — normal runs are never gated.
+             :review? (review-context?)
              :task-id task-id :session-key session-key :subagent subagent
              ;; Hermes `async_delivery_supported()` (gateway/session_context):
              ;; false for cron job turns and the api_server adapter; a spawn on
