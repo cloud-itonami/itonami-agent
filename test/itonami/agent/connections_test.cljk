@@ -60,7 +60,7 @@
     (let [rows (connections/connection-status {} {} "/tmp/x" [{"name" false} {"name" 42}])]
       (is (every? #(re-find #"non-blank name string" (str (get % "error"))) rows))))
   (testing "a non-boolean mcp is a named error"
-    (is (= "mcp must be boolean or absent"
+    (is (= "mcp must be boolean or absent (omit the key)"
            (get (first (connections/connection-status {} {} "/tmp/x" [{"name" "x" "mcp" "true"}])) "error")))))
 
 (deftest malformed-requests-are-named
@@ -94,7 +94,7 @@
               (h/json-str {"access_token" "S"}))
       (is (= "token-cached" (auth-of))))
     (testing "a PRESENT but non-numeric expires_at is corrupt: token-unreadable (never healthy)"
-      (doseq [v ["100" true]]
+      (doseq [v ["100" true nil]]
         (h/spit (h/join home "mcp-tokens" (str (oauth/store-name "srv") ".json"))
                 (h/json-str {"access_token" "S" "expires_at" v}))
         (is (= "token-unreadable" (auth-of)))))))

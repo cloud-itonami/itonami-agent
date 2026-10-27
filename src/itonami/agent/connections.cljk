@@ -23,7 +23,8 @@
     (if (h/file? f)
       (try
         (let [rec (h/json-parse (h/slurp f))
-              exp (when (map? rec) (get rec "expires_at"))]
+              exp-present (and (map? rec) (contains? rec "expires_at"))
+              exp (when exp-present (get rec "expires_at"))]
           ;; a parseable but non-object record (null, [], 42, false) is
           ;; corrupt — it must never read as healthy
           (when-not (map? rec)
@@ -33,7 +34,9 @@
           ;; PRESENT but non-numeric expires_at is corrupt -> token-unreadable
           ;; (a corrupt record must never read as healthy)
           (cond
-            (nil? exp) "token-cached"
+            ;; ABSENT key = the no-expiry policy; a PRESENT null is corrupt
+            (not exp-present) "token-cached"
+            (nil? exp) "token-unreadable"
             (number? exp) (if (<= exp (quot (h/now-ms) 1000)) "token-expired" "token-cached")
             :else "token-unreadable"))
         (catch :default _ "token-unreadable"))
@@ -73,8 +76,9 @@
                     (str/blank? n)
                     {"name" (str raw-name) "error" "a connection needs a non-blank name string"}
 
-                    (and (some? mcp-val) (not (boolean? mcp-val)))
-                    {"name" n "error" "mcp must be boolean or absent"}
+                    ;; a PRESENT mcp must be boolean — null is not absent
+                    (and (contains? item "mcp") (not (boolean? mcp-val)))
+                    {"name" n "error" "mcp must be boolean or absent (omit the key)"}
 
                     :else
                     (let [mcp? (or (true? mcp-val) (contains? mcp-names n))]

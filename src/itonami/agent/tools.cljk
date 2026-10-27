@@ -359,6 +359,8 @@
      "Check or describe connection surfaces. Two kinds exist: hosted connector accounts (a tool-gateway integration, answered here with a named error) and local MCP servers (configured state plus cached OAuth auth). Slice 1 is read-only; installing or authorizing a connection is a later slice. Pass connections=[{name: ..., mcp: bool}]; with none, every configured surface is listed."
      {"connections" {"type" "array"
                      "items" {"type" "object"
+                              "required" ["name"]
+                              "additionalProperties" false
                               "properties" {"name" {"type" "string"}
                                             "mcp" {"type" "boolean"}}}
                      "description" "Connector requests: [{\"name\": ..., \"mcp\": bool}]. Omit to list everything configured."}}
