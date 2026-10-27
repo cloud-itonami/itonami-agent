@@ -1,0 +1,74 @@
+(ns itonami.agent.tts
+  "Hermes text_to_speech, slice 1: provider-backed synthesis over an
+  OpenAI-compatible /audio/speech endpoint, on the same hop resolution the
+  chat chain uses. Config `tts.provider` / `tts.model` / `tts.voice`; an
+  unset piece is a NAMED error — nothing is inferred, no voice is guessed.
+  Audio bytes land in the profile workspace and the result names the file.
+  (Hermes' local/command providers, streaming and speaker routing are later
+  slices.)"
+  (:require [clojure.string :as str]
+            ["node:fs" :as fs]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.provider :as provider]))
+
+(defn configured
+  "The tts settings from config, or nil when incomplete: provider AND model
+  are required; voice defaults to `alloy` only once the rest is configured."
+  [config]
+  (let [c (get config "tts")]
+    (when-not (or (str/blank? (str (get c "provider")))
+                  (str/blank? (str (get c "model"))))
+      {:provider (str (get c "provider"))
+       :model (str (get c "model"))
+       :voice (str (or (get c "voice") "alloy"))})))
+
+(defn speech-request
+  "The /audio/speech request (pure): one hop -> {url headers body}. The
+  response is audio bytes, so the body carries the OpenAI speech fields and
+  the hop's headers ride along."
+  [hop voice text format]
+  {:url (str (:base-url hop) "/audio/speech")
+   :headers (cond-> (or (:headers hop) {})
+              (not (str/blank? (str (:token hop)))) (assoc "Authorization" (str "Bearer " (:token hop))))
+   :body (h/json-str {"model" (:model hop)
+                      "voice" voice
+                      "input" (str text)
+                      "response_format" (str format)})})
+
+(defn synthesize!
+  "Run one synthesis and write the audio into <home>/workspace/tts/<sha>.<format>.
+  Injected `fetch` for tests. Resolves to a map naming path and format, or a
+  map naming the error — a named outcome either way, never a guessed
+  artifact."
+  [config home {:strs [text voice model format]} fetch]
+  (let [cfg (configured config)
+        fmt (str (or format "mp3"))]
+    (cond
+      (nil? cfg)
+      (p/resolved {"error" "text_to_speech is not configured (tts.provider and tts.model are required)"})
+
+      (str/blank? (str text))
+      (p/resolved {"error" "text is required"})
+
+      :else
+      (let [hop (provider/resolve-hop config {"provider" (:provider cfg)
+                                              "model" (or model (:model cfg))})
+            token (when-not (str/blank? (str (:key-env hop))) (h/env (:key-env hop)))
+            req (speech-request (assoc hop :token token) (or voice (:voice cfg)) text fmt)
+            out-dir (h/join home "workspace" "tts")
+            out-path (h/join out-dir (str (h/sha256-hex (str text)) "." fmt))]
+        (if (str/blank? (str (:base-url hop)))
+          (p/resolved {"error" (str "provider " (:provider cfg) " has no base_url configured")})
+          (-> (fetch (:url req) (clj->js {:method "POST"
+                                          :headers (clj->js (:headers req))
+                                          :body (:body req)}))
+              (p/then (fn [res]
+                        (if (.-ok res)
+                          (-> (.arrayBuffer res)
+                              (p/then (fn [buf]
+                                        (h/mkdirs out-dir)
+                                        (fs/writeFileSync out-path (js/Buffer.from buf))
+                                        {"path" out-path "format" fmt})))
+                          (p/resolved {"error" (str "speech request failed: HTTP " (.-status res))}))))
+              (p/catch (fn [e] {"error" (str "speech request failed: " (or (.-message e) e))}))))))))

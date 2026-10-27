@@ -1,0 +1,70 @@
+(ns itonami.agent.tts-test
+  "text_to_speech slice 1: provider-backed synthesis — configured? answers
+  nothing when incomplete, the request is pure, and the audio lands in the
+  workspace with a named result (or a named error)."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.tts :as tts]))
+
+(deftest configured-never-guesses
+  (is (nil? (tts/configured {})))
+  (is (nil? (tts/configured {"tts" {"provider" "murakumo"}})))
+  (is (nil? (tts/configured {"tts" {"model" "x"}})))
+  (let [c (tts/configured {"tts" {"provider" "murakumo" "model" "tts-1"}})]
+    (is (= "murakumo" (:provider c)))
+    (is (= "tts-1" (:model c)))
+    (is (= "alloy" (:voice c))))
+  (is (= "nova" (:voice (tts/configured {"tts" {"provider" "p" "model" "m" "voice" "nova"}})))))
+
+(deftest speech-request-shape
+  (let [req (tts/speech-request {:base-url "https://api.x/v1" :model "tts-1" :token "T" :headers {}} "nova" "hi" "mp3")]
+    (is (= "https://api.x/v1/audio/speech" (:url req)))
+    (is (= "Bearer T" (get-in req [:headers "Authorization"])))
+    (let [body (js->clj (js/JSON.parse (:body req)))]
+      (is (= "tts-1" (get body "model")))
+      (is (= "nova" (get body "voice")))
+      (is (= "hi" (get body "input")))
+      (is (= "mp3" (get body "response_format"))))))
+
+(deftest synthesize-writes-the-audio
+  (async done
+    (let [home (h/join (h/tmp-dir) (str "test-tts-" (.-pid js/process) "-" (h/random-hex 4)))
+          captured (atom nil)
+          fake-fetch (fn [url opts]
+                       (reset! captured {:url url :body (.-body opts)})
+                       (p/resolved #js {:ok true
+                                        :status 200
+                                        :arrayBuffer (fn [] (p/resolved (js/Buffer.from "AUDIO"))) }))
+          config {"tts" {"provider" "p1" "model" "tts-1" "voice" "nova"}
+                  "providers" {"p1" {"base_url" "https://api.x/v1" "key_env" "X_TOKEN"}}}]
+      (aset (.-env js/process) "X_TOKEN" "TOK")
+      (-> (tts/synthesize! config home {"text" "hello world"} fake-fetch)
+          (p/then (fn [r]
+                    (is (nil? (get r "error")))
+                    (is (= "mp3" (get r "format")))
+                    (is (h/file? (get r "path")))
+                    (is (re-find #"workspace/tts/" (get r "path")))
+                    (is (re-find #"audio/speech" (:url @captured)))))
+          (p/finally (fn [] (js-delete (.-env js/process) "X_TOKEN") (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
+(deftest synthesize-named-errors
+  (async done
+    (let [home "/tmp/nope"
+          called (atom false)
+          fake-fetch (fn [_ _] (reset! called true) (p/resolved #js {:ok true :status 200}))]
+      (-> (tts/synthesize! {} home {"text" "x"} fake-fetch)
+          (p/then (fn [r] (is (re-find #"not configured" (str (get r "error"))))))
+          (p/then (fn [_] (tts/synthesize! {"tts" {"provider" "p1" "model" "m"}}
+                                           home {"text" "  "} fake-fetch)))
+          (p/then (fn [r] (is (re-find #"text is required" (str (get r "error"))))))
+          (p/then (fn [_]
+                    (tts/synthesize! {"tts" {"provider" "p1" "model" "m"}
+                                      "providers" {"p1" {"base_url" "https://api.x/v1"}}}
+                                     home {"text" "x"}
+                                     (fn [_ _] (p/resolved #js {:ok false :status 500})))))
+          (p/then (fn [r] (is (re-find #"HTTP 500" (str (get r "error"))))))
+          (p/then (fn [_] (is (false? @called))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
