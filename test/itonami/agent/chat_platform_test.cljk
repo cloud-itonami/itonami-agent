@@ -1,0 +1,174 @@
+(ns itonami.agent.chat-platform-test
+  "JUN-465 slice 1: inbound messaging — normalization, intake guards,
+  chat -> profile routing, per-chat history, and the serial per-chat
+  dispatch (busy chats queue). The transport and the turn run are injected."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.chat-platform :as chat]))
+
+(defn- tmp-home [tag]
+  (let [home (h/join (h/tmp-dir) (str "test-chat-" tag "-" (.-pid js/process) "-" (h/random-hex 4)))]
+    (h/mkdirs home)
+    home))
+
+(defn- tg-update
+  "A telegram getUpdates entry carrying a text message."
+  [uid chat-id text & [user-id]]
+  {"update_id" uid
+   "message" {"message_id" (str "m" uid)
+              "text" text
+              "chat" {"id" chat-id}
+              "from" {"id" (or user-id "u1") "username" "alice"}}})
+
+(deftest telegram-normalize-shape
+  (testing "a text message becomes the platform-agnostic inbound message"
+    (let [m (chat/normalize "telegram" (tg-update 7 "c1" "hello"))]
+      (is (= "telegram" (get m "platform")))
+      (is (= "7" (get m "update_id")))
+      (is (= "c1" (get m "chat_id")))
+      (is (= "u1" (get m "user_id")))
+      (is (= "alice" (get m "user_name")))
+      (is (= "m7" (get m "message_id")))
+      (is (= "hello" (get m "text")))))
+  (testing "updates that carry no turn normalize to nil"
+    (is (nil? (chat/normalize "telegram" {"update_id" 1 "edited_message" {"text" "x"}})))
+    (is (nil? (chat/normalize "telegram" {"update_id" 2 "message" {"photo" [{}]
+                                                                  "chat" {"id" "c1"}}})))
+    (is (nil? (chat/normalize "telegram" {"update_id" 3 "channel_post" {"text" "x"}})))
+    (is (nil? (chat/normalize "unknown-platform" {})))))
+
+(deftest intake-guards
+  (let [seen (atom [])
+        msg {:x 1 :platform "telegram" :update_id "1" :text "hi"}
+        g (chat/guard-message seen msg)]
+    (is (= {:ok msg} g))
+    (testing "a message already seen is dropped"
+      (is (= "duplicate" (:drop (chat/guard-message seen
+                                                    {:platform "telegram" :update_id "1" :text "hi"}))))))
+  (let [seen (atom [])]
+    (testing "empty and oversized texts are dropped"
+      (is (= "empty" (:drop (chat/guard-message seen {:platform "t" :update_id "1" :text "  "}))))
+      (is (= "oversized" (:drop (chat/guard-message seen {:platform "t" :update_id "2"
+                                                          :text (apply str (repeat (inc chat/max-text-chars) "a"))})))))))
+
+(deftest route-chat-ownership
+  (let [profiles [{:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}}}
+                  {:name "beta" :config {"delivery" {"telegram" {"chat_id" "c2"}}
+                                         "gateway" {"routes" {"telegram:c9" "beta"}}}}]]
+    (is (= "alpha" (chat/route-chat profiles {"platform" "telegram" "chat_id" "c1"})))
+    (is (= "beta" (chat/route-chat profiles {"platform" "telegram" "chat_id" "c2"})))
+    (testing "an explicit gateway.routes entry wins"
+      (is (= "beta" (chat/route-chat profiles {"platform" "telegram" "chat_id" "c9"}))))
+    (testing "an unresolved identity routes to nothing — it is dropped, never keyed elsewhere"
+      (is (nil? (chat/route-chat profiles {"platform" "telegram" "chat_id" "cX"}))))))
+
+(deftest history-round-trip
+  (let [home (tmp-home "hist")]
+    (chat/append-history! home "telegram" "c1" [{"role" "user" "content" "q"}
+                                                {"role" "assistant" "content" "a"}])
+    (let [rows (chat/load-history home "telegram" "c1")]
+      (is (= 2 (count rows)))
+      (is (= {"role" "user" "content" "q"} (first rows)))
+      (is (= {"role" "assistant" "content" "a"} (second rows))))
+    (testing "load caps at the newest rows"
+      (chat/append-history! home "telegram" "c1" [{"role" "user" "content" "q2"}])
+      (is (= ["a" "q2"] (map #(get % "content") (chat/load-history home "telegram" "c1" 2)))))))
+
+(defn- stub-executor
+  "A turn runner answering with `final`, recording the prompts it saw. When
+  `gate` is a promise, the turn waits on it (to hold a chat busy in tests)."
+  [calls final gate]
+  (fn [_prof prompt _opts]
+    (swap! calls conj prompt)
+    (if gate
+      (-> gate (p/then (fn [_] {:final final :exit-reason "completed" :messages []})))
+      (p/resolved {:final final :exit-reason "completed" :messages []}))))
+
+(deftest dispatch-round-trip
+  (async done
+    (let [home (tmp-home "dispatch")
+          calls (atom [])
+          sent (atom [])
+          profiles [{:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}} :home home}]
+          dispatch (chat/make-dispatcher
+                    {:profiles profiles
+                     :executor (stub-executor calls "A1" nil)
+                     :run-opts (fn [_ _] {})
+                     :send! (fn [_prof msg text] (swap! sent conj [(get msg "chat_id") text])
+                                        (p/resolved nil))})]
+      (-> (dispatch (tg-update 1 "c1" "hello"))
+          (p/then (fn [r]
+                    (is (= :replied (:status r)))
+                    (is (= ["hello"] @calls))
+                    (is (= [["c1" "A1"]] @sent))
+                    (testing "the transcript is persisted as role/content rows"
+                      (let [rows (chat/load-history home "telegram" "c1")]
+                        (is (= ["user" "assistant"] (map #(get % "role") rows)))
+                        (is (= "A1" (get (second rows) "content")))))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
+
+(deftest dispatch-drops-and-unrouted
+  (async done
+    (let [home (tmp-home "drop")
+          calls (atom [])
+          sent (atom [])
+          profiles [{:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}} :home home}]
+          dispatch (chat/make-dispatcher
+                    {:profiles profiles
+                     :executor (stub-executor calls "A" nil)
+                     :run-opts (fn [_ _] {})
+                     :send! (fn [_ _ text] (swap! sent conj text) (p/resolved nil))})]
+      (-> (dispatch (tg-update 1 "cX" "nobody owns this chat"))
+          (p/then (fn [r] (is (= :unrouted (:status r)))))
+          (p/then (fn [_] (dispatch (tg-update 2 "c1" "hi"))))
+          (p/then (fn [r] (is (= :replied (:status r)))))
+          (p/then (fn [_] (dispatch (tg-update 2 "c1" "hi"))))
+          (p/then (fn [r]
+                    (is (= :dropped (:status r)))
+                    (is (= "duplicate" (:reason r)))
+                    (is (= 1 (count @calls)))
+                    (is (= 1 (count @sent)))
+                    (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
+
+(deftest dispatch-queues-while-busy
+  (async done
+    (let [home (tmp-home "queue")
+          calls (atom [])
+          sent (atom [])
+          gate (js/Promise. (fn [res] (js/setTimeout #(res true) 150)))
+          profiles [{:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}} :home home}]
+          dispatch (chat/make-dispatcher
+                    {:profiles profiles
+                     :executor (stub-executor calls "A" gate)
+                     :run-opts (fn [_ _] {})
+                     :send! (fn [_ _ text] (swap! sent conj text) (p/resolved nil))})
+          first-done (dispatch (tg-update 1 "c1" "one"))]
+      ;; this message arrives while the first turn is still running
+      (-> (p/then (dispatch (tg-update 2 "c1" "two"))
+                  (fn [_] first-done))
+          (p/then (fn [_]
+                    (testing "the second message waited its turn instead of interleaving"
+                      (is (= ["one" "two"] @calls)))
+                    (is (= ["A" "A"] @sent))
+                    (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
+
+(deftest telegram-poll-advances-the-offset
+  (async done
+    (let [fetched (atom nil)
+          fake-fetch (fn [url _]
+                       (reset! fetched url)
+                       (p/resolved #js {:ok true
+                                        :text (fn [] (p/resolved (h/json-str {"ok" true
+                                                                              "result" [(tg-update 4 "c1" "hi")
+                                                                                        (tg-update 5 "c1" "yo")]})))}))]
+      (-> (chat/telegram-poll! {:fetch fake-fetch :token "TOKEN" :offset 0 :timeout 0})
+          (p/then (fn [{:keys [updates offset]}]
+                    (is (= 2 (count updates)))
+                    (is (= 6 offset))
+                    (is (re-find #"/botTOKEN/getUpdates" @fetched))
+                    (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
