@@ -40,7 +40,8 @@
 
 (deftest intake-guards
   (let [seen (atom [])
-        msg {"x" 1 "platform" "telegram" "update_id" "1" "text" "hi"}
+        msg {"x" 1 "platform" "telegram" "update_id" "1" "text" "hi"
+             "chat_id" "c1" "user_id" "u1"}
         g (chat/guard-message seen msg)]
     (is (= {:ok msg} g))
     (testing "a message already seen is dropped"
@@ -48,9 +49,13 @@
                                                     {"platform" "telegram" "update_id" "1" "text" "hi"}))))))
   (let [seen (atom [])]
     (testing "empty and oversized texts are dropped"
-      (is (= "empty" (:drop (chat/guard-message seen {"platform" "t" "update_id" "1" "text" "  "}))))
+      (is (= "empty" (:drop (chat/guard-message seen {"platform" "t" "update_id" "1" "text" "  "
+                                                     "chat_id" "c1" "user_id" "u1"}))))
+      (is (= "empty-identity" (:drop (chat/guard-message seen {"platform" "t" "update_id" "9" "text" "hi"
+                                                              "chat_id" "" "user_id" "u1"}))))
       (is (= "oversized" (:drop (chat/guard-message seen {"platform" "t" "update_id" "2"
-                                                          "text" (apply str (repeat (inc chat/max-text-chars) "a"))})))))))
+                                                          "text" (apply str (repeat (inc chat/max-text-chars) "a"))
+                                                          "chat_id" "c1" "user_id" "u1"})))))))
 
 (deftest route-chat-ownership
   (let [profiles [{:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}}}
@@ -208,3 +213,50 @@
                       (is (= :turn-failed (:status r))))))
           (p/then (fn [_] (done)))
           (p/catch (fn [e] (is false (str "hung or crashed: " (.-message e))) (done)))))))
+
+(deftest reply-targets-the-sender-chat-not-the-configured-chat
+  (async done
+    ;; regression: a gateway.routes-routed chat must get its reply in ITS OWN
+      ;; chat, never the profile's configured delivery.telegram.chat_id
+    (let [home (tmp-home "routes")
+          captured (atom nil)
+          fake-fetch (fn [url opts]
+                       (reset! captured {:url url :body (when opts (.-body opts))})
+                       (p/resolved #js {:ok true :status 200}))
+          profiles [{:name "alpha"
+                     :config {"delivery" {"telegram" {"chat_id" "configured-chat"}}
+                              "gateway" {"routes" {"telegram:sender-chat" "alpha"}}}
+                     :home home}]
+          dispatch (chat/make-dispatcher
+                    {:profiles profiles
+                     :executor (stub-executor (atom []) "A1" nil)
+                     :run-opts (fn [_ _] {})
+                     :send! (fn [prof msg text] (chat/send-reply! prof msg text fake-fetch))})]
+      (aset (.-env js/process) "TELEGRAM_BOT_TOKEN" "TESTTOKEN")
+      (-> (dispatch "telegram" (tg-update 1 "sender-chat" "hi"))
+          (p/then (fn [r]
+                    (is (= :replied (:status r)))
+                    (testing "the sendMessage body names the sender's chat"
+                      (is (re-find #"sender-chat" (str (:body @captured))))
+                      (is (not (re-find #"configured-chat" (str (:body @captured))))))))
+          (p/finally (fn []
+                       (js-delete (.-env js/process) "TELEGRAM_BOT_TOKEN")
+                       (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
+
+(deftest dispatch-rejecting-send-is-send-failed
+  (async done
+    (let [home (tmp-home "reject")
+          profiles [{:name "alpha" :config {"delivery" {"telegram" {"chat_id" "c1"}}} :home home}]
+          dispatch (chat/make-dispatcher
+                    {:profiles profiles
+                     :executor (stub-executor (atom []) "A" nil)
+                     :run-opts (fn [_ _] {})
+                     :send! (fn [_ _ _] (js/Promise.reject (js/Error. "net down")))})]
+      (-> (dispatch "telegram" (tg-update 1 "c1" "hi"))
+          (p/then (fn [r]
+                    (testing "a rejecting send resolves :send-failed, not :replied"
+                      (is (= :send-failed (:status r)))
+                      (is (= "net down" (:error r))))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
