@@ -1169,11 +1169,22 @@ plain: true
 
 (deftest the-review-fork-activation-flows
   ;; the R-staged seam: ITONAMI_SKILL_REVIEW=1 is the ONLY switch for the
-  ;; skill staged-review guards; normal runs are never gated
+  ;; skill staged-review guards; normal runs are never gated. The seam
+  ;; carries BOTH :review? and :review-read (the R1 gate: read-before-write
+  ;; must be SATISFIABLE — flag without marks deadlocks every write)
   (with-redefs [h/env (fn [k] (when (= k "ITONAMI_SKILL_REVIEW") "1"))]
-    (is (true? (agent-loop/review-context?))))
+    (is (true? (agent-loop/review-context?)))
+    (let [seam (agent-loop/review-seam)]
+      (is (true? (:review? seam)))
+      (is (some? (:review-read seam)))
+      ;; and the guard is satisfiable through the seam's marks (the fns are
+      ;; tools.cljk-private and take a ctx map carrying :review-read)
+      (let [gctx {:review-read (:review-read seam)}]
+        (#'tools/review-mark-read! gctx "/tmp/whatever")
+        (is (true? (#'tools/review-read? gctx "/tmp/whatever"))))))
   (with-redefs [h/env (fn [_] nil)]
-    (is (false? (agent-loop/review-context?)))))
+    (is (false? (agent-loop/review-context?)))
+    (is (= {} (agent-loop/review-seam)))))
 
 (deftest delegate-pending-results-delivered-once
   ;; background results re-enter as one message between turns and are
