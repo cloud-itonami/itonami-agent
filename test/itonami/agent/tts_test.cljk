@@ -32,16 +32,35 @@
       (is (= "mp3" (get body "response_format"))))))
 
 (deftest synthesize-fails-named-on-every-branch
-  (testing "a network failure is a named error"
-    (-> (tts/synthesize! {"tts" {"provider" "x" "model" "m"} "providers" {"x" {"kind" "send_json_base" "base_url" "https://api.x/v1" "model" "m"}}}
-                         "/tmp/tts-no-home" {"text" "hi" "format" "mp3"}
-                         (fn [_ _] (js/Promise.reject (js/Error. "ECONNRESET"))))
-        (promesa.core/then (fn [r] (is (re-find #"speech request failed: ECONNRESET" (str (get r "error"))))))))
-  (testing "a non-2xx response is a named error"
-    (-> (tts/synthesize! {"tts" {"provider" "x" "model" "m"} "providers" {"x" {"kind" "send_json_base" "base_url" "https://api.x/v1" "model" "m"}}}
-                         "/tmp/tts-no-home" {"text" "hi" "format" "mp3"}
-                         (fn [_ _] (js/Promise.resolve #js {:ok false :status 502})))
-        (promesa.core/then (fn [r] (is (= "speech request failed: HTTP 502" (get r "error"))))))))
+  ;; async: the assertions ride the promise chain and the test awaits them
+  (async done
+    (let [cfg {"tts" {"provider" "x" "model" "m"} "providers" {"x" {"kind" "send_json_base" "base_url" "https://api.x/v1" "model" "m"}}}]
+      (-> (tts/synthesize! cfg "/tmp/tts-no-home" {"text" "hi" "format" "mp3"}
+                           (fn [_ _] (js/Promise.reject (js/Error. "ECONNRESET")))
+                           (constantly true))
+          (promesa.core/then (fn [r]
+                               (is (re-find #"speech request failed: ECONNRESET" (str (get r "error"))))))
+          (promesa.core/then (fn [_]
+                               (tts/synthesize! cfg "/tmp/tts-no-home" {"text" "hi" "format" "mp3"}
+                                                (fn [_ _] (js/Promise.resolve #js {:ok false :status 502}))
+                                                (constantly true))))
+          (promesa.core/then (fn [r]
+                               (is (= "speech request failed: HTTP 502" (get r "error")))))
+          (promesa.core/then (fn [_] (done)))
+          (promesa.core/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
+(deftest synthesize-refuses-a-path-outside-roots
+  ;; the roots gate runs BEFORE the write and refuses it — like write-file
+  (async done
+    (let [cfg {"tts" {"provider" "x" "model" "m"} "providers" {"x" {"kind" "send_json_base" "base_url" "https://api.x/v1" "model" "m"}}}
+          fake-fetch (fn [_ _] (js/Promise.resolve #js {:ok true :status 200
+                                                        :arrayBuffer (fn [] (js/Promise.resolve (js/Buffer.from "abc")))}))]
+      (-> (tts/synthesize! cfg "/tmp/tts-no-home" {"text" "hi" "format" "mp3"} fake-fetch (constantly false))
+          (promesa.core/then (fn [r]
+                               (is (= "speech write refused: outside the permitted roots" (get r "error")))
+                               (is (nil? (get r "path")))))
+          (promesa.core/then (fn [_] (done)))
+          (promesa.core/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
 
 (deftest synthesize-writes-the-audio
   (async done

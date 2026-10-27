@@ -49,11 +49,13 @@
 
 (defn synthesize!
   "Run one synthesis and write the audio into <home>/workspace/tts/<sha>.<format>,
-  where the hash covers text+voice+model+format (same request, same bytes;
-  different request, different file). Injected `fetch` for tests. Resolves to
-  a map naming path and format, or a map naming the error — a named outcome
-  either way, never a guessed artifact."
-  [config home {:strs [text voice model] :as args} fetch]
+  where the hash covers text+voice+model+format+provider (same request, same
+  bytes; different request, different file). Injected `fetch` for tests;
+  `writable?` (a path predicate from the tool ctx) is consulted BEFORE the
+  write — a path outside the permitted roots is refused, exactly as
+  write-file/patch refuse. Resolves to a map naming path and format, or a map
+  naming the error — a named outcome either way, never a guessed artifact."
+  [config home {:strs [text voice model] :as args} fetch writable?]
   ;; `format` is pulled by key — destructuring it would shadow clojure.core
   (let [cfg (configured config)
         fmt-in (let [f (str (get args "format"))] (if (str/blank? f) "mp3" f))
@@ -87,28 +89,43 @@
                 ;; json encoding is delimiter-unambiguous: distinct requests
                 ;; cannot collide on one path
                 out-path (h/join out-dir (str (h/sha256-hex (h/json-str [(str text) voice model fmt (:provider cfg)])) "." fmt))]
-            (-> (fetch (:url req) (clj->js {:method "POST"
-                                            :headers (clj->js (:headers req))
-                                            :body (:body req)
-                                            ;; bound the wait like the chat
-                                            ;; hop: a stalled endpoint must
-                                            ;; not hang the tool call
-                                            :signal (.-signal (js/AbortController.))}))
-                (p/catch (fn [e] {"error" (str "speech request failed: " (or (.-message e) e))}))
-                (p/then (fn [r]
-                          (if (get r "error")
-                            r
-                            (if (.-ok r)
-                              (-> (.arrayBuffer r)
-                                  (p/then (fn [buf]
-                                            (try
-                                              (h/mkdirs out-dir)
-                                              (fs/writeFileSync out-path (js/Buffer.from buf))
-                                              ;; the CALLER records this as a
-                                              ;; run write (tools.cljk) — tts
-                                              ;; cannot require tools (cycle)
-                                              {"path" out-path "format" fmt}
-                                              (catch :default e
-                                                {"error" (str "speech write failed: " (or (.-message e) e))}))))
-                                  (p/catch (fn [e] {"error" (str "speech write failed: " (or (.-message e) e))})))
-                              {"error" (str "speech request failed: HTTP " (.-status r))})))))))))))
+            (let [ctl (js/AbortController.)
+                  ;; the chat-hop pattern: the controller is paired with a
+                  ;; timer that ABORTS it — without the timer the signal
+                  ;; never fires and the fetch stays unbounded. (The timer is
+                  ;; cleared on BOTH outcomes; p/finally is avoided: it
+                  ;; breaks value propagation through p/catch in this build.)
+                  timer (js/setTimeout (fn [] (.abort ctl))
+                                       (* 1000 (or (:timeout-s hop) 900)))]
+              (-> (fetch (:url req) (clj->js {:method "POST"
+                                              :headers (clj->js (:headers req))
+                                              :body (:body req)
+                                              :signal (.-signal ctl)}))
+                  (p/catch (fn [e]
+                             (js/clearTimeout timer)
+                             {"error" (str "speech request failed: " (or (.-message e) e))}))
+                  (p/then
+                   (fn [r]
+                     (js/clearTimeout timer)
+                     (if (get r "error")
+                       r
+                       (if (.-ok r)
+                         (-> (.arrayBuffer r)
+                             (p/then
+                              (fn [buf]
+                                (try
+                                  ;; the roots gate runs BEFORE the write,
+                                  ;; like write-file/patch — refuse, never
+                                  ;; write and then only skip bookkeeping
+                                  (if (and writable? (not (writable? out-path)))
+                                    {"error" "speech write refused: outside the permitted roots"}
+                                    (do (h/mkdirs out-dir)
+                                        (fs/writeFileSync out-path (js/Buffer.from buf))
+                                        ;; the CALLER records this as a run
+                                        ;; write (tools.cljk) — tts cannot
+                                        ;; require tools (cycle)
+                                        {"path" out-path "format" fmt}))
+                                  (catch :default e
+                                    {"error" (str "speech write failed: " (or (.-message e) e))}))))
+                             (p/catch (fn [e] {"error" (str "speech read failed: " (or (.-message e) e))})))
+                         {"error" (str "speech request failed: HTTP " (.-status r))}))))))))))))

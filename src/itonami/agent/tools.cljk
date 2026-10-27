@@ -2996,7 +2996,8 @@
   (-> (tts/synthesize! (:config ctx) (:home ctx)
                        {"text" text "voice" voice "model" model
                         "format" (get args "format")}
-                       js/fetch)
+                       js/fetch
+                       (fn [p] (writable? ctx p)))
       (p/then (fn [r]
                 (if-let [e (get r "error")]
                   (err e)
