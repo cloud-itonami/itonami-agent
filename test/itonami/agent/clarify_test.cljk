@@ -65,6 +65,27 @@
           (is (= "skipped" (get-in parsed ["responses" 0 "status"])))
           (is (nil? (get-in parsed ["responses" 0 "user_response"]))))))))
 
+(deftest multi-select-follows-python-truthiness
+  (testing "falsy multi_select values keep scalar answers valid (0/''/[]/{} are false in Python)"
+    (doseq [v [0 "" [] {} false nil]]
+      (let [[norm _] (clarify/normalize-questions [{"question" "A" "choices" ["yes" "no"] "multi_select" v}])]
+        (is (false? (get (first norm) "multi_select")) (str "multi_select " (pr-str v)))
+        ;; a scalar answer stays valid — no 'object is not iterable'
+        (is (= "yes" (get-in (h/json-parse (clarify/result-json norm {"answers" {"q0" "yes"} "outcome" "submitted"}))
+                             ["responses" 0 "user_response"]))))))
+  (testing "truthy values (1, a non-empty string) still mean multi_select when choices exist"
+    (let [[norm _] (clarify/normalize-questions [{"question" "A" "choices" ["yes" "no"] "multi_select" 1}])]
+      (is (true? (get (first norm) "multi_select"))))))
+
+(deftest bool-stringification-everywhere-python-style
+  (testing "a boolean question value stringifies True (Python str of the or-guard result)"
+    (let [[norm _] (clarify/normalize-questions [{"question" true "choices" ["a"]}])]
+      (is (= "True" (get (first norm) "question")))))
+  (testing "a boolean notice stringifies True"
+    (let [[norm _] (clarify/normalize-questions [{"question" "A"}])
+          parsed (h/json-parse (clarify/result-json norm {"answers" {} "outcome" "submitted" "notice" true}))]
+      (is (= "True" (get parsed "notice"))))))
+
 (deftest multi-items-stringify-python-style
   (testing "None and booleans SURVIVE the raw filter as None/True/False"
     (let [[norm _] (clarify/normalize-questions [{"question" "A" "choices" ["yes" "no"] "multi_select" true}])]

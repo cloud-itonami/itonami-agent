@@ -20,16 +20,15 @@
 (def shape "Pass questions=[{question, choices?, multi_select?}]; a single question is a one-entry array.")
 
 
-(defn- hermes-truthy-str
-  "Hermes str(x-or-empty): falsy values (nil, false, empty string, 0, empty
-  collections) become the empty string; everything else is stringified."
+(defn- py-str
+  "Python str() on an answer value: nil and booleans print Python-style
+  (None/True/False); numbers follow JS (CLJS cannot distinguish 1 from 1.0)
+  and collections follow JS repr — documented, accepted divergences."
   [x]
   (cond
-    (or (nil? x) (false? x)) ""
-    (and (string? x) (str/blank? x)) ""
-    (and (number? x) (zero? x)) ""
-    (and (sequential? x) (empty? x)) ""
-    (and (map? x) (empty? x)) ""
+    (nil? x) "None"
+    (true? x) "True"
+    (false? x) "False"
     :else (str x)))
 
 (defn- py-truthy
@@ -44,16 +43,17 @@
     (and (coll? x) (empty? x)) false
     :else true))
 
-(defn- py-str
-  "Python `str()` on an answer value: booleans and nil print Python-style.
-  Numbers follow JS stringification (CLJS cannot distinguish 1 from 1.0) —
-  a documented, accepted divergence."
+(defn- hermes-truthy-str
+  "Hermes str(x-or-empty): falsy values (nil, false, empty string, 0, empty
+  collections) become the empty string; everything else is stringified."
   [x]
   (cond
-    (true? x) "True"
-    (false? x) "False"
-    (nil? x) "None"
-    :else (str x)))
+    (or (nil? x) (false? x)) ""
+    (and (string? x) (str/blank? x)) ""
+    (and (number? x) (zero? x)) ""
+    (and (sequential? x) (empty? x)) ""
+    (and (map? x) (empty? x)) ""
+    :else (py-str x)))
 
 (defn strip-recommended
   "Remove the recommendation label so presentation never leaks into
@@ -139,7 +139,7 @@
                     "question" text
                     "choices" (when offer (mark-recommended offer))
                     "choices_offered" offer
-                    "multi_select" (boolean (and (get item "multi_select") offer))} nil])))))))))
+                    "multi_select" (and (py-truthy (get item "multi_select")) (some? offer))} nil])))))))))
 
 (defn normalize-questions
   "Hermes `_normalize_questions`: -> [normalized error]. Entries carry qid
@@ -168,7 +168,9 @@
   [qid answers multi?]
   (let [raw (get answers qid)
         cleaned (when-not (or (nil? raw) (= "" raw)) (clean-answer raw multi?))]
-    (if (and cleaned (if (sequential? cleaned) (seq cleaned) (not (str/blank? (str cleaned)))))
+    ;; the answered-or-not decision follows Python truthiness of the cleaned
+    ;; value, in one place (py-truthy), like every other truthiness call here
+    (if (and cleaned (py-truthy cleaned))
       ["answered" cleaned]
       [(if (contains? answers qid) "skipped" "unanswered") nil])))
 
@@ -192,7 +194,7 @@
         ;; " " is included; 0/false/empty strings and collections are not
         notice (get reply "notice")
         result (cond-> {"responses" responses "outcome" (get reply "outcome")}
-                 (py-truthy notice) (assoc "notice" (str notice)))]
+                 (py-truthy notice) (assoc "notice" (py-str notice)))]
     (h/json-str result)))
 
 (defn ask!
@@ -214,8 +216,8 @@
                   ;; a bridge reply may arrive as a plain JS object (answers
                   ;; may too — coerce both so lookups never silently miss)
                   reply (cond
-                          (map? r0) (update r0 "answers" (fn [a] (if (instance? js/Object a) (js->clj a) a)))
-                          (and r0 (instance? js/Object r0)) (js->clj r0)
+                          (map? r0) (update r0 "answers" (fn [a] (if (and a (identical? (type a) js/Object)) (js->clj a) a)))
+                          (and r0 (map? (js->clj r0))) (js->clj r0)
                           :else nil)]
             (when-not (map? reply)
               (throw (js/Error. "reply must carry answers, outcome and an optional notice")))
