@@ -227,19 +227,48 @@
         ;; comments are TRANSPARENT to the reader (comment-only lines are
         ;; stripped before parsing), so they must not end the block — only a
         ;; column-0 non-comment line does (the R4 silent-no-op gate)
-        top-line? (fn [l] (and (not (str/blank? l))
-                               (not (re-matches #"\s+.*" l))
-                               (not (str/starts-with? (str/trim l) "#"))
-                               ;; the reader drops '---' before parsing: it
-                               ;; must not end the block either (the R5
-                               ;; silent-no-op class)
-                               (not= "---" (str/trim l))))
+        ;; mirror the reader's `lines`: strip the comment FIRST, then drop
+        ;; '---' — so `--- # note` and `---\t#c` are transparent too (the R6
+        ;; silent-no-op class)
+        strip-comment (fn [l]
+                        (loop [i 0 in-q nil esc? false]
+                          (if (>= i (count l))
+                            l
+                            (let [c (nth l i)]
+                              (cond
+                                esc? (recur (inc i) in-q false)
+                                (and (= in-q \") (= c \"))
+                                (recur (inc i) nil false)
+                                (and (= in-q \') (= c \'))
+                                (recur (inc i) nil false)
+                                (and (not in-q) (= c \#)
+                                     (or (zero? i) (re-matches #"\s" (str (nth l (dec i))))))
+                                (subs l 0 i)
+                                (and (not in-q) (or (= c \") (= c \')))
+                                (recur (inc i) c false)
+                                (and (= in-q \") (= c \\))
+                                (recur (inc i) in-q true)
+                                :else (recur (inc i) in-q false))))))
+        top-line? (fn [l]
+                    (let [s (strip-comment l)]
+                      ;; a line that strips to blank IS a comment —
+                      ;; transparent; `---` (with or without a trailing
+                      ;; comment) is transparent too
+                      (and (not (str/blank? l))
+                           (not (str/blank? s))
+                           (not (re-matches #"\s+.*" l))
+                           (not (str/starts-with? (str/trim s) "#"))
+                           (not= "---" (str/trim s)))))
         ;; the top-level model: opener: `model:` alone, or with a trailing
         ;; comment (the reader's strip-comment accepts both). LAST wins —
         ;; the reader keeps the last duplicate mapping (the R4 block gate)
         start (last (keep-indexed (fn [i l]
                                     (when (and (top-line? l)
-                                               (re-matches #"model:(\s*(#.*)?)?" l))
+                                               ;; whitespace or end before
+                                               ;; any comment: `model:#c` is
+                                               ;; a scalar value to the
+                                               ;; reader, not this opener
+                                               (re-matches #"model:(\s+(#.*)?)?" l))
                                       i))
                                   lines))
         block-end (if (nil? start)
@@ -261,18 +290,28 @@
         ;; the key shapes the reader's split-key accepts: quoted (double or
         ;; single) or bare, with optional spaces before the colon
         key-rx (fn [k] (re-pattern (str "^" pad "(?:\"|')?" k "(?:\"|')?\\s*:.*$")))
-        ;; quote-aware (like the reader's strip-comment): a # inside a
-        ;; quoted value is not a comment start
+        ;; the SAME scanner as the reader's strip-comment (single quotes
+        ;; open too, backslash escapes inside double quotes, any whitespace
+        ;; before '#') — the comment tail is exactly what the reader would
+        ;; strip
         trailing-comment (fn [l]
                            (loop [i 0 in-q nil esc? false]
-                             (when (< i (count l))
+                             (if (>= i (count l))
+                               nil
                                (let [c (nth l i)]
                                  (cond
                                    esc? (recur (inc i) in-q false)
-                                   (= c \") (recur (inc i) (when-not in-q \") false)
-                                   (and in-q (= c in-q)) (recur (inc i) nil false)
-                                   (and (not in-q) (= c \#) (or (zero? i) (= \  (nth l (dec i)))))
+                                   (and (= in-q \") (= c \"))
+                                   (recur (inc i) nil false)
+                                   (and (= in-q \') (= c \'))
+                                   (recur (inc i) nil false)
+                                   (and (not in-q) (= c \#)
+                                        (or (zero? i) (re-matches #"\s" (str (nth l (dec i))))))
                                    (subs l i)
+                                   (and (not in-q) (or (= c \") (= c \')))
+                                   (recur (inc i) c false)
+                                   (and (= in-q \") (= c \\))
+                                   (recur (inc i) in-q true)
                                    :else (recur (inc i) in-q false))))))
         replace-key (fn [ls k value]
                       (let [rx (key-rx k)
@@ -331,7 +370,7 @@
     ;; (the R4 gate: umask 0644 must never hold config text) and renamed
     ;; into place; the target keeps its own mode
     (try
-      (fs/writeFileSync tmp (set-model-text text model provider) #js {:mode mode})
+      (fs/writeFileSync tmp (set-model-text text model provider) #js {:mode mode :flag "wx"})
       (fs/renameSync tmp p)
       (catch :default e
         (try (fs/unlinkSync tmp) (catch :default _ nil))

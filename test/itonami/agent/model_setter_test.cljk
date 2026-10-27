@@ -140,6 +140,16 @@
       (is (str/includes? out "  default: NEW"))
       (is (not (str/includes? out "old")))))
 
+  (testing "'---' with a trailing comment is transparent too (the reader strips first)"
+    (doseq [sep ["--- # note" "---\t#c"]]
+      (let [out (profile/set-model-text (str "model:\n" sep "\n  default: old\n") "NEW" nil)]
+        (is (= 1 (count (re-seq #"(?m)^\s+default:" out))) (str "sep " sep))
+        (is (not (str/includes? out "old")) (str "sep " sep)))))
+
+  (testing "single-quoted values: a # inside is not a comment start"
+    (let [out (profile/set-model-text "model:\n  default: 'a # b'\n" "NEW" nil)]
+      (is (= "model:\n  default: NEW\n" out))))
+
   (testing "a # inside a quoted value is not a comment start (no fabricated comments)"
     (let [out (profile/set-model-text "model:\n  default: \"a # b\"\n" "NEW" nil)]
       (is (= "model:\n  default: NEW\n" out)))

@@ -1239,11 +1239,13 @@
   ;; boolean here), so validate the VALUE: a flag-looking token (the
   ;; `--provider --verbose` shape) or a blank is refused on the SHOW path
   ;; too, where it feeds provider/resolution
-  (when (and (some? (:provider opts))
-             (or (not (string? (:provider opts)))
-                 (str/blank? (:provider opts))
-                 (str/starts-with? (str (:provider opts)) "-")))
-    (die 2 "--provider must be a provider name"))
+  ;; the KEY being present with a nil value is the bare `--provider` shape
+  ;; (parse-args stores nil) — refuse it like any invalid value
+  (when (contains? opts :provider)
+    (when (or (not (string? (:provider opts)))
+              (str/blank? (:provider opts))
+              (str/starts-with? (str (:provider opts)) "-"))
+      (die 2 "--provider must be a provider name")))
   (when-let [name (first args)]
     (when (str/blank? (str/trim name))
       (die 2 "model name must be non-empty"))
