@@ -182,7 +182,12 @@
   [normalized reply]
   (when-not (contains? (into #{} (keys reply)) "outcome")
     (throw (js/Error. "'outcome'")))
-  (let [answers (or (get reply "answers") {})
+  (let [raw-answers (get reply "answers")
+        ;; a non-map answers (42, "abc", [1 2]) is a contract violation, not
+        ;; a silent all-unanswered — Python's answers.get(qid) would raise
+        _ (when (and (some? raw-answers) (not (map? raw-answers)))
+            (throw (js/Error. "answers must be a map of qid to answer")))
+        answers (or raw-answers {})
         responses (mapv (fn [entry]
                           (let [[status value] (response-status (get entry "qid") answers (get entry "multi_select"))]
                             {"question" (get entry "question")

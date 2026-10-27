@@ -332,7 +332,12 @@
               ;; one turn per group_process_notifications group, as the CLI's
               ;; pending input queue does (`_pending_input.put` per group)
               (if (seq notices)
-                (-> ((executor opts) prof (first notices) (run-opts opts prof))
+                (-> ((executor opts) prof (first notices)
+                     ;; clarify is wired for the whole CLI session (Hermes
+                     ;; wires clarify_callback once per agent session): every
+                     ;; turn the user is present for may ask — not just the
+                     ;; prompt turn
+                     (assoc (run-opts opts prof) :clarify-fn clarify-ask))
                     (p/then (fn [r]
                               (when (:final r) (println (:final r)))
                               (run-notices (rest notices)))))
@@ -350,7 +355,8 @@
                                              (str "- " (get r "goal") " [" (get r "status") "]: "
                                                   (or (get r "summary") (get r "error")))))
                             "\n\nAcknowledge these results in one line, then end your turn.")
-                       (run-opts (assoc opts :join-children? false) prof))
+                       (assoc (run-opts (assoc opts :join-children? false) prof)
+                              :clarify-fn clarify-ask))
                       (p/then (fn [r]
                                 (when (:final r) (println (:final r)))
                                 (ask))))
