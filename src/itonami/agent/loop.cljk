@@ -579,6 +579,11 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                          (swap! delegate-children assoc id {"goal" goal
                                                                             "status" (get base "status")
                                                                             "summary" (get base "summary")})
+                                         ;; the RESULT must survive the run
+                                         ;; ending (the R1 gate: the success
+                                         ;; path is the one that carries the
+                                         ;; summary the next run re-enters)
+                                         (persist-delegate-state!)
                                          (swap! delegate-ctl dissoc id)
                                          ;; Hermes tools/delegate_tool_registry._unregister_subagent:
                                          ;; the record moves to the bounded recent FIFO
