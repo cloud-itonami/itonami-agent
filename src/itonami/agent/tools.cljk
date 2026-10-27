@@ -19,6 +19,7 @@
             [itonami.agent.process :as process]
             [itonami.agent.code-rpc :as code-rpc]
             [itonami.agent.connections :as connections]
+            [itonami.agent.tts :as tts]
             [itonami.agent.homeassistant :as homeassistant]
             [itonami.agent.profile :as profile]
             [itonami.agent.provider :as provider]
@@ -359,6 +360,14 @@
      {"connections" {"type" "array"
                      "description" "Connector requests: [{\"name\": ..., \"mcp\": bool}]. Omit to list everything configured."}}
      [])
+   "text_to_speech"
+   (fn-schema "text_to_speech"
+     "Convert text to speech audio (slice 1: an OpenAI-compatible /audio/speech endpoint). Requires tts.provider and tts.model in config; tts.voice names the voice (default alloy). The audio is written into the profile workspace and the result names the file. An unconfigured or failing synthesis answers a named error."
+     {"text" {"type" "string" "description" "The text to speak."}
+      "voice" {"type" "string" "description" "Voice name (defaults to the configured tts.voice or alloy)."}
+      "model" {"type" "string" "description" "Override the configured tts.model for this call."}
+      "format" {"type" "string" "description" "Audio format (default mp3)."}}
+     ["text"])
    "computer_use" (computer-use/schema)})
 
 (def hermes-core-tools
@@ -2998,6 +3007,17 @@
     (if-let [e (get rows "error")]
       (err e)
       (ok {"connections" rows}))))
+(defn text-to-speech
+  "Hermes text_to_speech, slice 1: provider-backed synthesis (tts.cljk)."
+  [ctx {:strs [text voice model] :as args}]
+  (-> (tts/synthesize! (:config ctx) (:home ctx)
+                       {"text" text "voice" voice "model" model
+                        "format" (get args "format")}
+                       js/fetch)
+      (p/then (fn [r]
+                (if-let [e (get r "error")]
+                  (err e)
+                  (ok (assoc r "success" true)))))))
 
 (defn browser-vault-list [ctx _args]
   (let [home (:home ctx)
@@ -3087,6 +3107,7 @@
    "browser_console" browser/console-output
    "browser_cdp" browser/cdp-send "browser_dialog" browser/dialog
    "manage_connections" manage-connections "browser_vault_list" browser-vault-list "browser_vault_unlock" browser-vault-unlock
+   "text_to_speech" text-to-speech "browser_vault_list" browser-vault-list "browser_vault_unlock" browser-vault-unlock
    "browser_vault_save_login" browser-vault-save-login "browser_vault_enter_code" browser-vault-enter-code
    "browser_vault_fill" browser-vault-fill "browser_exec" browser/exec-code
    "browser_vision" browser-vision

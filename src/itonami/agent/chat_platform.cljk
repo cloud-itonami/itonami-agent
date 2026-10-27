@@ -321,7 +321,10 @@
         ;; parseInt prefix guess ("8abc" is NOT 8)
         (if (re-matches #"\d+" raw)
           (let [n (js/parseInt raw 10)]
-            (if (and (js/isFinite n) (pos? n)) n 0))
+            ;; isSafeInteger: a digit string past double precision must not
+            ;; round into a wrong number — it restarts at 0 like any other
+            ;; unrepresentable value
+            (if (and (js/isFinite n) (js/Number.isSafeInteger n) (pos? n)) n 0))
           0))
       0)
     (catch :default _ 0)))
