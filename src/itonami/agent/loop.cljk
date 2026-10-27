@@ -260,6 +260,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
              ;; an async-unsupported turn drops notify/watch with
              ;; `notify_unsupported` (process/spawn-notify-disposition).
              :async-delivery? async-delivery?
+             :config config
              :browser-config (get config "browser" {})
              :browser-session (str "kotoba-" (h/random-hex 12))
              :browser-used? (atom false)
