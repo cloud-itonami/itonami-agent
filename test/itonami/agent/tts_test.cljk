@@ -1,5 +1,5 @@
 (ns itonami.agent.tts-test
-  "text_to_speech slice 1: provider-backed synthesis — configured? answers
+  "text_to_speech slice 1: provider-backed synthesis — configured answers
   nothing when incomplete, the request is pure, and the audio lands in the
   workspace with a named result (or a named error)."
   (:require [cljs.test :refer [deftest is testing async]]
@@ -47,6 +47,38 @@
                     (is (re-find #"workspace/tts/" (get r "path")))
                     (is (re-find #"audio/speech" (:url @captured)))))
           (p/finally (fn [] (js-delete (.-env js/process) "X_TOKEN") (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
+(deftest synthesize-hardening
+  (async done
+    (let [home "/tmp/tts-hardening"
+          config {"tts" {"provider" "p1" "model" "tts-1" "voice" "nova"}
+                  "providers" {"p1" {"base_url" "https://api.x/v1" "key_env" "X_TOKEN"}}}
+          fake-ok (fn [_ _] (p/resolved #js {:ok true :status 200
+                                             :arrayBuffer (fn [] (p/resolved (js/Buffer.from "AUDIO")))}))]
+      (aset (.-env js/process) "X_TOKEN" "TOK")
+      (-> (tts/synthesize! config home {"text" "t" "format" "x/../../../evil"} fake-ok)
+          (p/then (fn [r]
+                    (testing "a traversal format is refused before any send"
+                      (is (re-find #"alphanumeric" (str (get r "error")))))))
+          (p/then (fn [_] (tts/synthesize! config home {"text" "t" "format" "" "voice" "" "model" ""} fake-ok)))
+          (p/then (fn [r]
+                    (testing "empty strings fall back to the configured defaults"
+                      (is (nil? (get r "error")))
+                      (is (= "mp3" (get r "format"))))))
+          (p/then (fn [_] (tts/synthesize! config home {"text" "same" "voice" "v1"} fake-ok)))
+          (p/then (fn [r1]
+                    (-> (tts/synthesize! config home {"text" "same" "voice" "v2"} fake-ok)
+                        (p/then (fn [r2]
+                                  (testing "same text with a different voice lands in a different file"
+                                    (is (not= (get r1 "path") (get r2 "path")))))))))
+          (p/then (fn [_]
+                    (js-delete (.-env js/process) "X_TOKEN")
+                    (tts/synthesize! config home {"text" "t"} fake-ok)))
+          (p/then (fn [r]
+                    (testing "an unset credential is a named error, not a doomed 401"
+                      (is (re-find #"missing credentials" (str (get r "error")))))))
+          (p/then (fn [_] (done)))
           (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
 
 (deftest synthesize-named-errors

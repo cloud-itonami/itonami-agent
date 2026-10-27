@@ -2,8 +2,9 @@
   "Hermes text_to_speech, slice 1: provider-backed synthesis over an
   OpenAI-compatible /audio/speech endpoint, on the same hop resolution the
   chat chain uses. Config `tts.provider` / `tts.model` / `tts.voice`; an
-  unset piece is a NAMED error — nothing is inferred, no voice is guessed.
-  Audio bytes land in the profile workspace and the result names the file.
+  unset piece is a NAMED error — nothing is inferred (the voice defaults to
+  alloy only once the rest is configured). Audio bytes land in the profile
+  workspace and the result names the file.
   (Hermes' local/command providers, streaming and speaker routing are later
   slices.)"
   (:require [clojure.string :as str]
@@ -36,14 +37,25 @@
                       "input" (str text)
                       "response_format" (str format)})})
 
+(defn- safe-format
+  "The response format as a filename-safe token: alphanumeric only, so a
+  caller-supplied format can never escape the workspace through the path."
+  [f]
+  (let [s (str f)]
+    (when (re-matches #"[A-Za-z0-9]+" s) s)))
+
 (defn synthesize!
-  "Run one synthesis and write the audio into <home>/workspace/tts/<sha>.<format>.
-  Injected `fetch` for tests. Resolves to a map naming path and format, or a
-  map naming the error — a named outcome either way, never a guessed
-  artifact."
+  "Run one synthesis and write the audio into <home>/workspace/tts/<sha>.<format>,
+  where the hash covers text+voice+model+format (same request, same bytes;
+  different request, different file). Injected `fetch` for tests. Resolves to
+  a map naming path and format, or a map naming the error — a named outcome
+  either way, never a guessed artifact."
   [config home {:strs [text voice model format]} fetch]
   (let [cfg (configured config)
-        fmt (str (or format "mp3"))]
+        fmt-in (let [f (str format)] (if (str/blank? f) "mp3" f))
+        fmt (safe-format fmt-in)
+        voice (let [v (str voice)] (if (str/blank? v) (get cfg :voice) v))
+        model (let [m (str model)] (if (str/blank? m) (get cfg :model) m))]
     (cond
       (nil? cfg)
       (p/resolved {"error" "text_to_speech is not configured (tts.provider and tts.model are required)"})
@@ -51,24 +63,39 @@
       (str/blank? (str text))
       (p/resolved {"error" "text is required"})
 
+      (nil? fmt)
+      (p/resolved {"error" (str "format must be alphanumeric, got " (pr-str fmt-in))})
+
       :else
-      (let [hop (provider/resolve-hop config {"provider" (:provider cfg)
-                                              "model" (or model (:model cfg))})
-            token (when-not (str/blank? (str (:key-env hop))) (h/env (:key-env hop)))
-            req (speech-request (assoc hop :token token) (or voice (:voice cfg)) text fmt)
-            out-dir (h/join home "workspace" "tts")
-            out-path (h/join out-dir (str (h/sha256-hex (str text)) "." fmt))]
-        (if (str/blank? (str (:base-url hop)))
+      (let [hop (provider/resolve-hop config {"provider" (:provider cfg) "model" model})
+            key-env (:key-env hop)
+            token (when-not (str/blank? (str key-env)) (h/env key-env))]
+        (cond
+          (str/blank? (str (:base-url hop)))
           (p/resolved {"error" (str "provider " (:provider cfg) " has no base_url configured")})
-          (-> (fetch (:url req) (clj->js {:method "POST"
-                                          :headers (clj->js (:headers req))
-                                          :body (:body req)}))
-              (p/then (fn [res]
-                        (if (.-ok res)
-                          (-> (.arrayBuffer res)
-                              (p/then (fn [buf]
-                                        (h/mkdirs out-dir)
-                                        (fs/writeFileSync out-path (js/Buffer.from buf))
-                                        {"path" out-path "format" fmt})))
-                          (p/resolved {"error" (str "speech request failed: HTTP " (.-status res))}))))
-              (p/catch (fn [e] {"error" (str "speech request failed: " (or (.-message e) e))}))))))))
+
+          (and (not (str/blank? (str key-env))) (str/blank? (str token)))
+          (p/resolved {"error" (str "missing credentials: env " key-env " is unset")})
+
+          :else
+          (let [req (speech-request (assoc hop :token token) voice text fmt)
+                out-dir (h/join home "workspace" "tts")
+                out-path (h/join out-dir (str (h/sha256-hex (str text "|" voice "|" model "|" fmt)) "." fmt))]
+            (-> (fetch (:url req) (clj->js {:method "POST"
+                                            :headers (clj->js (:headers req))
+                                            :body (:body req)}))
+                (p/catch (fn [e] {"error" (str "speech request failed: " (or (.-message e) e))}))
+                (p/then (fn [r]
+                          (if (get r "error")
+                            r
+                            (if (.-ok r)
+                              (-> (.arrayBuffer r)
+                                  (p/then (fn [buf]
+                                            (try
+                                              (h/mkdirs out-dir)
+                                              (fs/writeFileSync out-path (js/Buffer.from buf))
+                                              {"path" out-path "format" fmt}
+                                              (catch :default e
+                                                {"error" (str "speech write failed: " (or (.-message e) e))}))))
+                                  (p/catch (fn [e] {"error" (str "speech write failed: " (or (.-message e) e))})))
+                              {"error" (str "speech request failed: HTTP " (.-status r))})))))))))))
