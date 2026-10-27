@@ -127,6 +127,49 @@
   (let [x (filter (set enabled) sandbox-allowed-tools)]
     (if (seq x) (vec x) sandbox-allowed-tools)))
 
+(defn- missing-import-hint
+  "code_execution_tool._missing_hermes_tools_import_hint, verbatim."
+  [missing enabled]
+  (if (contains? #{"json_parse" "shell_quote" "retry"} missing)
+    (str "Import helpers with `from hermes_tools import " missing "`. If that import failed, "
+         "the generated module may be stale or another hermes_tools may be first on sys.path. "
+         "Check hermes_tools.__file__ and retry with reset=true.")
+    (str "'" missing "' is not available inside the execute_code sandbox. Importable tools here: "
+         (str/join ", " (sandbox-tools-for enabled))
+         ". For anything else, use the normal tool call instead of execute_code.")))
+
+(def failure-hint-rules
+  "code_execution_tool._FAILURE_HINT_RULES, verbatim (regex, formatter) — first
+  match wins. Production mining ranked these as the top execute_code failure
+  classes."
+  [[#"cannot import name '(\w+)' from 'hermes_tools'"
+    (fn [m enabled] (missing-import-hint (nth m 1) enabled))]
+   [#"NameError: name '(json_parse|shell_quote|retry)' is not defined"
+    (fn [m _] (str "Import " (nth m 1) " before calling it: from hermes_tools import " (nth m 1)))]
+   [#"ModuleNotFoundError: No module named '([\w.]+)'"
+    (fn [m _] (str "'" (nth m 1) "' is not installed in the sandbox interpreter. "
+                   "Use Python stdlib inside execute_code, or run the code via "
+                   "terminal() with the project venv's python instead."))]
+   [#"TypeError: string indices must be integers|AttributeError: 'str' object has no attribute 'get'"
+    (fn [_ _] (str "Tool functions in the sandbox return DICTS (already parsed) — "
+                   "do not json.loads() them or index them like strings. "
+                   "Example: read_file(path)['content']."))]])
+
+(defn failure-hint
+  "Hermes code_execution_tool._sandbox_failure_hint: map well-known sandbox
+  script failures to ONE actionable recovery hint (bounded scan of the first
+  4000 chars, first match wins, never throws)."
+  [stderr enabled]
+  (when-not (str/blank? (str stderr))
+    (let [window (subs (str stderr) 0 (min 4000 (count (str stderr))))]
+      (some (fn [[re fmt]]
+              (try
+                (when-let [m (re-find re window)]
+                  (fmt (if (vector? m) m [m]) enabled))
+                (catch :default _ nil)))
+            failure-hint-rules))))
+
+
 (defn generate-hermes-tools
   "Source of the hermes_tools.py stub module for SANDBOX_ALLOWED_TOOLS ∩
   `enabled` — byte-identical to
