@@ -427,13 +427,22 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
   (def delegate-delivered (atom (get st "delivered"))))
 
 (defn persist-delegate-state!
-  "Atomically persist the registry after every mutation (the cross-run
-  re-entry record)."
+  "Persist the registry after every mutation (the cross-run re-entry
+  record). Under the registry LOCK and MERGED with what is already on disk:
+  a blind full-snapshot overwrite would erase a concurrent process's
+  finished children (lost forever) and delivered marks (duplicate
+  re-delivery) — the R3 gate. Merge: the file's records survive, this
+  process's overlay them, delivered sets union."
   []
   (try
-    (h/spit-atomic (delegate-state-file)
-                   (h/json-str {"children" @delegate-children
-                                "delivered" (vec @delegate-delivered)}))
+    (h/with-lock (str (delegate-state-file) ".lock")
+      (fn []
+        (let [on-disk (load-delegate-state)
+              merged-children (merge (get on-disk "children") @delegate-children)
+              merged-delivered (into (set (get on-disk "delivered")) @delegate-delivered)]
+          (h/spit-atomic (delegate-state-file)
+                         (h/json-str {"children" merged-children
+                                      "delivered" (vec merged-delivered)})))))
     (catch :default e
       ;; a silently failed write would void the re-entry guarantee
       (js/console.error (str "delegate registry persist failed: " (or (.-message e) e))))))
@@ -444,7 +453,9 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
   Session-scoped (the R2 security gate): a result belongs to the session
   that spawned its child and is never injected into another. Marked
   delivered."
-  ([] (delegate-pending-results! ""))
+  ;; the session key is REQUIRED: a silent "" default would both leak
+  ;; across sessions and make a keyed caller's results look permanently
+  ;; lost (the R3 gate)
   ([session-key]
    (let [sk (str session-key)
          pending (vec (for [[id c] @delegate-children

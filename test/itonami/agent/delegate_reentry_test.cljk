@@ -1,9 +1,17 @@
 (ns itonami.agent.delegate-reentry-test
   "Hermes delegate cross-run re-entry: pending background results PERSIST
-  across a run ending and re-enter as delegated-results on the next run."
+  across a run ending and re-enter as delegated-results on the next run.
+  Every test works against a throwaway registry: this ns rebinds
+  ITONAMI_DIR before loop loads state, so running it under ANY harness can
+  never touch a real ~/.itonami registry (the R3 test-hygiene note)."
   (:require [cljs.test :refer [deftest is testing]]
+            ["node:os" :as os]
+            ["node:path" :as path]
             [itonami.agent.host :as h]
             [itonami.agent.loop :as loop]))
+
+(aset (.-env js/process) "ITONAMI_DIR"
+      (path/join (os/tmpdir) (str "itonami-delegate-reentry-test-" (.-pid js/process) "-" (random-uuid))))
 
 (deftest pending-results-survive-a-run-ending
   (let [saved-children (atom {"kid1" {"goal" "g" "status" "completed" "summary" "done here"}})
@@ -33,6 +41,25 @@
       (is (= "for A" (get (first for-a) "summary")))
       ;; and neither session can pull the other's after delivery
       (is (= [] (vec (loop/delegate-pending-results! "sess-A")))))))
+
+(deftest concurrent-writers-merge-under-the-lock
+  ;; the R3 gate: persist MERGES with what is on disk — a concurrent
+  ;; process's finished children and delivered marks must survive our write
+  ;; (a blind snapshot overwrite would erase them: lost results, duplicate
+  ;; re-delivery)
+  (h/spit-atomic (loop/delegate-state-file)
+                 (h/json-str {"children" {"foreign" {"goal" "g" "status" "completed" "summary" "from the other process" "session_key" ""}}
+                              "delivered" ["already"]}))
+  (with-redefs [loop/delegate-children (atom {"mine" {"goal" "g" "status" "completed" "summary" "mine" "session_key" ""}})
+                loop/delegate-delivered (atom #{"mine"})]
+    (loop/persist-delegate-state!))
+  (let [loaded (loop/load-delegate-state)]
+    (is (= "from the other process" (get-in (get loaded "children") ["foreign" "summary"]))
+        "the other process's child survives our write")
+    (is (= "mine" (get-in (get loaded "children") ["mine" "summary"])))
+    (is (= #{"already" "mine"} (set (get loaded "delivered"))))
+    ;; and nothing is re-delivered: both sessions' results stay delivered
+    (is (= [] (vec (loop/delegate-pending-results! ""))))))
 
 (deftest joined-children-are-never-re-delivered
   ;; foreground children return INLINE — without a delivered mark the
