@@ -68,6 +68,16 @@
             ["node:readline" :as readline]
             ["node:crypto" :as crypto]))
 
+(defn- opt-value
+  "Value shaping shared by `--flag value` and `--flag=value`: toolsets split
+  on commas (both forms must agree), literal true/false become booleans."
+  [k v]
+  (cond
+    (= k :toolsets) (str/split (str v) #",")
+    (= "true" (str v)) true
+    (= "false" (str v)) false
+    :else v))
+
 (defn parse-args
   "Hermes-style: -p/--profile anywhere, flags with values, the rest positional.
   `--flag=value` carries the whole value. A following token is a VALUE when it
@@ -84,14 +94,15 @@
       (#{"-t" "--toolsets"} a) (recur (rest more) (assoc opts :toolsets (str/split (first more) #",")) pos)
       (str/starts-with? a "--")
       (if-let [eq (str/index-of a "=")]
-        (recur more (assoc opts (keyword (subs a 2 eq)) (subs a (inc eq))) pos)
+        (let [k (keyword (subs a 2 eq))]
+          (recur more (assoc opts k (opt-value k (subs a (inc eq)))) pos))
         (let [k (keyword (subs a 2))
               v (first more)]
           (if (or (nil? v)
                   (and (str/starts-with? v "-")
                        (not (re-matches #"-?\d+(\.\d+)?" v))))
             (recur more (assoc opts k true) pos)
-            (recur (rest more) (assoc opts k v) pos))))
+            (recur (rest more) (assoc opts k (opt-value k v)) pos))))
       :else (recur more opts (conj pos a)))))
 
 (defn- die [code msg] (binding [*print-fn* *print-err-fn*] (println msg)) (js/process.exit code))
@@ -1059,7 +1070,7 @@
   (let [names (profile/names)
         pid-state (fn [f]
                     (let [p (h/join (p2p/itonami-dir) f)
-          pid (when (h/file? p) (str/trim (h/slurp p)))]
+          pid (try (when (h/file? p) (str/trim (h/slurp p))) (catch :default _ nil))]
                       (if (and pid (h/pid-alive? pid))
                         (str "running (pid " pid ")")
                         "not running")))]
@@ -1069,7 +1080,8 @@
       (let [home (profile/home n)
             sched (get-in (try (profile/read-edn-file (h/join home "itonami.edn"))
                                (catch :default _ nil))
-                          [:runtime :scheduler] :hermes)
+                          [:runtime :scheduler])
+            sched (or sched :hermes)
             jobs (try (cron/read-jobs home) (catch :default _ []))]
         (println (str "  " (.padEnd n 32) "scheduler=" (name sched)
                       "  jobs=" (count (filter cron/active? jobs))))))
@@ -1083,6 +1095,8 @@
   [opts args]
   (let [platform (or (:platform opts) "telegram")
         chat-id (or (:chat-id opts) (die 2 "send: --chat-id is required"))
+        _ (when (or (true? chat-id) (str/blank? (str chat-id)))
+            (die 2 "send: --chat-id needs a chat id value (e.g. --chat-id -100123)"))
         text (str/trim (str/join " " args))]
     (when (str/blank? text) (die 2 "send: message text is required"))
     (p/let [prof0 (profile/load-profile (or (:profile opts) "default"))
@@ -1100,7 +1114,10 @@
         (die 1 (str "send failed: " res))))))
 
 (defn gateway-run [opts]
-  (let [interval (* 1000 (js/parseInt (or (:interval opts) "60") 10))
+  (let [interval (let [sec (js/parseInt (or (:interval opts) "60") 10)]
+                   ;; --interval is the tick period in seconds: a floor of 1 s
+                   ;; and a sane default, never a 1 ms hot loop
+                   (if (js/isFinite sec) (* 1000 (max 1 sec)) 60000))
         paused-noticed (atom false)
         cycle (fn cycle []
                 (let [adopted (filter (fn [n] (= :itonami (get-in (try (profile/read-edn-file (h/join (profile/home n) "itonami.edn"))

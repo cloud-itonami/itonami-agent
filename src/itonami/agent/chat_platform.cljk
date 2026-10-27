@@ -360,18 +360,23 @@
   "The reply through the platform's existing send adapter (the same one the
   cron delivery queue uses), addressed to the MESSAGE'S chat — a
   `gateway.routes`-routed chat must never leak into the profile's configured
-  delivery chat. Webhook-style sends have one fixed target, so the adapter
-  REFUSES a chat it does not serve rather than posting into the configured
-  channel. The message's `thread_id` rides along as the platform's thread
+  delivery chat: a message that names no chat is refused outright, and
+  webhook-style sends (one fixed target) refuse a chat they do not serve
+  rather than post into the configured channel. The message's `thread_id` rides along as the platform's thread
   target where one exists (telegram: message_thread_id). `prof` is the owning
   profile (same position as `send!`'s first argument). Resolves to nil on
   success or the adapter's error string."
   ([prof msg text] (send-reply! prof msg text nil))
   ([prof msg text fetch]
    (let [platform (get msg "platform")
+         chat (str (get msg "chat_id"))
          adapter (platforms/for-lane platform (:config prof))]
-     (if adapter
-       (adapter nil platform text (cond-> {:chat-id (get msg "chat_id")
+     (cond
+       (str/blank? chat)
+       (p/resolved (str platform " reply names no chat — refusing to fall back to the configured delivery chat"))
+       (nil? adapter)
+       (p/resolved (str platform " send adapter not configured"))
+       :else
+       (adapter nil platform text (cond-> {:chat-id chat
                                           :thread-id (get msg "thread_id")}
-                                    fetch (assoc :fetch fetch)))
-       (p/resolved (str platform " send adapter not configured"))))))
+                                    fetch (assoc :fetch fetch)))))))

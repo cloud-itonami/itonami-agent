@@ -22,6 +22,14 @@
     (let [[opts pos] (main/parse-args ["x" "--verbose" "-other"])]
       (is (true? (:verbose opts)))
       (is (= ["x" "-other"] pos))))
+  (testing "--toolsets=a,b splits exactly like --toolsets a,b"
+    (is (= ["a" "b"] (:toolsets (first (main/parse-args ["--toolsets=a,b"])))))
+    (is (= ["a" "b"] (:toolsets (first (main/parse-args ["--toolsets" "a,b"])))))
+    (is (= ["a" "b"] (:toolsets (first (main/parse-args ["-t" "a,b"]))))))
+  (testing "literal true/false values become booleans"
+    (is (false? (:force (first (main/parse-args ["--force=false"])))))
+    (is (true? (:force (first (main/parse-args ["--force=true"])))))
+    (is (true? (:force (first (main/parse-args ["--force"]))))))
   (testing "short value flags accept negative values too"
     (let [[opts _] (main/parse-args ["-p" "-weird-profile" "-z" "go"])]
       (is (= "-weird-profile" (:profile opts)))

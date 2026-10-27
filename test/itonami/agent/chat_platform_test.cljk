@@ -348,6 +348,23 @@
                        (done)))
           (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
 
+(deftest reply-without-a-chat-is-refused
+  (async done
+    ;; regression (Code first): the docstring forbids falling back to the
+    ;; profile's configured delivery chat — a chat-less message must be
+    ;; refused, never sent to the configured target
+    (let [called (atom false)
+          fake-fetch (fn [_ _] (reset! called true) (p/resolved #js {:ok true :status 200}))
+          prof {:name "alpha"
+                :config {"delivery" {"telegram" {"chat_id" "configured-chat"}}}
+                :home "/tmp"}]
+      (-> (chat/send-reply! prof {"platform" "telegram"} "hi" fake-fetch)
+          (p/then (fn [res]
+                    (is (re-find #"refusing" (str res)))
+                    (is (false? @called))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
 (deftest webhook-platforms-refuse-misdirected-replies
   (async done
     ;; regression: a webhook has one fixed target — a reply for another chat

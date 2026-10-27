@@ -31,4 +31,5 @@
 (defn since
   "The pause record (timestamp + reason) when the stop is active, else nil."
   []
-  (when (h/file? (marker)) (str/trim (h/slurp (marker)))))
+  (try (when (h/file? (marker)) (str/trim (h/slurp (marker))))
+       (catch :default _ nil)))
