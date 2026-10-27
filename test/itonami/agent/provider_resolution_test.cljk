@@ -28,6 +28,16 @@
       (is (= "p3" (get-in r [:provider :value])))
       (is (re-find #"override" (get-in r [:provider :source])))
       (is (true? (:pinned? r)))))
+  (testing "a CLI -m override is a pin: fallbacks drop, note becomes live"
+    (let [r (provider/resolution {"model" {"default" "m1" "provider" "p1"}
+                                  "fallback_providers" [{"provider" "p2" "model" "m2"}]}
+                                 {:model "m9"})]
+      (is (true? (:pinned? r)))
+      (is (= 1 (count (:hops r))))))
+  (testing "hops that only display the same provider/model are shown once"
+    (let [r (provider/resolution {"model" {"default" "m1" "provider" "p1"}}
+                                 {})]
+      (is (= 1 (count (:hops r))))))
   (testing "the legacy fallback_model map also becomes a hop"
     (let [r (provider/resolution {"model" {"default" "m1" "provider" "p1"}
                                   "fallback_model" {"provider" "p9" "model" "m9"}}

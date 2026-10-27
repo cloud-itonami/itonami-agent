@@ -69,10 +69,16 @@
   of each choice — the `model` / `fallback` display side (Hermes `hermes
   model` / `hermes fallback` show). Sources follow `chain` verbatim: run
   override (a job's pin, or the CLI's -m/--provider) -> cron.model ->
-  model.default, override -> cron.model_provider -> model.provider. `:hops` is the chain as provider/model pairs (primary
+  model.default, override -> cron.model_provider -> model.provider. An
+  override is a PIN (`:pinned? (boolean (:model opts))`, exactly as run-opts
+  and cron compute it): the chain keeps only the primary. `:hops` is the chain as provider/model pairs (primary
   first; a pinned run keeps only the primary)."
   [config opts]
-  (let [m (or (:model opts) (get-in config ["cron" "model"]) (get-in config ["model" "default"]))
+  ;; a run override IS a pin — run-opts sets :pinned? (boolean (:model opts))
+  ;; and cron sets (boolean (get job "model")); the display must say what the
+  ;; run will do, so `fallback -m X` shows no fallbacks
+  (let [opts (assoc opts :pinned? (boolean (or (:pinned? opts) (:model opts))))
+        m (or (:model opts) (get-in config ["cron" "model"]) (get-in config ["model" "default"]))
         m-src (cond (:model opts) "override (-m / job pin)"
                     (get-in config ["cron" "model"]) "cron.model"
                     (get-in config ["model" "default"]) "model.default"
@@ -85,8 +91,10 @@
     {:model {:value m :source m-src}
      :provider {:value pv :source pv-src}
      :pinned? (boolean (:pinned? opts))
-     :hops (mapv (fn [h] {:provider (:provider h) :model (:model h)})
-                 (chain config opts))}))
+     :hops (->> (chain config opts)
+                (map (fn [h] {:provider (:provider h) :model (:model h)}))
+                distinct
+                vec)}))
 
 (def default-deny-hosts
   "Third-party relays an itonami profile does not depend on. A rail must be
