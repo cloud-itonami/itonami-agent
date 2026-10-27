@@ -15,6 +15,7 @@
         (is (= "u1" (get body "touser")))
         (is (= "text" (get body "msgtype")))
         (is (= 1000002 (get body "agentid")))
+        (is (number? (get body "agentid")) "agentid is a JSON number, never a string")
         (is (= "hello" (get-in (js->clj (get body "text")) ["content"]))))))
   (testing "the auth transport is the gettoken exchange"
     (let [r (platforms/wecom-token-request "cid" "secret")]
@@ -53,5 +54,9 @@
           "an empty agent_id is not an identity")
       (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" false "chat_id" "u1"}}})))
       (is (fn? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" "1000002" "chat_id" "u1"}}}))
-          "a numeric string is a valid agent_id"))
-    (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" 10}}})))))
+          "a numeric string is a valid agent_id")))
+  (testing "a numeric-string agent_id goes out as a JSON NUMBER"
+    (let [body (h/json-parse (:body (platforms/wecom-request "tok" "u1" "1000002" "hello")))]
+      (is (number? (get body "agentid")))
+      (is (= 1000002 (get body "agentid")))))
+      (is (nil? (platforms/for-lane "wecom" {"delivery" {"wecom" {"agent_id" 10}}}))))

@@ -319,7 +319,11 @@
    :headers {"Content-Type" "application/json; charset=utf-8"}
    :body (h/json-str {"touser" (str touser)
                       "msgtype" "text"
-                      "agentid" agent-id
+                      ;; agentid is a JSON NUMBER on the wire (the R2 gate:
+                      ;; a numeric-string config value must not go out as a
+                      ;; JSON string) — coerced like the telegram thread-id
+                      ;; precedent
+                      "agentid" (if (number? agent-id) agent-id (js/parseInt (str agent-id) 10))
                       "text" {"content" (str text)}})})
 
 (defn- wecom-send! [fetch-fn token touser agent-id content]
