@@ -3106,7 +3106,7 @@
    "browser_press" browser/press "browser_get_images" browser/get-images
    "browser_console" browser/console-output
    "browser_cdp" browser/cdp-send "browser_dialog" browser/dialog
-   "manage_connections" manage-connections "browser_vault_list" browser-vault-list "browser_vault_unlock" browser-vault-unlock
+   "manage_connections" manage-connections
    "text_to_speech" text-to-speech "browser_vault_list" browser-vault-list "browser_vault_unlock" browser-vault-unlock
    "browser_vault_save_login" browser-vault-save-login "browser_vault_enter_code" browser-vault-enter-code
    "browser_vault_fill" browser-vault-fill "browser_exec" browser/exec-code
