@@ -309,19 +309,46 @@
       (min 600000 (max 1000 (js/Math.floor n)))
       5000)))
 
+(defn- read-offset
+  "The last consumed getUpdates offset from `file`, or 0. Best-effort: a
+  missing or corrupt file restarts at 0 (at-least-once replay), never a
+  guessed number."
+  [file]
+  (try
+    (if (h/file? file)
+      (let [raw (str (get (h/json-parse (h/slurp file)) "offset"))]
+        ;; strict digits only: a corrupt value restarts at 0, never a
+        ;; parseInt prefix guess ("8abc" is NOT 8)
+        (if (re-matches #"\d+" raw)
+          (let [n (js/parseInt raw 10)]
+            (if (and (js/isFinite n) (pos? n)) n 0))
+          0))
+      0)
+    (catch :default _ 0)))
+
+(defn- write-offset!
+  "Persist the consumed offset (atomic). Best-effort — a failed write replays
+  later, which is the safe direction."
+  [file n]
+  (when file
+    (try (h/spit-atomic file (h/json-str {"offset" n}))
+         (catch :default _ nil))))
+
 (defn serve!
   "The gateway serve loop (JUN-465): one `telegram-poll!` long poll, dispatch
   every carried update through `dispatch`, recur until stopped. A poll error
   reports through `on-error` and backs off `backoff-ms` of `interval` (ms,
   floored at 1000; default 5000 — never a hot retry loop).
   Injected: `fetch`, `dispatch` (fn [raw]), optional `on-error`, `max-ticks`
-  (tests bound the loop), `poll-timeout` (the long-poll timeout, default 25).
+  (tests bound the loop), `poll-timeout` (the long-poll timeout, default 25),
+  `offset-file` (where the consumed getUpdates offset persists, so a restart
+  does not replay what was already taken — best-effort, corrupt = 0).
   Returns {:stop (fn []) :done <promise resolving :stopped|:max-ticks>}."
-  [{:keys [fetch token dispatch on-error interval max-ticks poll-timeout]}]
+  [{:keys [fetch token dispatch on-error interval max-ticks poll-timeout offset-file]}]
   (let [iv (backoff-ms interval)
         stopped (atom false)
         ticks (atom 0)
-        off (atom 0)
+        off (atom (read-offset offset-file))
         resolve-done (atom nil)
         done (js/Promise. (fn [res] (reset! resolve-done res)))
         wait (fn [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
@@ -345,9 +372,15 @@
                                (if-let [err (:error res)]
                                  (do (notify! err)
                                      (-> (wait iv) (p/then (fn [_] (step)))))
-                                 (do (reset! off (:offset res))
-                                     (-> (p/all (map dispatch (:updates res)))
-                                         (p/then (fn [_] (step))))))))
+                                 ;; ack (memory + disk) only AFTER every
+                                 ;; dispatch settles: a crash or a rejecting
+                                 ;; dispatch replays the batch on restart
+                                 ;; (at-least-once — the safe direction)
+                                 (-> (p/all (map dispatch (:updates res)))
+                                     (p/then (fn [_]
+                                               (reset! off (:offset res))
+                                               (write-offset! offset-file (:offset res))
+                                               (step)))))))
                      (p/catch (fn [e]
                                 (notify! (err-str e))
                                 (-> (wait iv) (p/then (fn [_] (step)))))))))]
