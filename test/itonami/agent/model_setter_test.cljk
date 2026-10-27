@@ -58,6 +58,34 @@
           out (profile/set-model-text in "NEW" nil)]
       (is (str/includes? out "  # keep")))))
 
+(deftest yaml-shape-edges
+  (testing "a model: opener with a trailing comment is the block (no duplicate block)"
+    (let [out (profile/set-model-text "model:  # inference\n  default: old\n" "NEW" nil)]
+      (is (= 1 (count (re-seq #"(?m)^model:" out))))
+      (is (str/includes? out "  default: NEW"))
+      (is (not (str/includes? out "old")))))
+
+  (testing "exact in-place replacement keeps key order and comment attachment"
+    (let [out (profile/set-model-text "model:\n  default: old\n  # provider line\n  provider: x\n" "NEW" nil)]
+      (is (= "model:\n  default: NEW\n  # provider line\n  provider: x\n" out))))
+
+  (testing "a differently-indented comment does not set the child indent"
+    (let [out (profile/set-model-text "model:\n      # deep comment\n  default: old\n" "NEW" nil)]
+      (is (str/includes? out "  default: NEW"))
+      (is (not (str/includes? out "    default: NEW")))))
+
+  (testing "a dotted top-level key ends the block (no cross-section edits)"
+    (let [in "model:\n  default: old\nx.y:\n  default: keep\n"
+          out (profile/set-model-text in "NEW" nil)]
+      (is (str/includes? out "x.y:\n  default: keep"))
+      (is (str/includes? out "  default: NEW"))))
+
+  (testing "coercible shapes (null/true/yes) are quoted, never bare"
+    (let [out (profile/set-model-text "" "true" nil)]
+      (is (str/includes? out "  default: \"true\"")))
+    (let [cfg (parse-yaml (profile/set-model-text "" "true" nil))]
+      (is (= "true" (get-in cfg ["model" "default"]))))))
+
 (deftest values-cannot-corrupt-the-yaml
   (testing "a value with : or # is written as a safe quoted scalar"
     (let [out (profile/set-model-text "" "a: b # c" nil)]

@@ -182,48 +182,60 @@
 
 
 (defn- yaml-scalar
-  "Write a value as a safe YAML scalar: plain when it is a safe token,
-  otherwise a JSON double-quoted string (YAML 1.2 superset) — `: `, `#` and
-  newlines can never corrupt the line."
+  "Write a value as a safe YAML scalar: plain when it is a safe token that
+  the project's own scalar reader will NOT coerce (no null/bool/yes-no
+  shapes), otherwise a JSON double-quoted string (YAML 1.2 superset) —
+  `: `, `#` and newlines can never corrupt the line."
   [v]
   (let [s (str v)]
-    (if (re-matches #"[A-Za-z0-9._/-]+" s) s (js/JSON.stringify s))))
+    (if (and (re-matches #"[A-Za-z0-9._/-]+" s)
+             (not (contains? #{"true" "false" "null" "~" "yes" "no" "on" "off"} (str/lower-case s))))
+      s
+      (js/JSON.stringify s))))
 
 (defn set-model-text
   "Hermes `hermes model NAME` writes the default model into config.yaml.
   The edit is TEXTUAL (like bundle-config-text): comments, formatting and
-  keys outside model.default/model.provider survive verbatim. Only the
-  TOP-LEVEL model block is touched (the same top-level test bundle-config-text
-  uses), and only keys at the block's own child indent — nested keys at other
-  depths are never matched. Keys are replaced IN PLACE; a provider not given
-  here is kept."
+  keys outside model.default/model.provider survive verbatim. The block is
+  the top-level `model:` opener (a bare key, or one carrying a trailing
+  comment); its END is the next non-blank COLUMN-0 line (any top-level key
+  shape, including dotted/quoted keys, or a top-level comment). Keys are
+  replaced IN PLACE at the block's child indent (derived from the first
+  non-comment indented line) — a provider not given here is kept."
   [text model provider]
   (let [lines (str/split-lines (str text))
-        top-key? (fn [l] (boolean (re-matches #"[A-Za-z_][A-Za-z0-9_-]*:.*" l)))
-        ;; the top-level model: block: an unindented bare `model:` line
-        start (first (keep-indexed (fn [i l] (when (re-matches #"model:\s*" l) i)) lines))
+        top-line? (fn [l] (and (not (str/blank? l)) (not (re-matches #"\s+.*" l))))
+        ;; the top-level model: opener: `model:` alone, or with a trailing
+        ;; comment (the reader's strip-comment accepts both)
+        start (first (keep-indexed (fn [i l]
+                                     (when (and (top-line? l)
+                                                (re-matches #"model:(\s*(#.*)?)?" l))
+                                       i))
+                                   lines))
         block-end (if (nil? start)
                     nil
                     (or (first (for [i (range (inc start) (count lines))
                                      :let [l (nth lines i)]
-                                     :when (and (top-key? l) (not (str/blank? l)))]
+                                     :when (top-line? l)]
                                  i))
                         (count lines)))
         body (when start (vec (subvec (vec lines) start block-end)))
-        ;; the block's child indent = the indent of its first indented line
+        ;; the block's child indent comes from the first indented NON-COMMENT
+        ;; line — a differently-indented comment must not set it
         child-indent (when body (or (first (for [l (rest body)
-                                                 :when (re-matches #"\s+\S.*" l)]
+                                                 :when (and (re-matches #"\s+\S.*" l)
+                                                            (not (re-matches #"\s*#.*" l)))]
                                              (count (re-find #"^\s*" l))))
                                     2))
-        key-rx (fn [k] (re-pattern (str "^" (apply str (repeat child-indent " ")) k ":.*$")))
+        pad (apply str (repeat child-indent " "))
+        key-rx (fn [k] (re-pattern (str "^" pad k ":.*$")))
         replace-key (fn [ls k value]
                       (let [rx (key-rx k)
                             idx (first (keep-indexed (fn [i l] (when (re-matches rx l) i)) ls))
-                            line (str (apply str (repeat child-indent " ")) k ": " (yaml-scalar value))]
+                            line (str pad k ": " (yaml-scalar value))]
                         (if (nil? idx)
                           (conj (vec ls) line)
-                          (assoc (vec ls) idx line))))
-        drop-default? (fn [l] (boolean (re-matches (key-rx "default") l)))]
+                          (assoc (vec ls) idx line))))]
     (cond
       (nil? start)
       (str (str text)
@@ -235,10 +247,10 @@
            "\n")
 
       :else
-      (let [;; replace the default line IN PLACE (or append); touch the
-            ;; provider line only when a new one is given — a model-only
-            ;; write keeps the existing provider line verbatim
-            body (cond-> (filterv (complement drop-default?) body)
+      ;; replace-key replaces IN PLACE when the key exists (the R2 gate: no
+      ;; drop-then-append, so comments stay attached to their keys and the
+      ;; key order is preserved); a model-only write never touches provider
+      (let [body (cond-> body
                    true (replace-key "default" model)
                    (not (str/blank? (str provider))) (replace-key "provider" provider))]
         (str (str/join "\n" (concat (subvec (vec lines) 0 start) body (subvec (vec lines) block-end)))

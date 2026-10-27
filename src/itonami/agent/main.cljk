@@ -1231,6 +1231,10 @@
   [opts args]
   (when (< 1 (count args))
     (die 2 "usage: itonami-agent model [NAME] [--provider P] [--profile P]"))
+  ;; -m/--model is a RUN-TIME override of the resolution display: writing the
+  ;; default while showing a different effective model would mislead
+  (when (and (seq args) (:model opts))
+    (die 2 "model NAME and -m/--model cannot combine: NAME writes the default, -m overrides one run"))
   (when-let [name (first args)]
     (when (str/blank? (str/trim name))
       (die 2 "model name must be non-empty"))
