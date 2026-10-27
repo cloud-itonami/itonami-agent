@@ -1,8 +1,11 @@
 (ns itonami.agent.clarify
-  "Hermes tools/clarify_tool.py, verbatim core: structured multiple-choice /
-  open-ended questions to the user. Schema and validation live here; the UI is
-  a platform-injected callback (chat readline / the bridge's request row), and
-  a run with no callback answers the honest unavailability string."
+  "Hermes tools/clarify_tool.py core semantics: structured multiple-choice /
+  open-ended questions to the user. Behavior is ported faithfully (filter
+  order, falsy handling, error outcomes); MESSAGE STRINGS are not byte-identical
+  (over-long-choice wording, Python str() of numbers follows JS here). Schema
+  and validation live here; the UI is a platform-injected callback (chat
+  readline / the bridge's request row), and a run with no callback answers the
+  honest unavailability string."
   (:require [clojure.string :as str]
             [promesa.core :as p]
             [itonami.agent.host :as h]))
@@ -13,6 +16,30 @@
 (def recommended-label "(Recommended)")
 (def unavailable "Clarify tool is not available in this execution context.")
 (def shape "Pass questions=[{question, choices?, multi_select?}]; a single question is a one-entry array.")
+
+
+(defn- hermes-truthy-str
+  "Hermes str(x-or-empty): falsy values (nil, false, empty string, 0, empty
+  collections) become the empty string; everything else is stringified."
+  [x]
+  (cond
+    (or (nil? x) (false? x)) ""
+    (and (string? x) (str/blank? x)) ""
+    (and (number? x) (zero? x)) ""
+    (and (sequential? x) (empty? x)) ""
+    (and (map? x) (empty? x)) ""
+    :else (str x)))
+
+(defn- py-str
+  "Python `str()` on an answer value: booleans and nil print Python-style.
+  Numbers follow JS stringification (CLJS cannot distinguish 1 from 1.0) —
+  a documented, accepted divergence."
+  [x]
+  (cond
+    (true? x) "True"
+    (false? x) "False"
+    (nil? x) "None"
+    :else (str x)))
 
 (defn strip-recommended
   "Remove the recommendation label so presentation never leaks into
@@ -36,31 +63,30 @@
       (into [(str first0 " " recommended-label)] (rest choices)))))
 
 (defn- clean-answer
-  "Strip presentation (the label, multi-select JSON) from a locked answer: a
-  multi-select answer is a list, a JSON array string, or one typed answer."
+  "Strip presentation (the label, multi-select JSON) from a locked answer,
+  with Hermes' ORDER: blanks are filtered on the RAW item and the label is
+  stripped after (so a label-only item is a non-blank raw that survives to
+  become \"\"). A multi answer must be iterable: a scalar raises, exactly as
+  Python's iteration does, and ask! maps that to the tool error."
   [raw multi?]
   (if-not multi?
-    (strip-recommended raw)
+    (strip-recommended (py-str raw))
     (let [items (cond
-                  (array? raw) (vec raw)
-                  (sequential? raw) (vec raw)
                   (string? raw) (try (let [p (h/json-parse raw)]
-                                       ;; js->clj turns a JSON array into a
-                                       ;; CLJS vector: sequential? is the
-                                       ;; real test (array? is dead here)
                                        (if (sequential? p) (vec p) [raw]))
                                      (catch :default _ [raw]))
-                  :else [raw])]
-      ;; verbatim: strip the label AND drop blank items
+                  (sequential? raw) (vec raw)
+                  (array? raw) (vec raw)
+                  :else (throw (js/Error. (str (py-str raw) " object is not iterable"))))]
       (->> items
-           (map strip-recommended)
            (remove #(str/blank? (str %)))
+           (map strip-recommended)
            vec))))
 
 (defn- normalize-item
   "One question entry -> [entry error]."
   [index item]
-  (let [text (str/trim (str (get item "question")))]
+  (let [text (str/trim (hermes-truthy-str (get item "question")))]
     (cond
       (not (map? item))
       [nil (str "questions[" index "] must be an object. " shape)]
@@ -131,8 +157,11 @@
 (defn result-json
   "Hermes `_result`: every response carries status and user_response (null
   unless answered); outcome says how the wait ended and notice (surface-
-  supplied) says why."
+  supplied) says why. A reply without `outcome` is an error (Hermes indexes
+  it), never a silent null."
   [normalized reply]
+  (when-not (contains? (into #{} (keys reply)) "outcome")
+    (throw (js/Error. "'outcome'")))
   (let [answers (or (get reply "answers") {})
         responses (mapv (fn [entry]
                           (let [[status value] (response-status (get entry "qid") answers (get entry "multi_select"))]
@@ -148,7 +177,7 @@
 (defn ask!
   "Hermes `clarify_tool`: ask 1-5 questions in one call. `callback` is
   platform-injected and receives the normalized list and answers with a reply
-  map whose `answers` key maps qid -> the raw answer (or nil), plus `outcome`
+  map whose `answers` key maps qid to the raw answer (or nil), plus `outcome`
   and an optional `notice`. No callback -> the honest unavailability string.
   Errors are the standard tool-error JSON map, like every tool error."
   [questions callback]
@@ -166,6 +195,9 @@
                           (map? r0) r0
                           (and r0 (instance? js/Object r0)) (js->clj r0)
                           :else nil)]
-            (result-json normalized (or reply {})))
+            (when-not (map? reply)
+              (throw (js/Error. "reply must carry answers, outcome and an optional notice")))
+            (result-json normalized reply))
           (p/catch (fn [e]
-                     (h/json-str {"error" (str "Failed to get user input: " (or (.-message e) e))})))))))
+                     (let [m (.-message e)]
+                       (h/json-str {"error" (str "Failed to get user input: " (if (string? m) m (str e)))}))))))))

@@ -39,6 +39,32 @@
         (let [[one _] (clarify/normalize-questions [{"question" "x" "choices" ["only"]}])]
           (is (= ["only"] (get (first one) "choices"))))))))
 
+(deftest edge-answers-match-hermes-semantics
+  (testing "blanks are filtered on the RAW item, then the label is stripped"
+    (let [[norm _] (clarify/normalize-questions [{"question" "A" "choices" ["yes" "no"] "multi_select" true}])]
+      ;; a label-only item is non-blank raw -> survives -> answers [""] (Hermes)
+      (is (= [""] (get-in (h/json-parse (clarify/result-json norm {"answers" {"q0" ["(Recommended)"]} "outcome" "submitted"})) ["responses" 0 "user_response"])))))
+  (testing "a scalar multi answer errors like Python's non-iterable"
+    (let [[norm _] (clarify/normalize-questions [{"question" "A" "choices" ["yes" "no"] "multi_select" true}])]
+      (is (thrown-with-msg? js/Error #"object is not iterable"
+                            (clarify/result-json norm {"answers" {"q0" 5} "outcome" "submitted"})))))
+  (testing "a missing outcome is an error, not a silent null"
+    (let [[norm _] (clarify/normalize-questions [{"question" "A"}])]
+      (is (thrown-with-msg? js/Error #"'outcome'"
+                            (clarify/result-json norm {"answers" {}})))))
+  (testing "falsy question values are empty text, as in Hermes"
+    (is (re-find #"must be non-empty" (str (second (clarify/normalize-questions [{"question" 0}])))))
+    (is (re-find #"must be non-empty" (str (second (clarify/normalize-questions [{"question" false}])))))
+    (is (re-find #"must be non-empty" (str (second (clarify/normalize-questions [{"question" []}]))))))
+  (testing "single answers stringify Python-style for bool/nil"
+    (let [[norm _] (clarify/normalize-questions [{"question" "A"}])]
+      (is (= "True" (get-in (h/json-parse (clarify/result-json norm {"answers" {"q0" true} "outcome" "submitted"})) ["responses" 0 "user_response"])))
+      (is (= "False" (get-in (h/json-parse (clarify/result-json norm {"answers" {"q0" false} "outcome" "submitted"})) ["responses" 0 "user_response"])))
+      (testing "a None raw answer is skipped with no response (Hermes guards it away)"
+        (let [parsed (h/json-parse (clarify/result-json norm {"answers" {"q0" nil} "outcome" "submitted"}))]
+          (is (= "skipped" (get-in parsed ["responses" 0 "status"])))
+          (is (nil? (get-in parsed ["responses" 0 "user_response"]))))))))
+
 (deftest recommended-label-never-leaks
   (is (= "b" (clarify/strip-recommended "b (Recommended)")))
   (is (= ["b (Recommended)" "a"] (clarify/mark-recommended ["b" "a"])))

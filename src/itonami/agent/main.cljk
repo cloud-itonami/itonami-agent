@@ -303,7 +303,9 @@
                ;; .question callback would wedge the whole run mid-tool
                (.once rl "close"
                       (fn []
-                        (resolve {"answers" {}
+                        ;; Hermes' CLI modal preserves the answers already
+                        ;; locked in; only the gateway path drops them
+                        (resolve {"answers" @answers
                                   "outcome" "cancelled"
                                   "notice" "input closed before the questions were answered"})))
                (ask-at 0)))))
