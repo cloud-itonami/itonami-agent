@@ -18,16 +18,19 @@
    :body (h/json-str {"chat_id" chat-id "text" (str text)})})
 
 (defn- telegram-adapter [token chat-id]
-  (fn [_job _lane content _opts]
-    (-> (js/fetch (:url (telegram-request token chat-id content))
+  ;; `opts :chat-id` overrides the configured target — a reply must reach the
+  ;; chat it answers, never the profile's default delivery chat
+  (fn [_job _lane content opts]
+    (let [req (telegram-request token (or (:chat-id opts) chat-id) content)]
+    (-> ((or (:fetch opts) js/fetch) (:url req)
                   #js {:method "POST"
                        :headers #js {"Content-Type" "application/json"}
-                       :body (:body (telegram-request token chat-id content))})
+                       :body (:body req)})
         (.then (fn [res]
                  (if (.-ok res)
                    nil
                    (str "telegram sendMessage failed: HTTP " (.-status res)))))
-        (.catch (fn [e] (str "telegram sendMessage failed: " (.-message e)))))))
+        (.catch (fn [e] (str "telegram sendMessage failed: " (.-message e))))))))
 
 
 ;; ---------------------------------------------------------------- slack
@@ -40,10 +43,10 @@
    :body (h/json-str {"channel" channel "text" (str text)})})
 
 (defn- slack-adapter [token channel]
-  (fn [_job _lane content _opts]
-    (let [r (slack-request token channel content)]
-      (-> (js/fetch (:url r) #js {:method "POST"
-                                  :headers (clj->js (:headers r))
+  (fn [_job _lane content opts]
+    (let [r (slack-request token (or (:chat-id opts) channel) content)]
+      (-> ((or (:fetch opts) js/fetch) (:url r) #js {:method "POST"
+                          :headers (clj->js (:headers r))
                                   :body (:body r)})
           (.then (fn [res]
                    (if (.-ok res)
@@ -71,15 +74,22 @@
    :headers {"Authorization" (str "Bot " token) "Content-Type" "application/json"}
    :body (h/json-str {"content" (str text)})})
 
-(defn- discord-adapter [webhook-url token channel-id]
-  (fn [_job _lane content _opts]
-    (let [r (if webhook-url (discord-request webhook-url content) (discord-bot-request token channel-id content))]
-      (-> (js/fetch (:url r) #js {:method "POST"
+(defn- discord-adapter [webhook-url token channel-id configured-chat]
+  (fn [_job _lane content opts]
+    ;; a bot-channel message honours :chat-id; a webhook has ONE fixed target
+    ;; and refuses a chat it does not serve — never a silent wrong-chat send
+    (let [to (str (:chat-id opts))]
+      (if (and webhook-url (not (str/blank? to)) (not= to (str configured-chat)))
+        (js/Promise.resolve (str "discord webhook serves chat " (str configured-chat)
+                                 "; refusing reply to " to))
+        (let [r (if webhook-url (discord-request webhook-url content)
+                    (discord-bot-request token (or (:chat-id opts) channel-id) content))]
+      (-> ((or (:fetch opts) js/fetch) (:url r) #js {:method "POST"
                                   :headers (clj->js (or (:headers r) {"Content-Type" "application/json"}))
                                   :body (:body r)})
           (.then (fn [res]
                    (if (.-ok res) nil (str "discord send failed: HTTP " (.-status res)))))
-          (.catch (fn [e] (str "discord send failed: " (.-message e))))))))
+          (.catch (fn [e] (str "discord send failed: " (.-message e))))))))))
 
 ;; ---------------------------------------------------------------- mattermost
 
@@ -89,15 +99,21 @@
   {:url webhook-url
    :body (h/json-str {"text" (str text)})})
 
-(defn- mattermost-adapter [webhook-url]
-  (fn [_job _lane content _opts]
-    (let [r (mattermost-request webhook-url content)]
-      (-> (js/fetch (:url r) #js {:method "POST"
+(defn- mattermost-adapter [webhook-url configured-chat]
+  ;; one webhook = one chat; a reply for any other chat is refused, never
+  ;; posted into the configured channel
+  (fn [_job _lane content opts]
+    (let [to (str (:chat-id opts))]
+      (if (and (not (str/blank? to)) (not= to (str configured-chat)))
+        (js/Promise.resolve (str "mattermost webhook serves chat " (str configured-chat)
+                                 "; refusing reply to " to))
+        (let [r (mattermost-request webhook-url content)]
+      (-> ((or (:fetch opts) js/fetch) (:url r) #js {:method "POST"
                                   :headers #js {"Content-Type" "application/json"}
                                   :body (:body r)})
           (.then (fn [res]
                    (if (.-ok res) nil (str "mattermost webhook failed: HTTP " (.-status res)))))
-          (.catch (fn [e] (str "mattermost webhook failed: " (.-message e))))))))
+          (.catch (fn [e] (str "mattermost webhook failed: " (.-message e))))))))))
 
 ;; ---------------------------------------------------------------- matrix
 
@@ -110,9 +126,9 @@
    :body (h/json-str {"msgtype" "m.text" "body" (str text)})})
 
 (defn- matrix-adapter [homeserver token room-id]
-  (fn [_job _lane content _opts]
-    (let [r (matrix-request homeserver token room-id content)]
-      (-> (js/fetch (:url r) #js {:method "PUT"
+  (fn [_job _lane content opts]
+    (let [r (matrix-request homeserver token (or (:chat-id opts) room-id) content)]
+      (-> ((or (:fetch opts) js/fetch) (:url r) #js {:method "PUT"
                                   :headers (clj->js (:headers r))
                                   :body (:body r)})
           (.then (fn [res]
@@ -147,14 +163,14 @@
           token (h/env (or (get c "token_env") "DISCORD_BOT_TOKEN"))
           channel-id (get c "channel_id")]
       (cond
-        (not (str/blank? (str webhook))) (discord-adapter (str webhook) nil nil)
+        (not (str/blank? (str webhook))) (discord-adapter (str webhook) nil nil (str (get c "chat_id")))
         (and (not (str/blank? (str token))) (not (str/blank? (str channel-id))))
-        (discord-adapter nil token channel-id)))
+        (discord-adapter nil token channel-id nil)))
     "mattermost"
     (let [c (get-in config ["delivery" "mattermost"])
           webhook (get c "webhook_url")]
       (when-not (str/blank? (str webhook))
-        (mattermost-adapter (str webhook))))
+        (mattermost-adapter (str webhook) (str (get c "chat_id")))))
     "matrix"
     (let [c (get-in config ["delivery" "matrix"])
           homeserver (get c "homeserver")

@@ -1,0 +1,317 @@
+(ns itonami.agent.chat-platform
+  "Inbound messaging for the gateway — the receiving half of Hermes'
+  `gateway/platforms` contract (JUN-465 slice 1).
+
+  One platform-agnostic inbound message flows through: normalize (a raw
+  transport update -> a turn-carrying message or nil) -> intake guards
+  (dedup, size) -> chat -> profile routing (an unresolved identity is DROPPED
+  with one warning, never keyed into another profile) -> a serial per-chat
+  dispatch (busy chats queue, as `platforms/base.py::_pending_messages`) ->
+  a turn on the owning profile -> the reply through the platform's existing
+  send adapter.
+
+  The transport (long poll / webhook) and the turn run are injected, so a new
+  platform is one `platform-adapters` entry plus one `normalize` entry here.
+  History is the user/assistant transcript the CLJK turn API takes as
+  `:history` (`loop/history-messages` shape: {\"role\" \"content\"})."
+  (:require [clojure.string :as str]
+            [promesa.core :as p]
+            [itonami.agent.host :as h]
+            [itonami.agent.platform-adapters :as platforms]))
+
+;; ---------------------------------------------------------------- normalize
+
+(defn telegram-normalize
+  "Hermes `gateway/platforms/telegram.py`: one `getUpdates` entry -> the
+  platform-agnostic inbound message, or nil when the update carries no turn
+  (non-message updates, edited messages, non-text messages)."
+  [raw]
+  (let [m (get raw "message")]
+    (when (and m (string? (get m "text")))
+      {"update_id" (str (get raw "update_id"))
+       "platform" "telegram"
+       "chat_id" (str (get-in m ["chat" "id"]))
+       "user_id" (str (get-in m ["from" "id"]))
+       "user_name" (str (or (get-in m ["from" "username"])
+                            (get-in m ["from" "first_name"]) ""))
+       "thread_id" (str (or (get m "message_thread_id") ""))
+       "message_id" (str (get m "message_id"))
+       "text" (get m "text")})))
+
+(def platform-adapters
+  "One entry per platform. `:normalize` turns one raw transport update into
+  the inbound message map above (nil = carries no turn). The send half lives
+  in `itonami.agent.platform-adapters/for-lane`. A second platform is one
+  entry here — nothing else changes."
+  {"telegram" {:normalize telegram-normalize}})
+
+(defn normalize
+  "The inbound message in `raw` for `platform`, or nil."
+  [platform raw]
+  (when-let [f (get-in platform-adapters [platform :normalize])]
+    (f raw)))
+
+;; ---------------------------------------------------------------- guards
+
+(def max-text-chars
+  "Intake guard: the longest inbound text a turn will be built from."
+  8000)
+
+(def max-seen-updates
+  "Intake guard: how many update ids per platform are remembered for dedup."
+  512)
+
+(defn- err-str
+  "A rejection's message text — `(.-message e)` is undefined for non-Error
+  rejections."
+  [e]
+  (str (or (.-message e) e)))
+
+(defn guard-message
+  "Hermes' intake guards (the base adapter side): a message already seen is
+  dropped, an empty or oversized text is dropped. Returns `{:ok msg}` or
+  `{:drop reason}` — a drop is silent to the sender, one line to the log."
+  [seen msg]
+  (let [uid (str (get msg "platform") ":" (get msg "update_id"))]
+    (cond
+      (some #(= uid %) @seen) {:drop "duplicate"}
+      (or (str/blank? (str (get msg "chat_id"))) (str/blank? (str (get msg "user_id"))))
+      {:drop "empty-identity"}
+      (str/blank? (str (get msg "text"))) {:drop "empty"}
+      (< max-text-chars (count (str (get msg "text")))) {:drop "oversized"}
+      :else (do (swap! seen (fn [s]
+                              (let [s (conj (vec (or s [])) uid)]
+                                (if (< max-seen-updates (count s))
+                                  (subvec s (- (count s) max-seen-updates))
+                                  s))))
+                {:ok msg}))))
+
+;; ---------------------------------------------------------------- routing
+
+(defn route-chat
+  "Which profile owns this chat. A chat is owned by the profile whose delivery
+  config names it (`delivery.<platform>.chat_id`) or by an explicit
+  `gateway.routes` entry (\"<platform>:<chat-id>\" -> profile name).
+  Returns the profile name, or nil — an unresolved identity is dropped, as
+  Hermes drops an unroutable event instead of keying it into another profile."
+  [profiles msg]
+  (let [platform (get msg "platform")
+        chat (get msg "chat_id")
+        explicit (reduce (fn [acc prof]
+                           (or acc (get-in (:config prof) ["gateway" "routes" (str platform ":" chat)])))
+                         nil profiles)]
+    (or explicit
+        (some (fn [prof]
+                (when (= (str (get-in (:config prof) ["delivery" platform "chat_id"])) (str chat))
+                  (:name prof)))
+              profiles))))
+
+;; ---------------------------------------------------------------- history
+
+(defn- history-path [home platform chat-id]
+  ;; both segments are sanitized: neither may escape home/chat
+  (h/join home "chat" (str (str/replace (str platform) #"[^A-Za-z0-9_-]" "_") "-"
+                           (str/replace (str chat-id) #"[^A-Za-z0-9_-]" "_") ".jsonl")))
+
+(defn load-history
+  "The chat's user/assistant transcript ({\"role\" \"content\"} rows), newest
+  last, capped at `limit` rows."
+  ([home platform chat-id] (load-history home platform chat-id 100))
+  ([home platform chat-id limit]
+   (let [f (history-path home platform chat-id)]
+     (if (h/file? f)
+       (->> (str/split-lines (h/slurp f))
+            (remove str/blank?)
+            (map #(h/json-parse %))
+            (take-last limit)
+            vec)
+       []))))
+
+(defn append-history!
+  "Append rows to the chat's transcript. Rows only — tool rows stay scoped to
+  the turn that produced them (the CLJK turn API keeps the user/assistant
+  transcript between requests, nothing else)."
+  [home platform chat-id rows]
+  (when (seq rows)
+    (let [f (history-path home platform chat-id)
+          prior (if (h/file? f) (h/slurp f) "")]
+      (h/mkdirs (h/join home "chat"))
+      (h/spit-atomic f (str prior (str/join "" (for [r rows] (str (h/json-str r) "\n"))))))))
+
+;; ---------------------------------------------------------------- dispatch
+
+(defn make-dispatcher
+  "The per-chat dispatch: normalize -> guard -> route -> queue -> turn ->
+  reply. One turn per chat at a time; a message that arrives mid-turn waits in
+  that chat's queue (Hermes `platforms/base.py::_pending_messages`), never
+  interleaved.
+
+  Injected:
+    `profiles`    seq of {:name :config :home} — the routable profiles
+    `executor`    (fn [prof prompt opts] -> promise of the loop result map)
+    `run-opts`    (fn [prof msg] -> the turn's run options)
+    `send!`       (fn [prof msg text] -> promise) — the reply, via the platform's
+                  send adapter
+    `on-event`    optional (fn [event]) log hook (:drop / :unrouted / :turn /
+                  :turn-error)
+
+  Returns a fn: (dispatch platform raw) -> a promise that resolves when THIS
+  message's turn and reply finished — including when it waited in the chat's
+  queue — with {:status :dropped|:unrouted|:replied|:send-failed|:turn-failed ...}.
+  The transport update carries no platform label — the caller names the
+  platform it received the update from."
+  [{:keys [profiles executor run-opts send! on-event]}]
+  (let [seen (atom #{})
+        state (atom {:queues {} :busy #{}})
+        emit (fn [e] (when on-event (on-event e)))
+        chat-key (fn [m] (str (get m "platform") ":" (get m "chat_id")))
+        run-one (fn [msg]
+                  (let [platform (get msg "platform")
+                        chat-id (get msg "chat_id")
+                        prof-name (route-chat profiles msg)
+                        prof (some #(when (= (:name %) prof-name) %) profiles)]
+                    (if-not prof
+                      (do (emit {:event :unrouted :msg (select-keys msg ["platform" "chat_id" "user_id"])})
+                          (p/resolved {:status :unrouted}))
+                      (let [home (:home prof)
+                            prior (load-history home platform chat-id)]
+                        (-> (executor prof (get msg "text")
+                                      (assoc (run-opts prof msg) :history prior))
+                            (p/then (fn [r]
+                                      (let [final (or (:final r) (str "[" (:exit-reason r) "]"))]
+                                        ;; persist the transcript as role/content rows
+                                        (append-history! home platform chat-id
+                                                         [{"role" "user" "content" (get msg "text")}
+                                                          {"role" "assistant" "content" final}])
+                                        (emit {:event :turn :msg msg :exit-reason (:exit-reason r)})
+                                        (if (= "completed" (:exit-reason r))
+                                          (-> (send! prof msg final)
+                                              (p/then (fn [res]
+                                                        (if (nil? res)
+                                                          {:status :replied :reply final}
+                                                          {:status :send-failed :reply final :error (str res)})))
+                                              (p/catch (fn [e]
+                                                         {:status :send-failed :reply final :error (err-str e)})))
+                                          (-> (send! prof msg (str "The turn failed: " (:exit-reason r)
+                                                              (when-let [e (get-in r [:error :error])] (str " — " e))))
+                                              (p/then (fn [res]
+                                                        {:status :turn-failed :exit-reason (:exit-reason r)
+                                                         :notice (if (nil? res) :delivered (str res))}))
+                                              (p/catch (fn [e]
+                                                         {:status :turn-failed :exit-reason (:exit-reason r)
+                                                          :notice (str (err-str e))})))))))
+                            (p/catch (fn [e]
+                                       (emit {:event :turn-error :msg msg :error (err-str e)})
+                                       (p/resolved {:status :turn-failed :error (err-str e)}))))))))
+        pop-next! (fn [k]
+                    ;; atomic: one compare-and-set takes the head, never a
+                    ;; side effect inside swap!
+                    (loop []
+                      (let [st @state
+                            q (get-in st [:queues k])
+                            nxt (first q)]
+                        (if (nil? nxt)
+                          nil
+                          (if (compare-and-set! state st (assoc-in st [:queues k] (vec (rest q))))
+                            nxt
+                            (recur))))))
+        claim! (fn [k]
+                 ;; true = this caller owns the chat's pump
+                 (loop []
+                   (let [st @state]
+                     (cond
+                       (contains? (:busy st) k) false
+                       (compare-and-set! state st (update st :busy conj k)) true
+                       :else (recur)))))
+        release! (fn [k]
+                   ;; one atomic transition: drop the claim only while the
+                   ;; queue is empty. true = released; false = a message
+                   ;; arrived meanwhile and the claim is kept.
+                   (loop []
+                     (let [st @state]
+                       (cond
+                         (seq (get-in st [:queues k])) false
+                         (compare-and-set! state st (update st :busy disj k)) true
+                         :else (recur)))))
+        pump! (fn pump! [k]
+                (if-let [{:keys [msg res-fn]} (pop-next! k)]
+                  ;; run-one enters through a promise boundary: a synchronous
+                  ;; throw (corrupt history, a bad injected fn) becomes a
+                  ;; rejection the catch below answers — never a hung caller
+                  (-> (p/resolved nil)
+                      (p/then (fn [_] (run-one msg)))
+                      (p/then (fn [r] (res-fn r) (pump! k)))
+                      (p/catch (fn [e]
+                                 (res-fn {:status :turn-failed :error (err-str e)})
+                                 (pump! k))))
+                  (when-not (release! k)
+                    (pump! k))))]
+    ;; dispatch resolves when THIS message's turn (and reply) finished, even
+    ;; when it waited behind another message in the same chat
+    (fn dispatch [platform raw]
+      (let [msg (normalize platform raw)]
+        (if (nil? msg)
+          (let [reason (if (contains? platform-adapters platform) "no-turn" "unknown-platform")]
+            (emit {:event :drop :reason reason})
+            (p/resolved {:status :dropped :reason reason}))
+          (let [g (guard-message seen msg)]
+            (if (:drop g)
+              (do (emit {:event :drop :reason (:drop g)})
+                  (p/resolved {:status :dropped :reason (:drop g)}))
+              (let [k (chat-key msg)
+                    res-fn (atom nil)
+                    done (js/Promise. (fn [res] (reset! res-fn res)))]
+                (swap! state update-in [:queues k] (fnil conj []) {:msg msg :res-fn @res-fn})
+                (when (claim! k)
+                  (pump! k))
+                done))))))))
+
+;; ---------------------------------------------------------------- telegram
+
+(defn telegram-poll!
+  "One `getUpdates` long poll. `fetch` is injected (tests pass a fake); the
+  body is Hermes' shape (`ok` / `result`). Returns {:updates [...] :offset n}
+  where `offset` is the next `update_id` to ask for."
+  [{:keys [fetch token offset timeout]}]
+  (let [url (str "https://api.telegram.org/bot" token "/getUpdates?timeout="
+                 (or timeout 25) "&offset=" (or offset 0))]
+    (-> (fetch url #js {:method "GET"})
+        (p/then (fn [res] (if (.-ok res) (.text res) (js/Promise.reject (js/Error. (str "getUpdates failed: HTTP " (.-status res)))))))
+        (p/then (fn [body]
+                  (let [data (h/json-parse body)
+                        updates (vec (get data "result"))]
+                    (let [ids (keep (fn [u]
+                                      (let [n (js/parseInt (str (get u "update_id")) 10)]
+                                        (when-not (js/isNaN n) n)))
+                                    updates)]
+                      {:updates updates
+                       :offset (if (seq ids)
+                                 (inc (apply max ids))
+                                 (or offset 0))}))))
+        (p/catch (fn [e] {:error (err-str e) :updates [] :offset (or offset 0)})))))
+
+(defn telegram-token
+  "The bot token for a telegram session: the env named by
+  `delivery.telegram.token_env` (default TELEGRAM_BOT_TOKEN). nil = not
+  configured."
+  [config]
+  (let [c (get-in config ["delivery" "telegram"])
+        token (h/env (or (get c "token_env") "TELEGRAM_BOT_TOKEN"))]
+    (when-not (str/blank? (str token)) (str token))))
+
+(defn send-reply!
+  "The reply through the platform's existing send adapter (the same one the
+  cron delivery queue uses), addressed to the MESSAGE'S chat — a
+  `gateway.routes`-routed chat must never leak into the profile's configured
+  delivery chat. Webhook-style sends have one fixed target, so the adapter
+  REFUSES a chat it does not serve rather than posting into the configured
+  channel. `prof` is the owning profile (same position as `send!`'s first
+  argument). Resolves to nil on success or the adapter's error string."
+  ([prof msg text] (send-reply! prof msg text nil))
+  ([prof msg text fetch]
+   (let [platform (get msg "platform")
+         adapter (platforms/for-lane platform (:config prof))]
+     (if adapter
+       (adapter nil platform text (cond-> {:chat-id (get msg "chat_id")}
+                                    fetch (assoc :fetch fetch)))
+       (p/resolved (str platform " send adapter not configured"))))))
