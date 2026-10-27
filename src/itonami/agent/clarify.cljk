@@ -45,7 +45,10 @@
                   (array? raw) (vec raw)
                   (sequential? raw) (vec raw)
                   (string? raw) (try (let [p (h/json-parse raw)]
-                                       (if (array? p) (vec p) [raw]))
+                                       ;; js->clj turns a JSON array into a
+                                       ;; CLJS vector: sequential? is the
+                                       ;; real test (array? is dead here)
+                                       (if (sequential? p) (vec p) [raw]))
                                      (catch :default _ [raw]))
                   :else [raw])]
       ;; verbatim: strip the label AND drop blank items
@@ -157,7 +160,12 @@
       ;; the callback may be async (a readline, a chat round trip): p/let
       ;; AWAITS a Promise reply — a Promise answer is an ANSWER, never a
       ;; silent {} (p/resolved would wrap it unflattened)
-      (-> (p/let [reply (callback normalized)]
-            (result-json normalized (if (map? reply) reply {})))
+      (-> (p/let [r0 (callback normalized)
+                  ;; a bridge reply may arrive as a plain JS object
+                  reply (cond
+                          (map? r0) r0
+                          (and r0 (instance? js/Object r0)) (js->clj r0)
+                          :else nil)]
+            (result-json normalized (or reply {})))
           (p/catch (fn [e]
                      (h/json-str {"error" (str "Failed to get user input: " (or (.-message e) e))})))))))

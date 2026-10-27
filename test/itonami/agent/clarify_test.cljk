@@ -71,10 +71,6 @@
                                  (str (h/json-parse out)))))))
         (p/then (fn [_]
                   (let [seen (atom nil)]
-                    (clarify/ask! [{"question" "Q" "choices" ["a" "b"]}]
-                                  (fn [norm]
-                                    (reset! seen norm)
-                                    {"answers" {"q0" "a"} "outcome" "answered"}))
                     (-> (clarify/ask! [{"question" "Q" "choices" ["a" "b"]}]
                                       (fn [norm]
                                         (reset! seen norm)
@@ -96,10 +92,17 @@
         (p/then (fn [_]
                   (clarify/ask! [{"question" "A" "choices" ["yes" "no"] "multi_select" true}]
                                 (fn [_] {"answers" {"q0" ["yes (Recommended)" "" " "]} "outcome" "answered"}))))
+        (p/then (fn [_]
+                  (clarify/ask! [{"question" "A" "choices" ["yes" "no"] "multi_select" true}]
+                                (fn [_] {"answers" {"q0" "[\"yes\", \"no\"]"} "outcome" "answered"}))))
         (p/then (fn [out]
                   (let [parsed (h/json-parse out)]
                     (testing "multi-select answers drop blanks and the label (Hermes verbatim)"
                       (is (= ["yes"] (get-in parsed ["responses" 0 "user_response"])))))))
+        (p/then (fn [out]
+                  (let [parsed (h/json-parse out)]
+                    (testing "a JSON-array STRING is split too (js->clj yields a vector, not a JS array)"
+                      (is (= ["yes" "no"] (get-in parsed ["responses" 0 "user_response"])))))))
         (p/then (fn [_]
                   (clarify/ask! [{"question" "Q"}]
                                 (fn [_] (js/Promise.reject (js/Error. "boom"))))))

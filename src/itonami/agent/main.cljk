@@ -299,6 +299,13 @@
                                                  (swap! answers assoc (get q "qid") picked)
                                                  (ask-at (inc i))))))
                               (resolve {"answers" @answers "outcome" "answered"})))]
+               ;; stdin closing must SETTLE the promise — a dropped
+               ;; .question callback would wedge the whole run mid-tool
+               (.once rl "close"
+                      (fn []
+                        (resolve {"answers" (into {} (map (fn [q] [(get q "qid") ""]) qs))
+                                  "outcome" "aborted"
+                                  "notice" "input closed before the questions were answered"})))
                (ask-at 0)))))
         ask-before-tool (fn [{:keys [name arguments]}]
                           (let [arguments (if (map? arguments) arguments
