@@ -5,6 +5,7 @@
   (:require [cljs.test :refer [deftest is testing async]]
             [promesa.core :as p]
             [itonami.agent.host :as h]
+            [itonami.agent.platform-adapters :as platforms]
             [itonami.agent.chat-platform :as chat]))
 
 (defn- tmp-home [tag]
@@ -160,6 +161,109 @@
                     (is (= ["A" "A"] @sent))
                     (done)))
           (p/catch (fn [e] (is false (str "unexpected: " (.-message e))) (done)))))))
+
+(deftest telegram-request-thread-id
+  (let [body (fn [t] (js->clj (js/JSON.parse (:body (platforms/telegram-request "TOK" "c1" "hi" t)))))]
+    (testing "a forum-topic reply carries message_thread_id as a number"
+      (is (= 42 (get (body "42") "message_thread_id"))))
+    (testing "absent, negative, or non-numeric thread ids add no field"
+      (is (nil? (get (body nil) "message_thread_id")))
+      (is (nil? (get (body "-1") "message_thread_id")))
+      (is (nil? (get (body "abc") "message_thread_id")))
+      (is (nil? (get (body "42abc") "message_thread_id"))))))
+
+(deftest backoff-ms-validates
+  (testing "a poll-error backoff can never be NaN, zero, or sub-second"
+    (is (= 5000 (chat/backoff-ms nil)))
+    (is (= 5000 (chat/backoff-ms js/NaN)))
+    (is (= 5000 (chat/backoff-ms "abc")))
+    (is (= 5000 (chat/backoff-ms 0)))
+    (is (= 1000 (chat/backoff-ms 60)))
+    (is (= 30000 (chat/backoff-ms "30000")))
+    (is (= 5000 (chat/backoff-ms -5))))
+  (testing "oversized intervals are capped: Node's setTimeout overflows above 2^31-1 ms"
+    (is (= 600000 (chat/backoff-ms 3000000000)))
+    (is (= 600000 (chat/backoff-ms "3000000")))))
+
+(deftest serve-loop-dispatches-and-bounds
+  (async done
+    (let [tick (atom 0)
+          dispatched (atom [])
+          fake-fetch (fn [_url _opts]
+                       (swap! tick inc)
+                       (let [body (if (= 1 @tick)
+                                    (h/json-str {"ok" true "result" [(tg-update 4 "c1" "one")
+                                                                     (tg-update 5 "c1" "two")]})
+                                    (h/json-str {"ok" true "result" []}))]
+                         (p/resolved #js {:ok true :text (fn [] (p/resolved body))})))
+          srv (chat/serve! {:fetch fake-fetch :token "T" :poll-timeout 0 :max-ticks 2
+                            :dispatch (fn [u]
+                                        (swap! dispatched conj (get-in u ["message" "text"]))
+                                        (p/resolved nil))})]
+      (-> (:done srv)
+          (p/then (fn [why]
+                    (is (= :max-ticks why))
+                    (is (= ["one" "two"] @dispatched))
+                    (is (= 2 @tick))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
+(deftest serve-loop-backs-off-and-recovers
+  (async done
+    (let [tick (atom 0)
+          errs (atom [])
+          dispatched (atom [])
+          fake-fetch (fn [_url _opts]
+                       (swap! tick inc)
+                       (if (= 1 @tick)
+                         (p/resolved #js {:ok false :status 500})
+                         (p/resolved #js {:ok true
+                                          :text (fn [] (p/resolved (h/json-str {"ok" true
+                                                                                "result" [(tg-update 9 "c1" "late")]})))})))
+          srv (chat/serve! {:fetch fake-fetch :token "T" :poll-timeout 0 :max-ticks 2
+                            :on-error (fn [e] (swap! errs conj e))
+                            :dispatch (fn [u]
+                                        (swap! dispatched conj (get-in u ["message" "text"]))
+                                        (p/resolved nil))})]
+      (-> (:done srv)
+          (p/then (fn [why]
+                    (is (= :max-ticks why))
+                    (testing "the poll error was reported and the loop recovered"
+                      (is (= 1 (count @errs)))
+                      (is (re-find #"HTTP 500" (str (first @errs))))
+                      (is (= ["late"] @dispatched)))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
+
+(deftest serve-loop-survives-a-synchronous-fetch-throw
+  (async done
+    (let [tick (atom 0)
+          errs (atom [])
+          fake-fetch (fn [_url _opts]
+                       (swap! tick inc)
+                       (if (= 1 @tick)
+                         (throw (js/Error. "sync boom"))
+                         (p/resolved #js {:ok true :text (fn [] (p/resolved (h/json-str {"ok" true "result" []})))})))]
+      (let [srv (chat/serve! {:fetch fake-fetch :token "T" :poll-timeout 0 :max-ticks 2
+                              :on-error (fn [e] (swap! errs conj e))
+                              :dispatch (fn [_] (p/resolved nil))})]
+        (-> (:done srv)
+            (p/then (fn [why]
+                      (is (= :max-ticks why))
+                      (is (re-find #"sync boom" (str (first @errs))))))
+            (p/then (fn [_] (done)))
+            (p/catch (fn [e] (is false (str "loop died: " (str e))) (done))))))))
+
+(deftest serve-loop-stop-ends-the-loop
+  (async done
+    (let [srv (chat/serve! {:fetch (fn [_ _] (p/resolved #js {:ok true :text (fn [] (p/resolved (h/json-str {"ok" true "result" []})))}))
+                            :token "T" :poll-timeout 0
+                            :dispatch (fn [_] (p/resolved nil))})]
+      ((:stop srv))
+      (-> (:done srv)
+          (p/then (fn [why] (is (= :stopped why))))
+          (p/then (fn [_] (done)))
+          (p/catch (fn [e] (is false (str "unexpected: " (str e))) (done)))))))
 
 (deftest telegram-poll-advances-the-offset
   (async done

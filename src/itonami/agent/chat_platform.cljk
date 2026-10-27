@@ -299,19 +299,79 @@
         token (h/env (or (get c "token_env") "TELEGRAM_BOT_TOKEN"))]
     (when-not (str/blank? (str token)) (str token))))
 
+(defn backoff-ms
+  "The poll-error backoff in milliseconds: a finite positive interval floored
+  at 1000 and capped at 600000 — a NaN or zero backoff would hot-loop the
+  platform's API, and Node's setTimeout collapses delays above 2^31-1 ms to
+  ~1 ms (the same hot loop from the other side). Anything unparseable falls
+  back to 5000."
+  [interval]
+  (let [n (if (number? interval) interval (js/parseFloat (str interval)))]
+    (if (and (js/isFinite n) (pos? n))
+      (min 600000 (max 1000 (js/Math.floor n)))
+      5000)))
+
+(defn serve!
+  "The gateway serve loop (JUN-465): one `telegram-poll!` long poll, dispatch
+  every carried update through `dispatch`, recur until stopped. A poll error
+  reports through `on-error` and backs off `backoff-ms` of `interval` (ms,
+  floored at 1000; default 5000 — never a hot retry loop).
+  Injected: `fetch`, `dispatch` (fn [raw]), optional `on-error`, `max-ticks`
+  (tests bound the loop), `poll-timeout` (the long-poll timeout, default 25).
+  Returns {:stop (fn []) :done <promise resolving :stopped|:max-ticks>}."
+  [{:keys [fetch token dispatch on-error interval max-ticks poll-timeout]}]
+  (let [iv (backoff-ms interval)
+        stopped (atom false)
+        ticks (atom 0)
+        off (atom 0)
+        resolve-done (atom nil)
+        done (js/Promise. (fn [res] (reset! resolve-done res)))
+        wait (fn [ms] (js/Promise. (fn [res] (js/setTimeout res ms))))
+        finish (fn [why] (@resolve-done why))  ;; a Promise resolver is idempotent
+        notify! (fn [e]
+                  (when on-error
+                    (try (on-error e) (catch :default _ nil))))
+        step (fn step []
+               (cond
+                 @stopped (finish :stopped)
+                 (and max-ticks (<= max-ticks @ticks)) (finish :max-ticks)
+                 :else
+                 ;; the poll enters through a promise boundary: a synchronous
+                 ;; throw from an injected fetch or callback becomes a
+                 ;; rejection the catch answers — never a dead loop
+                 (-> (p/resolved nil)
+                     (p/then (fn [_] (telegram-poll! {:fetch fetch :token token :offset @off
+                                                      :timeout (or poll-timeout 25)})))
+                     (p/then (fn [res]
+                               (swap! ticks inc)
+                               (if-let [err (:error res)]
+                                 (do (notify! err)
+                                     (-> (wait iv) (p/then (fn [_] (step)))))
+                                 (do (reset! off (:offset res))
+                                     (-> (p/all (map dispatch (:updates res)))
+                                         (p/then (fn [_] (step))))))))
+                     (p/catch (fn [e]
+                                (notify! (err-str e))
+                                (-> (wait iv) (p/then (fn [_] (step)))))))))]
+    (step)
+    {:stop (fn [] (reset! stopped true)) :done done}))
+
 (defn send-reply!
   "The reply through the platform's existing send adapter (the same one the
   cron delivery queue uses), addressed to the MESSAGE'S chat — a
   `gateway.routes`-routed chat must never leak into the profile's configured
   delivery chat. Webhook-style sends have one fixed target, so the adapter
   REFUSES a chat it does not serve rather than posting into the configured
-  channel. `prof` is the owning profile (same position as `send!`'s first
-  argument). Resolves to nil on success or the adapter's error string."
+  channel. The message's `thread_id` rides along as the platform's thread
+  target where one exists (telegram: message_thread_id). `prof` is the owning
+  profile (same position as `send!`'s first argument). Resolves to nil on
+  success or the adapter's error string."
   ([prof msg text] (send-reply! prof msg text nil))
   ([prof msg text fetch]
    (let [platform (get msg "platform")
          adapter (platforms/for-lane platform (:config prof))]
      (if adapter
-       (adapter nil platform text (cond-> {:chat-id (get msg "chat_id")}
+       (adapter nil platform text (cond-> {:chat-id (get msg "chat_id")
+                                          :thread-id (get msg "thread_id")}
                                     fetch (assoc :fetch fetch)))
        (p/resolved (str platform " send adapter not configured"))))))
