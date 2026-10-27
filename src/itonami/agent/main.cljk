@@ -344,7 +344,7 @@
                               (run-notices (rest notices)))))
                 (p/resolved nil)))
             (ask []
-              (let [pending (agent-loop/delegate-pending-results!)
+              (let [pending (agent-loop/delegate-pending-results! "")
                     notices (proc/pending-notification-messages {:session-key ""})]
                 (cond
                   (seq pending)

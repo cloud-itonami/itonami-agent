@@ -396,24 +396,132 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                (inc n) attempts resp)))))))))))
        (fn [] (browser-runtime/close-session ctx)))))
 
-(def delegate-children
-  "subagent_id -> {goal status summary}. Children are registered while they
-  run and kept afterwards, so action=list stays truthful."
-  (atom {}))
+(defn delegate-state-file
+  "Where the delegate registry persists: children and delivered ids SURVIVE
+  a run ending (Hermes: background results that finish after the parent run
+  re-enter on the NEXT run instead of being lost). Same root as
+  p2p/itonami-dir, inlined to avoid a require cycle."
+  []
+  (h/join (h/expand (or (h/env "ITONAMI_DIR") "~/.itonami")) "delegate-results.json"))
 
-(def delegate-delivered (atom #{}))
+(defn load-delegate-state
+  "The persisted registry as {children delivered}; empty when absent or
+  unreadable (a corrupt registry never wedges startup)."
+  []
+  (try
+    (let [f (delegate-state-file)]
+      (if (h/file? f)
+        (let [rec (h/json-parse (h/slurp f))]
+          {"children" (let [c (get rec "children")] (if (map? c) c {}))
+           "delivered" (set (let [d (get rec "delivered")] (if (sequential? d) d [])))})
+        {"children" {} "delivered" #{}}))
+    (catch :default _ {"children" {} "delivered" #{}})))
+
+;; ONE load for both atoms (two reads could disagree on a racing write)
+(let [st (load-delegate-state)]
+  (def delegate-children
+    "subagent_id -> {goal status summary}. Children are registered while they
+  run and kept afterwards, so action=list stays truthful. Loaded from the
+  persisted registry at startup (cross-run re-entry)."
+    (atom (get st "children")))
+  (def delegate-delivered (atom (get st "delivered"))))
+
+(defn- merge-children
+  "MERGE BY recency — shared by the write AND the fetch paths (the R7 gate:
+  a stale in-memory record must never mask a newer on-disk one anywhere).
+  Higher updated_at wins; ties keep the IN-MEMORY record (the owner's live
+  state — the R8 gate)."
+  [on-disk mem]
+  ;; ties prefer the in-MEMORY record: a done/failed stamped in the same
+  ;; millisecond as its running record must not tie-lose to it (the R8 gate
+  ;; — wall-clock stamps are 1ms-granular; memory is the owner's live state)
+  (merge-with (fn [a b] (if (>= (or (get b "updated_at") 0) (or (get a "updated_at") 0)) b a))
+              on-disk mem))
+
+(defn- write-merged-registry!
+  "The MERGED write itself — caller must hold the lock."
+  []
+  (let [on-disk (load-delegate-state)
+        merged-children (merge-children (get on-disk "children") @delegate-children)
+        merged-delivered (into (set (get on-disk "delivered")) @delegate-delivered)]
+    (h/spit-atomic (delegate-state-file)
+                   (h/json-str {"children" merged-children
+                                "delivered" (vec merged-delivered)}))))
+
+(defn persist-delegate-state!
+  "Persist the registry after every mutation (the cross-run re-entry
+  record). Under the registry LOCK and MERGED with what is already on disk:
+  a blind full-snapshot overwrite would erase a concurrent process's
+  finished children (lost forever) and delivered marks (duplicate
+  re-delivery) — the R3 gate. A BUSY lock is RETRIED and, if still held,
+  loudly logged: with-lock returns ::busy without throwing, and a silently
+  skipped write would void the guarantee (the R5 gate)."
+  ([] (persist-delegate-state! 3))
+  ([attempts]
+   (try
+     (let [r (h/with-lock (str (delegate-state-file) ".lock") write-merged-registry!)]
+       ;; h/with-lock returns the HOST namespace's ::busy — loop's own
+       ;; ::busy is a different keyword and the comparison never matched
+       ;; (the R8 gate: the retry/log path was dead code)
+       (when (= r :itonami.agent.host/busy)
+         (if (pos? attempts)
+           (do (js/Atomics.wait (js/Int32Array. (js/SharedArrayBuffer. 4)) 0 0 50)
+               (persist-delegate-state! (dec attempts)))
+           (js/console.error "delegate registry persist skipped: lock held by another process"))))
+     (catch :default e
+       (js/console.error (str "delegate registry persist failed: " (or (.-message e) e)))))))
 
 (defn delegate-pending-results!
-  "Finished background children not yet delivered — one message per call, as
-  Hermes delivers background results between turns. Marked delivered."
-  []
-  (let [pending (vec (for [[id c] @delegate-children
-                           :when (and (not= "running" (get c "status"))
-                                      (not (contains? @delegate-delivered id)))]
-                       (assoc c "subagent_id" id)))]
-    (when (seq pending)
-      (swap! delegate-delivered into (map #(get % "subagent_id") pending)))
-    pending))
+  "Finished background children not yet delivered TO THIS SESSION — one
+  message per call, as Hermes delivers background results between turns.
+  Session-scoped (the R2 security gate): a result belongs to the session
+  that spawned its child and is never injected into another. Marked
+  delivered."
+  ;; the session key is REQUIRED — and the requirement is ASSERTED, not
+  ;; left to arity: kbb/SCI binds missing args to nil (verified), so a
+  ;; forgotten key would silently degrade to the leaky "" case (the R3/R4
+  ;; gate)
+  ([session-key]
+   (when-not (string? session-key)
+     (throw (js/Error. "delegate-pending-results! requires a session key")))
+   ;; READ-FILTER-MARK all under the lock against a FRESH on-disk state:
+   ;; deciding from in-memory atoms lets two concurrent processes both
+   ;; deliver the same finished child before either write lands (the R5
+   ;; double-delivery gate)
+   (let [sk (str session-key)
+         outcome (try
+                   (h/with-lock (str (delegate-state-file) ".lock")
+                   (fn []
+                     (let [on-disk (load-delegate-state)
+                           children (merge-children (get on-disk "children") @delegate-children)
+                           delivered (into (set (get on-disk "delivered")) @delegate-delivered)
+                           pending (vec (for [[id c] children
+                                              :when (and (not= "running" (get c "status"))
+                                                         (not (contains? delivered id))
+                                                         (= sk (str (get c "session_key" ""))))]
+                                          (assoc c "subagent_id" id)))]
+                       (when (seq pending)
+                         (swap! delegate-delivered into (map #(get % "subagent_id") pending))
+                         ;; the ack write must not CRASH ask nor swallow the
+                         ;; results (the R6 gate): a delivery that happened
+                         ;; is returned even if persisting it failed — the
+                         ;; failure is loud, the alternative is losing the
+                         ;; results entirely
+                         (try (write-merged-registry!)
+                              (catch :default e
+                                (js/console.error (str "delegate delivery ack failed: " (or (.-message e) e))))))
+                       pending)))
+                   (catch :default e
+                     ;; lock-acquire IO errors must not crash ask either
+                     ;; (the R7 gate) — loud log, empty result, next poll
+                     (js/console.error (str "delegate registry fetch failed: " (or (.-message e) e)))
+                    []))]
+     (if (= outcome :itonami.agent.host/busy)
+       ;; TRANSIENT contention must not kill the interactive loop: return
+       ;; empty and let the next poll pick the results up (delivery stays
+       ;; atomic; the R6 escalation note)
+       []
+       outcome))))
 
 (def delegate-ctl
   "subagent_id -> {:steer (atom [message]) :cancel (atom bool)}. steer queues
@@ -544,13 +652,27 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                           "error" (get-in result [:error :error])} extra)]
                                          (swap! delegate-children assoc id {"goal" goal
                                                                             "status" (get base "status")
-                                                                            "summary" (get base "summary")})
+                                                                            "summary" (get base "summary")
+                                                                            "error" (get base "error")
+                                                                            "session_key" (str (or (:session-key parent-options) ""))
+                                                                            ;; per-record stamp: the merge
+                                                                            ;; keeps the NEWER record (the
+                                                                            ;; R6 stale-writer gate)
+                                                                            "updated_at" (h/now-ms)})
+                                         ;; the RESULT must survive the run
+                                         ;; ending (the R1 gate: the success
+                                         ;; path is the one that carries the
+                                         ;; summary the next run re-enters)
+                                         (persist-delegate-state!)
                                          (swap! delegate-ctl dissoc id)
                                          ;; Hermes tools/delegate_tool_registry._unregister_subagent:
                                          ;; the record moves to the bounded recent FIFO
                                          (proc/unregister-subagent-attribution! id)
                                          base))]
-                            (swap! delegate-children assoc id {"goal" goal "status" "running"})
+                            (swap! delegate-children assoc id {"goal" goal "status" "running"
+                                                               "session_key" (str (or (:session-key parent-options) ""))
+                                                               "updated_at" (h/now-ms)})
+                            (persist-delegate-state!)
                             (swap! delegate-ctl assoc id ctl)
                             ;; Hermes tools/delegate_tool_registry._register_child:
                             ;; the process-notice attribution record
@@ -572,7 +694,15 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                     (p/then (fn [r2] (done r2 (delegate-validate-schema schema (:final r2)))))
                                                     (p/catch (fn [_] (done result v)))))))))
                                 (p/catch (fn [e]
-                                           (swap! delegate-children assoc id {"goal" goal "status" "failed"})
+                                           (swap! delegate-children assoc id {"goal" goal "status" "failed"
+                                                                              "error" (str (or (.-message e) ""))
+                                                                              "session_key" (str (or (:session-key parent-options) ""))
+                                                                              ;; EVERY record is stamped (the R7
+                                                                              ;; gate): an unstamped failure tie-loses
+                                                                              ;; to the on-disk running record and
+                                                                              ;; vanishes across runs
+                                                                              "updated_at" (h/now-ms)})
+                                           (persist-delegate-state!)
                                            (proc/unregister-subagent-attribution! id)
                                            {"subagent_id" id "goal" goal "status" "failed" "error" (.-message e)})))))
               child-runs (mapv child-run ids tasks)]
@@ -585,5 +715,11 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
                                                        "status" "running"}))}))
             (p/then (p/all child-runs)
                     (fn [results]
+                      ;; joined children return INLINE — mark them delivered
+                      ;; so the registry never re-delivers them as duplicates
+                      ;; on a later run (the R2 gate)
+                      (swap! delegate-delivered into
+                             (map #(get % "subagent_id") results))
+                      (persist-delegate-state!)
                       (h/json-str {"results" (vec results)
                                    "total_duration_seconds" (/ (- (h/now-ms) t0) 1000)})))))))))

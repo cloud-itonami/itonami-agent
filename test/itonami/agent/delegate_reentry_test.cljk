@@ -1,0 +1,155 @@
+(ns itonami.agent.delegate-reentry-test
+  "Hermes delegate cross-run re-entry: pending background results PERSIST
+  across a run ending and re-enter as delegated-results on the next run.
+  Every test resets the registry to a throwaway state first. (The
+  ITONAMI_DIR rebind below only guards WRITES — loop's namespace load has
+  already read whatever registry was current at require time, so tests must
+  reset the atoms/registry rather than trust load order — the R5 note.)"
+  (:require [cljs.test :refer [deftest is testing]]
+            ["node:os" :as os]
+            ["node:path" :as path]
+            [itonami.agent.host :as h]
+            [itonami.agent.loop :as loop]))
+
+(aset (.-env js/process) "ITONAMI_DIR"
+      (path/join (os/tmpdir) (str "itonami-delegate-reentry-test-" (.-pid js/process) "-" (random-uuid))))
+
+(deftest pending-results-survive-a-run-ending
+  ;; per-test registry isolation: tests share one process-wide file
+  (h/spit-atomic (loop/delegate-state-file) (h/json-str {"children" {} "delivered" []}))
+  (let [saved-children (atom {"kid1" {"goal" "g" "status" "completed" "summary" "done here"}})
+        saved-delivered (atom #{})]
+    (with-redefs [loop/delegate-children saved-children
+                  loop/delegate-delivered saved-delivered]
+      (testing "the first call yields the finished child and marks it delivered"
+        (let [pending (loop/delegate-pending-results! "")]
+          (is (= 1 (count pending)))
+          (is (= "kid1" (get (first pending) "subagent_id")))
+          (is (= "done here" (get (first pending) "summary")))))
+      (testing "the delivery is PERSISTED — a next run must not re-deliver"
+        (let [rec (h/json-parse (h/slurp (loop/delegate-state-file)))]
+          (is (contains? (set (get rec "delivered")) "kid1")))
+        (is (= [] (vec (loop/delegate-pending-results! ""))))))))
+
+(deftest results-are-session-scoped
+  (h/spit-atomic (loop/delegate-state-file) (h/json-str {"children" {} "delivered" []}))
+  ;; the R2 security gate: a delegated result belongs to the session that
+  ;; spawned its child and is NEVER injected into another session's prompt
+  (with-redefs [loop/delegate-children (atom {"kidA" {"goal" "g" "status" "completed" "summary" "for A" "session_key" "sess-A"}
+                                              "kidB" {"goal" "g" "status" "completed" "summary" "for B" "session_key" "sess-B"}})
+                loop/delegate-delivered (atom #{})]
+    (let [for-a (loop/delegate-pending-results! "sess-A")
+          for-b (loop/delegate-pending-results! "sess-B")]
+      (is (= ["kidA"] (mapv #(get % "subagent_id") for-a)))
+      (is (= ["kidB"] (mapv #(get % "subagent_id") for-b)))
+      (is (= "for A" (get (first for-a) "summary")))
+      ;; and neither session can pull the other's after delivery
+      (is (= [] (vec (loop/delegate-pending-results! "sess-A")))))))
+
+(deftest merge-keeps-the-newer-record
+  ;; the R6 stale-writer gate: a stale in-memory record must never overwrite
+  ;; a NEWER on-disk one (updated_at decides)
+  (h/spit-atomic (loop/delegate-state-file)
+                 (h/json-str {"children" {"kid" {"goal" "g" "status" "completed" "summary" "newer on disk" "session_key" "" "updated_at" 2000}}
+                              "delivered" []}))
+  (with-redefs [loop/delegate-children (atom {"kid" {"goal" "g" "status" "running" "summary" "stale in memory" "session_key" "" "updated_at" 1000}})
+                loop/delegate-delivered (atom #{})]
+    (loop/persist-delegate-state!))
+  (is (= "newer on disk" (get-in (get (loop/load-delegate-state) "children") ["kid" "summary"]))))
+
+(deftest lock-contention-is-transient-not-fatal
+  ;; the R8 gate: the busy sentinel is the HOST namespace's keyword — the
+  ;; old comparison never matched (silent persist skips; a raw keyword
+  ;; crashing (seq pending)). Both paths are now tested against the REAL
+  ;; sentinel value.
+  (with-redefs [h/with-lock (fn [_ _] :itonami.agent.host/busy)]
+    ;; persist: busy is retried then loudly logged — never silent (the
+    ;; outcome is invisible here; the contract is no-throw)
+    (loop/persist-delegate-state!)
+    ;; fetch: transient contention yields empty, never a crash
+    (is (= [] (vec (loop/delegate-pending-results! ""))))))
+
+(deftest same-millisecond-ties-prefer-the-owner
+  ;; the R8 tie gate: wall-clock stamps are 1ms-granular — a finished record
+  ;; stamped in the same ms as its running record must win
+  (h/spit-atomic (loop/delegate-state-file)
+                 (h/json-str {"children" {"kid" {"goal" "g" "status" "running" "session_key" "" "updated_at" 2000}}
+                              "delivered" []}))
+  (with-redefs [loop/delegate-children (atom {"kid" {"goal" "g" "status" "completed" "summary" "same ms" "session_key" "" "updated_at" 2000}})
+                loop/delegate-delivered (atom #{})]
+    (loop/persist-delegate-state!))
+  (is (= "completed" (get-in (get (loop/load-delegate-state) "children") ["kid" "status"]))))
+
+(deftest failure-records-survive-the-merge
+  ;; the R7 gate: EVERY record is stamped, so a completed/failed record can
+  ;; never tie-lose to an older on-disk 'running' one (an unstamped failure
+  ;; used to vanish across runs)
+  (h/spit-atomic (loop/delegate-state-file)
+                 (h/json-str {"children" {"kid" {"goal" "g" "status" "running" "session_key" "" "updated_at" 1000}}
+                              "delivered" []}))
+  (with-redefs [loop/delegate-children (atom {"kid" {"goal" "g" "status" "failed" "error" "boom" "session_key" "" "updated_at" 2000}})
+                loop/delegate-delivered (atom #{})]
+    (loop/persist-delegate-state!))
+  (let [kid (get (get (loop/load-delegate-state) "children") "kid")]
+    (is (= "failed" (get kid "status")))
+    (is (= "boom" (get kid "error")))))
+
+(deftest the-session-key-is-asserted-not-assumed
+  (h/spit-atomic (loop/delegate-state-file) (h/json-str {"children" {} "delivered" []}))
+  ;; kbb/SCI binds missing args to nil — the requirement must be RUNTIME
+  ;; checked, not left to arity (the R4 gate)
+  (is (thrown-with-msg? js/Error #"requires a session key"
+                        (loop/delegate-pending-results! nil)))
+  (is (thrown-with-msg? js/Error #"requires a session key"
+                        (loop/delegate-pending-results! 42))))
+
+(deftest concurrent-writers-merge-under-the-lock
+  ;; the R3 gate: persist MERGES with what is on disk — a concurrent
+  ;; process's finished children and delivered marks must survive our write
+  ;; (a blind snapshot overwrite would erase them: lost results, duplicate
+  ;; re-delivery)
+  (h/spit-atomic (loop/delegate-state-file)
+                 (h/json-str {"children" {"foreign" {"goal" "g" "status" "completed" "summary" "from the other process" "session_key" ""}}
+                              "delivered" ["already"]}))
+  (with-redefs [loop/delegate-children (atom {"mine" {"goal" "g" "status" "completed" "summary" "mine" "session_key" ""}})
+                loop/delegate-delivered (atom #{"mine"})]
+    (loop/persist-delegate-state!))
+  (let [loaded (loop/load-delegate-state)]
+    (is (= "from the other process" (get-in (get loaded "children") ["foreign" "summary"]))
+        "the other process's child survives our write")
+    (is (= "mine" (get-in (get loaded "children") ["mine" "summary"])))
+    (is (= #{"already" "mine"} (set (get loaded "delivered"))))
+    ;; the merged foreign child is still UNDELIVERED — it belongs to the
+    ;; root session and re-enters exactly once (then never again)
+    (let [first-run (vec (loop/delegate-pending-results! ""))]
+      (is (= ["foreign"] (mapv #(get % "subagent_id") first-run)))
+      (is (= "from the other process" (get (first first-run) "summary"))))
+    (is (= [] (vec (loop/delegate-pending-results! ""))) "exactly once — never re-delivered")))
+
+(deftest joined-children-are-never-re-delivered
+  (h/spit-atomic (loop/delegate-state-file) (h/json-str {"children" {} "delivered" []}))
+  ;; foreground children return INLINE — without a delivered mark the
+  ;; registry would re-deliver them as duplicates on the next run (the R2
+  ;; duplicate gate); the in-memory state models the post-join registry
+  (with-redefs [loop/delegate-children (atom {"kidJ" {"goal" "g" "status" "completed" "summary" "already inline" "session_key" ""}})
+                loop/delegate-delivered (atom #{"kidJ"})]
+    (is (= [] (vec (loop/delegate-pending-results! ""))))))
+
+(deftest a-crashed-runs-results-reenter
+  ;; simulate the registry as a previous process left it: a child that
+  ;; finished AFTER its run ended is still undelivered
+  (let [f (loop/delegate-state-file)]
+    (h/spit-atomic f (h/json-str {"children" {"kid2" {"goal" "g2" "status" "completed" "summary" "late result"}}
+                                  "delivered" []}))
+    (let [loaded (loop/load-delegate-state)]
+      (is (= "late result" (get-in (get loaded "children") ["kid2" "summary"])))
+      (is (empty? (get loaded "delivered"))))
+    ;; and with the atoms restored from disk, the re-entry happens
+    (with-redefs [loop/delegate-children (atom (get (loop/load-delegate-state) "children"))
+                  loop/delegate-delivered (atom (get (loop/load-delegate-state) "delivered"))]
+      (let [pending (loop/delegate-pending-results! "")]
+        (is (= 1 (count pending)))
+        (is (= "kid2" (get (first pending) "subagent_id")))))
+    ;; a corrupt registry never wedges startup
+    (h/spit f "{not json")
+    (is (= {"children" {} "delivered" #{}} (loop/load-delegate-state)))))

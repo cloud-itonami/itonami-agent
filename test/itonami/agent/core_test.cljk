@@ -1174,8 +1174,8 @@ plain: true
   (reset! agent-loop/delegate-delivered #{})
   (swap! agent-loop/delegate-children assoc "sub-f" {"goal" "g" "status" "completed" "summary" "done"})
   (swap! agent-loop/delegate-children assoc "sub-r" {"goal" "g2" "status" "running"})
-  (is (= ["sub-f"] (map #(get % "subagent_id") (agent-loop/delegate-pending-results!))))
-  (is (empty? (agent-loop/delegate-pending-results!)) "delivered once")
+  (is (= ["sub-f"] (map #(get % "subagent_id") (agent-loop/delegate-pending-results! ""))))
+  (is (empty? (agent-loop/delegate-pending-results! "")) "delivered once")
   (reset! agent-loop/delegate-children {})
   (reset! agent-loop/delegate-delivered #{}))
 
