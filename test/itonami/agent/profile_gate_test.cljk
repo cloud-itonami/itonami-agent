@@ -1,0 +1,21 @@
+(ns itonami.agent.profile-gate-test
+  "The profile-name -> path join is the ONE place a name becomes a path:
+  invalid names refuse instead of escaping the store."
+  (:require [cljs.test :refer [deftest is testing]]
+            [itonami.agent.profile :as profile]))
+
+(deftest home-in-gates-names
+  (testing "default and nil name the store root"
+    (is (= "/r" (profile/home-in "/r" "default")))
+    (is (= "/r" (profile/home-in "/r" nil))))
+  (testing "a valid name joins under profiles/"
+    (is (= "/r/profiles/alpha-1_2" (profile/home-in "/r" "alpha-1_2"))))
+  (testing "traversal and malformed names refuse — they never join"
+    (is (thrown-with-msg? js/Error #"invalid profile name"
+                          (profile/home-in "/r" "../..")))
+    (is (thrown-with-msg? js/Error #"invalid profile name"
+                          (profile/home-in "/r" "a/b")))
+    (is (thrown-with-msg? js/Error #"invalid profile name"
+                          (profile/home-in "/r" "UPPER")))
+    (is (thrown-with-msg? js/Error #"invalid profile name"
+                          (profile/home-in "/r" "")))))
