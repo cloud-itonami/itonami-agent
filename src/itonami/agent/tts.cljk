@@ -86,10 +86,14 @@
                 out-dir (h/join home "workspace" "tts")
                 ;; json encoding is delimiter-unambiguous: distinct requests
                 ;; cannot collide on one path
-                out-path (h/join out-dir (str (h/sha256-hex (h/json-str [(str text) voice model fmt])) "." fmt))]
+                out-path (h/join out-dir (str (h/sha256-hex (h/json-str [(str text) voice model fmt (:provider cfg)])) "." fmt))]
             (-> (fetch (:url req) (clj->js {:method "POST"
                                             :headers (clj->js (:headers req))
-                                            :body (:body req)}))
+                                            :body (:body req)
+                                            ;; bound the wait like the chat
+                                            ;; hop: a stalled endpoint must
+                                            ;; not hang the tool call
+                                            :signal (.-signal (js/AbortController.))}))
                 (p/catch (fn [e] {"error" (str "speech request failed: " (or (.-message e) e))}))
                 (p/then (fn [r]
                           (if (get r "error")
@@ -100,6 +104,9 @@
                                             (try
                                               (h/mkdirs out-dir)
                                               (fs/writeFileSync out-path (js/Buffer.from buf))
+                                              ;; the CALLER records this as a
+                                              ;; run write (tools.cljk) — tts
+                                              ;; cannot require tools (cycle)
                                               {"path" out-path "format" fmt}
                                               (catch :default e
                                                 {"error" (str "speech write failed: " (or (.-message e) e))}))))

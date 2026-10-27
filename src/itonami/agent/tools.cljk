@@ -3000,7 +3000,9 @@
       (p/then (fn [r]
                 (if-let [e (get r "error")]
                   (err e)
-                  (ok (assoc r "success" true)))))))
+                  (do ;; the audio file is a run write like any other
+                      (when-let [p (get r "path")] (when (writable? ctx p) (record-write! ctx p)))
+                      (ok (assoc r "success" true))))))))
 
 (defn browser-vault-list [ctx _args]
   (let [home (:home ctx)

@@ -31,6 +31,18 @@
       (is (= "hi" (get body "input")))
       (is (= "mp3" (get body "response_format"))))))
 
+(deftest synthesize-fails-named-on-every-branch
+  (testing "a network failure is a named error"
+    (-> (tts/synthesize! {"tts" {"provider" "x" "model" "m"} "providers" {"x" {"kind" "send_json_base" "base_url" "https://api.x/v1" "model" "m"}}}
+                         "/tmp/tts-no-home" {"text" "hi" "format" "mp3"}
+                         (fn [_ _] (js/Promise.reject (js/Error. "ECONNRESET"))))
+        (promesa.core/then (fn [r] (is (re-find #"speech request failed: ECONNRESET" (str (get r "error"))))))))
+  (testing "a non-2xx response is a named error"
+    (-> (tts/synthesize! {"tts" {"provider" "x" "model" "m"} "providers" {"x" {"kind" "send_json_base" "base_url" "https://api.x/v1" "model" "m"}}}
+                         "/tmp/tts-no-home" {"text" "hi" "format" "mp3"}
+                         (fn [_ _] (js/Promise.resolve #js {:ok false :status 502})))
+        (promesa.core/then (fn [r] (is (= "speech request failed: HTTP 502" (get r "error"))))))))
+
 (deftest synthesize-writes-the-audio
   (async done
     (let [home (h/join (h/tmp-dir) (str "test-tts-" (.-pid js/process) "-" (h/random-hex 4)))
