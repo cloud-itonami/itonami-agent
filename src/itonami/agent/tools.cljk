@@ -2959,7 +2959,9 @@
                    (reset! stopped? true)
                    (let [output (str (:stdout r) (when-not (str/blank? (:stderr r))
                                                    (str "\n[stderr]\n" (:stderr r))))
-                         tool-errors (code-rpc/tool-errors-since @(:log st) 0)]
+                         tool-errors (code-rpc/tool-errors-since @(:log st) 0)
+                         hint (code-rpc/hint-on-failure (:exit r) (:timed-out? r) (:stderr r)
+                                                        (code-rpc/sandbox-tools-for (:run-tools ctx)))]
                      (confine/audit! {:tool "execute_code" :profile (:profile ctx) :peer? (:peer? pol)
                                       :sandbox (:sandbox c) :cmd "python3 script.py" :exit (:exit r)
                                       :stderr (:stderr r) :timed-out? (:timed-out? r)})
@@ -2972,7 +2974,8 @@
                                   "persistent" false
                                   "tool_rpc" true
                                   "tool_calls_made" @(:counter st)}
-                           (seq tool-errors) (assoc "tool_errors" tool-errors)))))))))))))
+                           (seq tool-errors) (assoc "tool_errors" tool-errors)
+                           hint (assoc "hint" hint)))))))))))))
 
 (defn- vault-filled? [r]
   (true? (get-in (h/json-parse r) ["result" "result" "value"])))

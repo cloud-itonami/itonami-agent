@@ -1,0 +1,42 @@
+(ns itonami.agent.code-rpc-hint-test
+  "execute_code's failure hints — code_execution_tool._FAILURE_HINT_RULES,
+  verbatim (first match wins, bounded scan, never throws)."
+  (:require [cljs.test :refer [deftest is testing]]
+            [itonami.agent.code-rpc :as code-rpc]))
+
+(deftest failure-hint-basics
+  (testing "a missing hermes_tools name lists what IS importable"
+    (let [h (code-rpc/failure-hint "ImportError: cannot import name 'zebra' from 'hermes_tools'" ["terminal" "read_file"])]
+      (is (re-find #"'zebra' is not available" h))
+      (is (re-find #"terminal" h))
+      (is (re-find #"read_file" h))))
+  (testing "a missing helper gets the import line"
+    (is (re-find #"from hermes_tools import json_parse"
+                 (code-rpc/failure-hint "NameError: name 'json_parse' is not defined" nil)))
+    (is (re-find #"Import helpers with `from hermes_tools import retry`"
+                 (code-rpc/failure-hint "cannot import name 'retry' from 'hermes_tools'" nil))))
+  (testing "a missing third-party module points at stdlib or terminal"
+    (is (re-find #"'numpy' is not installed in the sandbox interpreter"
+                 (code-rpc/failure-hint "ModuleNotFoundError: No module named 'numpy'" nil))))
+  (testing "string-vs-dict misuse gets the dict reminder"
+    (is (re-find #"return DICTS"
+                 (code-rpc/failure-hint "TypeError: string indices must be integers" nil)))
+    (is (re-find #"return DICTS"
+                 (code-rpc/failure-hint "AttributeError: 'str' object has no attribute 'get'" nil))))
+  (testing "first match wins"
+    (is (re-find #"'numpy' is not installed"
+                 (code-rpc/failure-hint (str "ModuleNotFoundError: No module named 'numpy'\n"
+                                             "TypeError: string indices must be integers")
+                                        nil))))
+  (testing "the hint belongs to FAILED runs only (Hermes gates on error status)"
+    (let [err "ModuleNotFoundError: No module named 'x'"]
+      (is (re-find #"'x' is not installed" (code-rpc/hint-on-failure 1 false err nil)))
+      (is (re-find #"'x' is not installed" (code-rpc/hint-on-failure 0 true err nil)))
+      (is (nil? (code-rpc/hint-on-failure 0 false err nil)))
+      (is (re-find #"not installed" (code-rpc/hint-on-failure nil false err nil)))))
+  (testing "no match, blank, and oversized stderr never throw — hint or nil"
+    (is (nil? (code-rpc/failure-hint "something else entirely" nil)))
+    (is (nil? (code-rpc/failure-hint "" nil)))
+    (is (nil? (code-rpc/failure-hint nil nil)))
+    (let [big (str (apply str (repeat 5000 "x")) "ModuleNotFoundError: No module named 'deep'")]
+      (is (nil? (code-rpc/failure-hint big nil))))))
