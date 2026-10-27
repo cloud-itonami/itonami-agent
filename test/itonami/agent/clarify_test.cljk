@@ -51,7 +51,7 @@
                                                {"question" "B"}
                                                {"question" "C"}])
         reply {"answers" {"q0" "yes (Recommended)" "q2" ""}
-               "outcome" "answered"
+               "outcome" "submitted"
                "notice" "timed out"}
         parsed (h/json-parse (clarify/result-json norm reply))]
     (is (= "answered" (get-in parsed ["responses" 0 "status"])))
@@ -59,7 +59,7 @@
     (is (= "unanswered" (get-in parsed ["responses" 1 "status"])))
     (is (nil? (get-in parsed ["responses" 1 "user_response"])))
     (is (= "skipped" (get-in parsed ["responses" 2 "status"])))
-    (is (= "answered" (get parsed "outcome")))
+    (is (= "submitted" (get parsed "outcome")))
     (is (= "timed out" (get parsed "notice")))))
 
 (deftest ask-contracts
@@ -74,7 +74,7 @@
                     (-> (clarify/ask! [{"question" "Q" "choices" ["a" "b"]}]
                                       (fn [norm]
                                         (reset! seen norm)
-                                        {"answers" {"q0" "a"} "outcome" "answered"}))
+                                        {"answers" {"q0" "a"} "outcome" "submitted"}))
                         (p/then (fn [out]
                                   (let [parsed (h/json-parse out)]
                                     (testing "a sync callback's reply is shaped"
@@ -83,7 +83,7 @@
                                       (is (= "a" (get-in parsed ["responses" 0 "user_response"])))))))))))
         (p/then (fn [_]
                   (clarify/ask! [{"question" "Q"}]
-                                (fn [_] (p/resolved {"answers" {"q0" "typed"} "outcome" "answered"})))))
+                                (fn [_] (p/resolved {"answers" {"q0" "typed"} "outcome" "submitted"})))))
         (p/then (fn [out]
                   (let [parsed (h/json-parse out)]
                     (testing "an ASYNC callback's reply is awaited — a Promise answer is an ANSWER"
@@ -91,18 +91,26 @@
                       (is (= "typed" (get-in parsed ["responses" 0 "user_response"])))))))
         (p/then (fn [_]
                   (clarify/ask! [{"question" "A" "choices" ["yes" "no"] "multi_select" true}]
-                                (fn [_] {"answers" {"q0" ["yes (Recommended)" "" " "]} "outcome" "answered"}))))
-        (p/then (fn [_]
-                  (clarify/ask! [{"question" "A" "choices" ["yes" "no"] "multi_select" true}]
-                                (fn [_] {"answers" {"q0" "[\"yes\", \"no\"]"} "outcome" "answered"}))))
+                                (fn [_] {"answers" {"q0" ["yes (Recommended)" "" " "]} "outcome" "submitted"}))))
         (p/then (fn [out]
                   (let [parsed (h/json-parse out)]
                     (testing "multi-select answers drop blanks and the label (Hermes verbatim)"
-                      (is (= ["yes"] (get-in parsed ["responses" 0 "user_response"])))))))
+                      (is (= ["yes"] (get-in parsed ["responses" 0 "user_response"]))))
+                    out)))
+        (p/then (fn [_]
+                  (clarify/ask! [{"question" "A" "choices" ["yes" "no"] "multi_select" true}]
+                                (fn [_] {"answers" {"q0" "[\"yes\", \"no\"]"} "outcome" "submitted"}))))
         (p/then (fn [out]
                   (let [parsed (h/json-parse out)]
                     (testing "a JSON-array STRING is split too (js->clj yields a vector, not a JS array)"
                       (is (= ["yes" "no"] (get-in parsed ["responses" 0 "user_response"])))))))
+        (p/then (fn [_]
+                  (clarify/ask! [{"question" "Q"}]
+                                (fn [_] #js {"answers" #js {"q0" "js-obj"} "outcome" "submitted"}))))
+        (p/then (fn [out]
+                  (let [parsed (h/json-parse out)]
+                    (testing "a plain JS-object reply is read too (future bridge interop)"
+                      (is (= "js-obj" (get-in parsed ["responses" 0 "user_response"])))))))
         (p/then (fn [_]
                   (clarify/ask! [{"question" "Q"}]
                                 (fn [_] (js/Promise.reject (js/Error. "boom"))))))
