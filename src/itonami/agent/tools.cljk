@@ -1489,6 +1489,41 @@
 (def ^:private session-source-filter "COALESCE(s.source, '') NOT IN ('tool', 'delegate', 'kanban')")
 (def ^:private session-hidden-filter "COALESCE(s.hidden, 0) = 0")
 
+(defn sessions-browse
+  "The `sessions list` rows (also session_search's browse shape): the visible
+  conversations of a profile's state.db, newest activity first — the same
+  filters as discovery (non-tool/delegate/kanban, not hidden). Read-only."
+  ([db-path] (sessions-browse db-path 20))
+  ([db-path limit]
+   (when (h/file? db-path)
+     (let [db (sqlite/DatabaseSync. db-path #js {:readOnly true})]
+       (try
+         (.exec db "PRAGMA query_only = ON")
+         (sqlite-records db
+                         (str "SELECT s.id AS session_id, s.title, s.started_at, s.message_count "
+                              "FROM sessions s WHERE " session-hidden-filter " AND " session-source-filter " "
+                              "ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC LIMIT ?")
+                         limit)
+         (finally (.close db)))))))
+
+(defn session-latest-messages
+  "The `sessions show` body: the newest `limit` messages of one session,
+  returned oldest-first for reading. Read-only; an unknown session answers
+  [], a missing state.db answers nil."
+  [db-path session-id limit]
+  (when (h/file? db-path)
+    (let [db (sqlite/DatabaseSync. db-path #js {:readOnly true})]
+      (try
+        (.exec db "PRAGMA query_only = ON")
+        (->> (sqlite-records db
+                             (str "SELECT m.id, m.role, m.content, m.timestamp FROM messages m "
+                                  "JOIN sessions s ON s.id = m.session_id WHERE s.id = ? AND "
+                                  session-hidden-filter " AND " session-source-filter " "
+                                  "ORDER BY m.id DESC LIMIT ?")
+                             session-id limit)
+             reverse vec)
+        (finally (.close db))))))
+
 (defn- session-suggest-profile-name [nm]
   (let [candidate (-> (str/lower-case (str/trim (str nm)))
                       (str/replace #"[^a-z0-9_-]+" "-")

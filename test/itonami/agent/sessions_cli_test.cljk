@@ -1,0 +1,37 @@
+(ns itonami.agent.sessions-cli-test
+  "sessions list/show over a profile's state.db — read-only, the same
+  visibility filters as session_search discovery."
+  (:require [cljs.test :refer [deftest is testing]]
+            ["node:sqlite" :as sqlite]
+            [itonami.agent.host :as h]
+            [itonami.agent.tools :as tools]))
+
+(deftest browse-and-show
+  (let [dir (h/join (h/tmp-dir) (str "test-sessions-" (.-pid js/process) "-" (h/random-hex 4)))
+        _ (h/mkdirs dir)
+        db-path (h/join dir "state.db")
+        db (sqlite/DatabaseSync. db-path)]
+    (.exec db (str "CREATE TABLE sessions (id TEXT, title TEXT, started_at TEXT, message_count INTEGER,"
+                   " last_activity_at TEXT, parent_session_id TEXT, source TEXT, hidden INTEGER);"
+                   "CREATE TABLE messages (id TEXT, session_id TEXT, role TEXT, content TEXT, timestamp TEXT);"
+                   "INSERT INTO sessions VALUES ('s1','one','2026-10-27T10:00:00Z',2,'2026-10-27T10:01:00Z',NULL,NULL,0);"
+                   "INSERT INTO sessions VALUES ('s2','hidden','2026-10-27T09:00:00Z',0,NULL,NULL,NULL,1);"
+                   "INSERT INTO sessions VALUES ('s3','tool','2026-10-27T08:00:00Z',0,NULL,NULL,'tool',0);"
+                   "INSERT INTO messages VALUES ('m1','s1','user','hello','2026-10-27T10:00:00Z');"
+                   "INSERT INTO messages VALUES ('m2','s1','assistant','hi','2026-10-27T10:01:00Z');"))
+    (.close db)
+    (testing "browse lists only visible sessions (hidden and tool rows filtered)"
+      (let [rows (tools/sessions-browse db-path 10)]
+        (is (= 1 (count rows)))
+        (is (= "s1" (get (first rows) "session_id")))
+        (is (= "one" (get (first rows) "title")))
+        (is (= 2 (get (first rows) "message_count")))))
+    (testing "show returns the session's messages oldest-first"
+      (let [rows (tools/session-latest-messages db-path "s1" 10)]
+        (is (= ["hello" "hi"] (map #(get % "content") rows)))
+        (is (= ["user" "assistant"] (map #(get % "role") rows)))))
+    (testing "an unknown session answers empty, not a guess"
+      (is (= [] (tools/session-latest-messages db-path "nope" 10))))
+    (testing "a missing state.db answers nil, not a crash"
+      (is (nil? (tools/sessions-browse (h/join dir "no.db") 10)))
+      (is (nil? (tools/session-latest-messages (h/join dir "no.db") "s1" 10))))))
