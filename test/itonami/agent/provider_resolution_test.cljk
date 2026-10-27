@@ -1,0 +1,49 @@
+(ns itonami.agent.provider-resolution-test
+  "The model/fallback display resolution — the sources must follow provider/chain
+  verbatim (job pin -> cron -> profile defaults)."
+  (:require [cljs.test :refer [deftest is testing]]
+            [itonami.agent.provider :as provider]))
+
+(deftest resolution-sources
+  (testing "profile defaults are the floor"
+    (let [r (provider/resolution {"model" {"default" "m1" "provider" "p1"}} {})]
+      (is (= "m1" (get-in r [:model :value])))
+      (is (= "model.default" (get-in r [:model :source])))
+      (is (= "p1" (get-in r [:provider :value])))
+      (is (= "model.provider" (get-in r [:provider :source])))
+      (is (false? (:pinned? r)))))
+  (testing "cron settings win over profile defaults"
+    (let [r (provider/resolution {"model" {"default" "m1" "provider" "p1"}
+                                  "cron" {"model" "m2" "model_provider" "p2"}} {})]
+      (is (= "m2" (get-in r [:model :value])))
+      (is (= "cron.model" (get-in r [:model :source])))
+      (is (= "p2" (get-in r [:provider :value])))
+      (is (= "cron.model_provider" (get-in r [:provider :source])))))
+  (testing "a job pin wins over everything"
+    (let [r (provider/resolution {"model" {"default" "m1" "provider" "p1"}
+                                  "cron" {"model" "m2"}}
+                                 {:model "m3" :provider "p3" :pinned? true})]
+      (is (= "m3" (get-in r [:model :value])))
+      (is (= "job pin" (get-in r [:model :source])))
+      (is (= "p3" (get-in r [:provider :value])))
+      (is (true? (:pinned? r)))))
+  (testing "nothing configured reports unset, not a guess"
+    (let [r (provider/resolution {} {})]
+      (is (= "unset" (get-in r [:model :source])))
+      (is (= "unset" (get-in r [:provider :source]))))))
+
+(deftest resolution-hops
+  (testing "the chain is primary first, then fallbacks"
+    (let [r (provider/resolution {"model" {"default" "m1" "provider" "p1"}
+                                  "fallback_providers" [{"provider" "p2" "model" "m2"}
+                                                        {"provider" "p3" "model" "m3"}]}
+                                 {})]
+      (is (= 3 (count (:hops r))))
+      (is (= {:provider "p1" :model "m1"} (first (:hops r))))
+      (is (= "p2" (get-in r [:hops 1 :provider])))
+      (is (= "p3" (get-in r [:hops 2 :provider])))))
+  (testing "a pinned run keeps only the primary"
+    (let [r (provider/resolution {"model" {"default" "m1" "provider" "p1"}
+                                  "fallback_providers" [{"provider" "p2" "model" "m2"}]}
+                                 {:model "m1" :provider "p1" :pinned? true})]
+      (is (= 1 (count (:hops r)))))))
