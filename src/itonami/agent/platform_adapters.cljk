@@ -141,6 +141,22 @@
 
 ;; ---------------------------------------------------------------- registry
 
+(def token-env-defaults
+  "The env var each lane's token comes from when delivery.<lane>.token_env does
+  not name one — shared by for-lane and `doctor`."
+  {"telegram" "TELEGRAM_BOT_TOKEN"
+   "slack" "SLACK_BOT_TOKEN"
+   "discord" "DISCORD_BOT_TOKEN"
+   "mattermost" nil
+   "matrix" "MATRIX_ACCESS_TOKEN"})
+
+(defn token-env-name
+  "The env var that carries this lane's token, or nil (a webhook lane has no
+  token)."
+  [lane config]
+  (let [c (get-in config ["delivery" lane])]
+    (or (get c "token_env") (get token-env-defaults lane))))
+
 (defn for-lane
   "The built-in adapter for a deliver lane, or nil when this lane has no
   configured platform. `config` is the profile's config.yaml map.
