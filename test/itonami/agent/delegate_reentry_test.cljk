@@ -19,14 +19,14 @@
     (with-redefs [loop/delegate-children saved-children
                   loop/delegate-delivered saved-delivered]
       (testing "the first call yields the finished child and marks it delivered"
-        (let [pending (loop/delegate-pending-results!)]
+        (let [pending (loop/delegate-pending-results! "")]
           (is (= 1 (count pending)))
           (is (= "kid1" (get (first pending) "subagent_id")))
           (is (= "done here" (get (first pending) "summary")))))
       (testing "the delivery is PERSISTED — a next run must not re-deliver"
         (let [rec (h/json-parse (h/slurp (loop/delegate-state-file)))]
           (is (contains? (set (get rec "delivered")) "kid1")))
-        (is (= [] (vec (loop/delegate-pending-results!))))))))
+        (is (= [] (vec (loop/delegate-pending-results! ""))))))))
 
 (deftest results-are-session-scoped
   ;; the R2 security gate: a delegated result belongs to the session that
@@ -41,6 +41,14 @@
       (is (= "for A" (get (first for-a) "summary")))
       ;; and neither session can pull the other's after delivery
       (is (= [] (vec (loop/delegate-pending-results! "sess-A")))))))
+
+(deftest the-session-key-is-asserted-not-assumed
+  ;; kbb/SCI binds missing args to nil — the requirement must be RUNTIME
+  ;; checked, not left to arity (the R4 gate)
+  (is (thrown-with-msg? js/Error #"requires a session key"
+                        (loop/delegate-pending-results! nil)))
+  (is (thrown-with-msg? js/Error #"requires a session key"
+                        (loop/delegate-pending-results! 42))))
 
 (deftest concurrent-writers-merge-under-the-lock
   ;; the R3 gate: persist MERGES with what is on disk — a concurrent
@@ -81,7 +89,7 @@
     ;; and with the atoms restored from disk, the re-entry happens
     (with-redefs [loop/delegate-children (atom (get (loop/load-delegate-state) "children"))
                   loop/delegate-delivered (atom (get (loop/load-delegate-state) "delivered"))]
-      (let [pending (loop/delegate-pending-results!)]
+      (let [pending (loop/delegate-pending-results! "")]
         (is (= 1 (count pending)))
         (is (= "kid2" (get (first pending) "subagent_id")))))
     ;; a corrupt registry never wedges startup

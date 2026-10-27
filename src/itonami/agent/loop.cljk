@@ -453,10 +453,13 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
   Session-scoped (the R2 security gate): a result belongs to the session
   that spawned its child and is never injected into another. Marked
   delivered."
-  ;; the session key is REQUIRED: a silent "" default would both leak
-  ;; across sessions and make a keyed caller's results look permanently
-  ;; lost (the R3 gate)
+  ;; the session key is REQUIRED — and the requirement is ASSERTED, not
+  ;; left to arity: kbb/SCI binds missing args to nil (verified), so a
+  ;; forgotten key would silently degrade to the leaky "" case (the R3/R4
+  ;; gate)
   ([session-key]
+   (when-not (string? session-key)
+     (throw (js/Error. "delegate-pending-results! requires a session key")))
    (let [sk (str session-key)
          pending (vec (for [[id c] @delegate-children
                             :when (and (not= "running" (get c "status"))
@@ -466,7 +469,7 @@ Use tools to act; do not describe a tool call instead of making it. Independent 
     (when (seq pending)
       (swap! delegate-delivered into (map #(get % "subagent_id") pending))
       (persist-delegate-state!))
-    pending)))
+pending)))
 
 (def delegate-ctl
   "subagent_id -> {:steer (atom [message]) :cancel (atom bool)}. steer queues
