@@ -16,7 +16,7 @@
   ([] (pause! nil))
   ([reason]
    (h/mkdirs (p2p/itonami-dir))
-   (h/spit (marker) (str (h/iso-local) (when-not (clojure.string/blank? (str reason)) (str " " reason)) "\n"))
+   (h/spit (marker) (str (h/iso-local) (when-not (str/blank? (str reason)) (str " " reason)) "\n"))
    true))
 
 (defn resume!
@@ -31,4 +31,4 @@
 (defn since
   "The pause record (timestamp + reason) when the stop is active, else nil."
   []
-  (when (h/file? (marker)) (clojure.string/trim (h/slurp (marker)))))
+  (when (h/file? (marker)) (str/trim (h/slurp (marker)))))

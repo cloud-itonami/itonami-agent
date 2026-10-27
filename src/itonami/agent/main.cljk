@@ -68,8 +68,11 @@
             ["node:readline" :as readline]
             ["node:crypto" :as crypto]))
 
-(defn- parse-args
-  "Hermes-style: -p/--profile anywhere, flags with values, the rest positional."
+(defn parse-args
+  "Hermes-style: -p/--profile anywhere, flags with values, the rest positional.
+  `--flag=value` carries the whole value. A following token is a VALUE when it
+  is not dash-prefixed or is a negative number — Telegram group chat ids are
+  exactly `-100123...` and must not be read as a boolean flag."
   [args]
   (loop [[a & more] args opts {} pos []]
     (cond
@@ -80,10 +83,15 @@
       (= "--provider" a) (recur (rest more) (assoc opts :provider (first more)) pos)
       (#{"-t" "--toolsets"} a) (recur (rest more) (assoc opts :toolsets (str/split (first more) #",")) pos)
       (str/starts-with? a "--")
-      (let [k (keyword (subs a 2))]
-        (if (or (nil? (first more)) (str/starts-with? (first more) "-"))
-          (recur more (assoc opts k true) pos)
-          (recur (rest more) (assoc opts k (first more)) pos)))
+      (if-let [eq (str/index-of a "=")]
+        (recur more (assoc opts (keyword (subs a 2 eq)) (subs a (inc eq))) pos)
+        (let [k (keyword (subs a 2))
+              v (first more)]
+          (if (or (nil? v)
+                  (and (str/starts-with? v "-")
+                       (not (re-matches #"-?\d+(\.\d+)?" v))))
+            (recur more (assoc opts k true) pos)
+            (recur (rest more) (assoc opts k v) pos))))
       :else (recur more opts (conj pos a)))))
 
 (defn- die [code msg] (binding [*print-fn* *print-err-fn*] (println msg)) (js/process.exit code))
@@ -1050,9 +1058,10 @@
   [_ _]
   (let [names (profile/names)
         pid-state (fn [f]
-                    (let [p (h/join (p2p/itonami-dir) f)]
-                      (if (and (h/file? p) (h/pid-alive? (str/trim (h/slurp p))))
-                        (str "running (pid " (str/trim (h/slurp p)) ")")
+                    (let [p (h/join (p2p/itonami-dir) f)
+          pid (when (h/file? p) (str/trim (h/slurp p)))]
+                      (if (and pid (h/pid-alive? pid))
+                        (str "running (pid " pid ")")
                         "not running")))]
     (println (str "paused: " (if (pause/active?) (pause/since) "no")))
     (println (str "profiles (" (count names) "):"))
@@ -1076,7 +1085,12 @@
         chat-id (or (:chat-id opts) (die 2 "send: --chat-id is required"))
         text (str/trim (str/join " " args))]
     (when (str/blank? text) (die 2 "send: message text is required"))
-    (p/let [prof (profile/load-profile (or (:profile opts) "default"))
+    (p/let [prof0 (profile/load-profile (or (:profile opts) "default"))
+            ;; an explicit --chat-id is the target even when the profile's
+            ;; delivery config does not pre-declare one
+            prof (update-in prof0 [:config "delivery" platform]
+                            (fn [c] (cond-> (or c {})
+                                      (str/blank? (str (get c "chat_id"))) (assoc "chat_id" (str chat-id)))))
             res (chat/send-reply! prof {"platform" platform
                                         "chat_id" (str chat-id)
                                         "thread_id" (str (or (:thread-id opts) ""))}
@@ -1087,11 +1101,17 @@
 
 (defn gateway-run [opts]
   (let [interval (* 1000 (js/parseInt (or (:interval opts) "60") 10))
+        paused-noticed (atom false)
         cycle (fn cycle []
                 (let [adopted (filter (fn [n] (= :itonami (get-in (try (profile/read-edn-file (h/join (profile/home n) "itonami.edn"))
                                                                          (catch :default _ nil))
                                                                        [:runtime :scheduler])))
                                       (profile/names))]
+                  (if (pause/active?)
+                    (when-not @paused-noticed
+                      (reset! paused-noticed true)
+                      (println (str (h/iso-local) " gateway: paused (" (pause/since) ") — dispatch stopped")))
+                    (reset! paused-noticed false))
                   ;; each profile ticks independently (its own cron/.itonami-tick.lock),
                   ;; so a long run in one profile never delays another's schedule
                   ;; secrets (keychain helper) are resolved only when a job is due
