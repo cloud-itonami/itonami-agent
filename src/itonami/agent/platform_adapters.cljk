@@ -74,7 +74,7 @@
 (defn discord-bot-request
   "The Discord bot-channel message request. Pure."
   [token channel-id text]
-  {:url (str "https://discord.com/api/channels/" channel-id "/messages")
+  {:url (str "https://discord.com/api/channels/" (js/encodeURIComponent (str channel-id)) "/messages")
    :headers {"Authorization" (str "Bot " token) "Content-Type" "application/json"}
    :body (h/json-str {"content" (str text)})})
 

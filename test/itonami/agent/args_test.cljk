@@ -30,6 +30,9 @@
     (is (false? (:force (first (main/parse-args ["--force=false"])))))
     (is (true? (:force (first (main/parse-args ["--force=true"])))))
     (is (true? (:force (first (main/parse-args ["--force"]))))))
+  (testing "named value flags take values verbatim — no true/false coercion"
+    (is (= "false" (:oneshot (first (main/parse-args ["-z" "false"])))))
+    (is (= "true" (:profile (first (main/parse-args ["-p" "true"]))))))
   (testing "short value flags accept negative values too"
     (let [[opts _] (main/parse-args ["-p" "-weird-profile" "-z" "go"])]
       (is (= "-weird-profile" (:profile opts)))

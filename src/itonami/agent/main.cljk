@@ -69,8 +69,10 @@
             ["node:crypto" :as crypto]))
 
 (defn- opt-value
-  "Value shaping shared by `--flag value` and `--flag=value`: toolsets split
-  on commas (both forms must agree), literal true/false become booleans."
+  "Shaping for GENERIC long flags (`--flag value` / `--flag=value`): toolsets
+  split on commas (both spellings must agree), literal true/false become
+  booleans for flag-like options. Named value flags (-p/-z/-m/--provider/-t)
+  bypass this — their values are arbitrary strings."
   [k v]
   (cond
     (= k :toolsets) (str/split (str v) #",")
@@ -87,11 +89,14 @@
   (loop [[a & more] args opts {} pos []]
     (cond
       (nil? a) [opts pos]
-      (#{"-p" "--profile"} a) (recur (rest more) (assoc opts :profile (opt-value :profile (first more))) pos)
-      (#{"-z" "--oneshot"} a) (recur (rest more) (assoc opts :oneshot (opt-value :oneshot (first more))) pos)
-      (#{"-m" "--model"} a) (recur (rest more) (assoc opts :model (opt-value :model (first more))) pos)
-      (= "--provider" a) (recur (rest more) (assoc opts :provider (opt-value :provider (first more))) pos)
-      (#{"-t" "--toolsets"} a) (recur (rest more) (assoc opts :toolsets (opt-value :toolsets (first more))) pos)
+      ;; value flags take their value verbatim — a prompt or a model name may
+      ;; be any string (`-z false` is the prompt "false"), so no flag
+      ;; coercion here; only --toolsets shapes (comma split)
+      (#{"-p" "--profile"} a) (recur (rest more) (assoc opts :profile (first more)) pos)
+      (#{"-z" "--oneshot"} a) (recur (rest more) (assoc opts :oneshot (first more)) pos)
+      (#{"-m" "--model"} a) (recur (rest more) (assoc opts :model (first more)) pos)
+      (= "--provider" a) (recur (rest more) (assoc opts :provider (first more)) pos)
+      (#{"-t" "--toolsets"} a) (recur (rest more) (assoc opts :toolsets (str/split (first more) #",")) pos)
       (str/starts-with? a "--")
       (if-let [eq (str/index-of a "=")]
         (let [k (keyword (subs a 2 eq))]
@@ -1087,7 +1092,9 @@
                       "  jobs=" (count (filter cron/active? jobs))))))
     (println (str "gateway (cron tick): " (pid-state "gateway.pid")))
     (println (str "gateway serve: " (pid-state "gateway-serve.pid")))
-    (println (str "peers: " (count (:trusted (p2p/read-peers))) " trusted"))))
+    (println (str "peers: " (try (count (:trusted (p2p/read-peers)))
+                                (catch :default _ "?"))
+                  " trusted"))))
 
 (defn send-cmd
   "Hermes `hermes send`: push one message to a configured platform chat,
