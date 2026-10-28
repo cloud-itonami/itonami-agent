@@ -159,3 +159,33 @@
                              (is (= "stop" (get-in r [:ok :finish-reason])))))
                    (p/catch (fn [e] (is false (str "unexpected: " (.-message e)))))
                    (p/finally (fn [] (.close srv) (done)))))))))
+
+(deftest sse-complete-tells-a-cut-stream-from-a-finished-one
+  (testing "finish_reason, [DONE] or an error chunk end a stream"
+    (is (provider/sse-complete? (reduce provider/sse-line (provider/sse-acc)
+                                        [(str "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}")])))
+    (is (provider/sse-complete? (reduce provider/sse-line (provider/sse-acc) ["data: [DONE]"])))
+    (is (provider/sse-complete? (reduce provider/sse-line (provider/sse-acc) ["data: {\"error\":{\"message\":\"x\"}}"]))))
+  (testing "reasoning that just stops is a fragment"
+    (is (not (provider/sse-complete? (reduce provider/sse-line (provider/sse-acc)
+                                             ["data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"hmm\"}}]}"]))))
+    (is (not (provider/sse-complete? (provider/sse-acc))))))
+
+(deftest complete-hop-reports-a-cut-stream-as-transport
+  (async done
+    (serve (fn [^js req ^js res]
+             (.on req "data" (fn [_]))
+             (.on req "end"
+                  (fn []
+                    (.writeHead res 200 #js {"content-type" "text/event-stream"})
+                    (.end res "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n"))))
+           (fn [^js srv port]
+             (let [hop {:provider "murakumo" :model "m" :stream? true
+                        :base-url (str "http://127.0.0.1:" port "/v1") :timeout-s 20}]
+               (-> (provider/complete-hop hop {} {:messages [{"role" "user" "content" "hi"}]})
+                   (p/then (fn [r]
+                             (is (nil? (:ok r)))
+                             (is (str/starts-with? (str (get-in r [:err :error])) "transport: stream ended"))
+                             (is (true? (boolean (re-find #"(?i)transport" (str (get-in r [:err :error]))))))))
+                   (p/catch (fn [e] (is false (str "unexpected: " (.-message e)))))
+                   (p/finally (fn [] (.close srv) (done)))))))))

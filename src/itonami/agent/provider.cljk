@@ -197,7 +197,7 @@
 ;; {"choices" [{"message" ...}] "model" .. "usage" ..}, so complete-hop below
 ;; (tool calls, empty/error bodies, retry classification) is the same for both.
 
-(defn sse-acc [] {:seen? false :content "" :reasoning "" :tools (sorted-map)
+(defn sse-acc [] {:seen? false :done? false :content "" :reasoning "" :tools (sorted-map)
                   :finish nil :model nil :usage nil :error nil})
 
 (defn- timings->usage [t]
@@ -241,10 +241,19 @@
     (if-not (str/starts-with? line "data:")
       acc
       (let [payload (str/trim (subs line 5))]
-        (if (or (str/blank? payload) (= payload "[DONE]"))
-          acc
+        (cond
+          (str/blank? payload) acc
+          (= payload "[DONE]") (assoc acc :done? true)
+          :else
           (let [chunk (try (h/json-parse payload) (catch :default _ nil))]
             (if (map? chunk) (sse-apply acc chunk) acc)))))))
+
+(defn sse-complete?
+  "Did the stream end the way a server ends one: a finish_reason, `[DONE]`, or an
+  error chunk? A connection that just stops (gateway cut, reset) has none of
+  these, and what was read is a fragment, not a reply."
+  [{:keys [done? finish error]}]
+  (boolean (or done? finish error)))
 
 (defn sse-finish
   "The accumulator as a one-shot chat-completion body."
@@ -311,7 +320,11 @@
                            (str/includes? (str (.get (.-headers r) "content-type")) "text/event-stream"))
                     (p/let [_ (read-sse-lines (.getReader (.-body r)) (js/TextDecoder.)
                                               (fn [line] (swap! acc sse-line line)))]
-                      {:status (.-status r) :text (h/json-str (sse-finish @acc))})
+                      (if (sse-complete? @acc)
+                        {:status (.-status r) :text (h/json-str (sse-finish @acc))}
+                        ;; complete-hop reports this as "transport: ...", which
+                        ;; the retry chain treats as retryable
+                        (throw (js/Error. "stream ended before finish_reason or [DONE]"))))
                     (p/let [txt (.text r)] {:status (.-status r) :text txt}))))
         (p/finally (fn [] (js/clearTimeout t))))))
 
