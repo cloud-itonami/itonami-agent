@@ -29,6 +29,20 @@
   {"HTTP-Referer" "https://itonami.cloud"
    "X-Title" "Itonami By KotobaLabs"})
 
+(defn stream-hop?
+  "Whether a hop asks for `stream: true` (SSE). Config wins: models.<m>.stream,
+  then providers.<p>.stream, so a rail that cannot stream is switched off
+  explicitly. Unset, only the murakumo rail streams: its non-streaming reply
+  sends no header until the whole generation (reasoning included) is done, and
+  Node's fetch drops a connection that has no response header after 300 s
+  (UND_ERR_HEADERS_TIMEOUT), whatever request_timeout_seconds says. A stream
+  answers at once and keeps the connection alive with comment lines."
+  [provider pc mc]
+  (let [m (get mc "stream") r (get pc "stream")]
+    (cond (some? m) (boolean m)
+          (some? r) (boolean r)
+          :else (= provider "murakumo"))))
+
 (defn resolve-hop
   "One {provider model base_url key_env} entry -> a callable hop."
   [config {:strs [provider model base_url key_env]}]
@@ -47,7 +61,8 @@
      :headers (merge default-headers (get pc "extra_headers"))
      :extra-body (get pc "extra_body")
      :timeout-s (or (get mc "timeout_seconds") (get pc "request_timeout_seconds") 900)
-     :timeout-explicit? (boolean (or (get mc "timeout_seconds") (get pc "request_timeout_seconds")))}))
+     :timeout-explicit? (boolean (or (get mc "timeout_seconds") (get pc "request_timeout_seconds")))
+     :stream? (stream-hop? provider pc mc)}))
 
 (defn chain
   "The ordered hops for a run. opts: {:model :provider :pinned?} from a job or
@@ -177,6 +192,129 @@
         (p/then (fn [^js r] (p/let [txt (.text r)] {:status (.-status r) :text txt})))
         (p/finally (fn [] (js/clearTimeout t))))))
 
+;; ---- streaming (SSE) -------------------------------------------------------
+;; A stream is folded back into the one-shot response shape
+;; {"choices" [{"message" ...}] "model" .. "usage" ..}, so complete-hop below
+;; (tool calls, empty/error bodies, retry classification) is the same for both.
+
+(defn sse-acc [] {:seen? false :content "" :reasoning "" :tools (sorted-map)
+                  :finish nil :model nil :usage nil :error nil})
+
+(defn- timings->usage [t]
+  (let [pn (get t "prompt_n") cn (get t "predicted_n")]
+    (when (or pn cn)
+      {"prompt_tokens" (or pn 0) "completion_tokens" (or cn 0) "total_tokens" (+ (or pn 0) (or cn 0))})))
+
+(defn- apply-tool-delta [acc tc]
+  (let [i (or (get tc "index") 0)
+        f (get tc "function")]
+    (update-in acc [:tools i]
+               (fn [t]
+                 (let [t (or t {:id nil :name "" :args ""})]
+                   (cond-> t
+                     (get tc "id") (assoc :id (get tc "id"))
+                     (string? (get f "name")) (update :name str (get f "name"))
+                     (string? (get f "arguments")) (update :args str (get f "arguments"))))))))
+
+(defn sse-apply
+  "Fold one parsed stream chunk (string-keyed map) into the accumulator."
+  [acc chunk]
+  (let [choice (first (get chunk "choices"))
+        delta (get choice "delta")
+        acc (cond-> acc
+              (get chunk "error") (assoc :error (get chunk "error"))
+              (get chunk "model") (assoc :model (get chunk "model"))
+              (get chunk "usage") (assoc :usage (get chunk "usage"))
+              (and (nil? (get chunk "usage")) (get chunk "timings"))
+              (assoc :usage (timings->usage (get chunk "timings")))
+              choice (assoc :seen? true)
+              (get choice "finish_reason") (assoc :finish (get choice "finish_reason"))
+              (string? (get delta "content")) (update :content str (get delta "content"))
+              (string? (get delta "reasoning_content")) (update :reasoning str (get delta "reasoning_content")))]
+    (reduce apply-tool-delta acc (get delta "tool_calls"))))
+
+(defn sse-line
+  "Fold one raw SSE line. Comment lines (keep-alives), blank lines, `[DONE]`
+  and malformed JSON leave the accumulator alone."
+  [acc line]
+  (let [line (str/replace (str line) #"\r$" "")]
+    (if-not (str/starts-with? line "data:")
+      acc
+      (let [payload (str/trim (subs line 5))]
+        (if (or (str/blank? payload) (= payload "[DONE]"))
+          acc
+          (let [chunk (try (h/json-parse payload) (catch :default _ nil))]
+            (if (map? chunk) (sse-apply acc chunk) acc)))))))
+
+(defn sse-finish
+  "The accumulator as a one-shot chat-completion body."
+  [{:keys [seen? content reasoning tools finish model usage error]}]
+  (cond
+    error {"error" error}
+    (not seen?) {"choices" []}
+    :else
+    {"choices" [{"index" 0
+                 "finish_reason" finish
+                 "message" (cond-> {"role" "assistant"
+                                    "content" (when-not (str/blank? content) content)}
+                             (not (str/blank? reasoning)) (assoc "reasoning_content" reasoning)
+                             (seq tools) (assoc "tool_calls"
+                                                (mapv (fn [[_ {:keys [id name args]}]]
+                                                        {"id" id "type" "function"
+                                                         "function" {"name" name "arguments" args}})
+                                                      tools)))}]
+     "model" model
+     "usage" usage}))
+
+(defn sse-parse-text
+  "A whole SSE body -> one-shot body map (what the network path builds incrementally)."
+  [text]
+  (sse-finish (reduce sse-line (sse-acc) (str/split (str text) #"\n" -1))))
+
+(defn- read-sse-lines
+  "Feed each complete line of a fetch body to (on-line line); resolves when it ends.
+  A native-Promise callback loop, not a recursive p/then chain: a long reply is
+  thousands of chunks, and a chain that deep overflows the stack when it resolves."
+  [^js reader ^js decoder on-line]
+  (js/Promise.
+   (fn [resolve reject]
+     (let [buf (atom "")
+           step (fn step []
+                  (.then (.read reader)
+                         (fn [^js r]
+                           (try
+                             (if (.-done r)
+                               (do (when-not (str/blank? @buf) (on-line @buf))
+                                   (resolve nil))
+                               (let [s (str @buf (.decode decoder (.-value r) #js {:stream true}))
+                                     parts (str/split s #"\n" -1)]
+                                 (run! on-line (butlast parts))
+                                 (reset! buf (last parts))
+                                 (step)))
+                             (catch :default e (reject e))))
+                         (fn [e] (reject e))))]
+       (step)))))
+
+(defn- fetch-sse
+  "Like fetch-json, with `stream: true` already in the body. Resolves to the
+  same {:status :text}, where :text is the folded one-shot body. A non-2xx reply
+  or one that is not text/event-stream (a server that ignored `stream`) is
+  returned as plain text, exactly as fetch-json would."
+  [url {:keys [headers body timeout-s]}]
+  (let [ctrl (js/AbortController.)
+        t (js/setTimeout #(.abort ctrl) (* 1000 timeout-s))
+        acc (atom (sse-acc))]
+    (-> (js/fetch url (clj->js {:method "POST" :headers (assoc headers "Accept" "text/event-stream")
+                                :body body :signal (.-signal ctrl)}))
+        (p/then (fn [^js r]
+                  (if (and (<= 200 (.-status r) 299)
+                           (str/includes? (str (.get (.-headers r) "content-type")) "text/event-stream"))
+                    (p/let [_ (read-sse-lines (.getReader (.-body r)) (js/TextDecoder.)
+                                              (fn [line] (swap! acc sse-line line)))]
+                      {:status (.-status r) :text (h/json-str (sse-finish @acc))})
+                    (p/let [txt (.text r)] {:status (.-status r) :text txt}))))
+        (p/finally (fn [] (js/clearTimeout t))))))
+
 (defn- hop-error [hop status msg]
   {:provider (:provider hop) :model (:model hop) :status status :error (subs (str msg) 0 (min 400 (count (str msg))))})
 
@@ -191,9 +329,10 @@
           body (cond-> (merge (:extra-body hop) {"model" (:model hop) "messages" messages})
                  (seq tools) (assoc "tools" tools)
                  reasoning-effort (assoc "reasoning_effort" reasoning-effort)
-                 max-tokens (assoc "max_tokens" max-tokens))]
-      (-> (fetch-json (str (:base-url hop) "/chat/completions")
-                      {:headers headers :body (h/json-str body) :timeout-s (:timeout-s hop)})
+                 max-tokens (assoc "max_tokens" max-tokens)
+                 (:stream? hop) (assoc "stream" true))]
+      (-> ((if (:stream? hop) fetch-sse fetch-json) (str (:base-url hop) "/chat/completions")
+           {:headers headers :body (h/json-str body) :timeout-s (:timeout-s hop)})
           (p/then (fn [{:keys [status text]}]
                     (let [j (try (h/json-parse text) (catch :default _ nil))
                           choice (first (get j "choices"))
