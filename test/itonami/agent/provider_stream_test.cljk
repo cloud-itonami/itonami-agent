@@ -1,0 +1,161 @@
+(ns itonami.agent.provider-stream-test
+  "Streaming (SSE) chat completions: the stream is folded back into the one-shot
+  body, so everything after the fetch (tool calls, empty replies, retries) stays
+  the same. Node's fetch cuts a reply that sends no header for 300 s, which a
+  non-streaming reasoning model can hit; a stream answers at once."
+  (:require [cljs.test :refer [deftest is testing async]]
+            [clojure.string :as str]
+            ["node:http" :as http]
+            [promesa.core :as p]
+            [itonami.agent.provider :as provider]))
+
+(defn- sse [& lines] (str (str/join "\n\n" lines) "\n\n"))
+
+(def body-with-tool-call
+  (sse "data: {\"id\":\"x\",\"object\":\"chat.completion.chunk\",\"model\":\"mishima\",\"choices\":[]}"
+       ":"
+       ":"
+       "data: {\"choices\":[{\"finish_reason\":null,\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null}}]}"
+       "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think \"}}]}"
+       "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"more\"}}]}"
+       "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"terminal\",\"arguments\":\"{\\\"command\\\"\"}}]}}]}"
+       "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"ls\\\"}\"}}]}}]}"
+       "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"tool_calls\",\"delta\":{}}],\"model\":\"mishima\",\"timings\":{\"prompt_n\":10,\"predicted_n\":5}}"
+       "data: [DONE]"))
+
+(deftest sse-folds-to-a-one-shot-body
+  (testing "tool-call arguments arrive in pieces and are joined per index"
+    (let [j (provider/sse-parse-text body-with-tool-call)
+          choice (first (get j "choices"))
+          msg (get choice "message")]
+      (is (= "tool_calls" (get choice "finish_reason")))
+      (is (nil? (get msg "content")))
+      (is (= "think more" (get msg "reasoning_content")))
+      (is (= [{"id" "call_1" "type" "function"
+               "function" {"name" "terminal" "arguments" "{\"command\":\"ls\"}"}}]
+             (get msg "tool_calls")))
+      (is (= "mishima" (get j "model")))))
+  (testing "usage falls back to the server's timings"
+    (is (= {"prompt_tokens" 10 "completion_tokens" 5 "total_tokens" 15}
+           (get (provider/sse-parse-text body-with-tool-call) "usage"))))
+  (testing "a usage block wins over timings"
+    (let [t (sse "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}"
+                 "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3},\"timings\":{\"prompt_n\":9,\"predicted_n\":9}}")]
+      (is (= 3 (get-in (provider/sse-parse-text t) ["usage" "total_tokens"])))))
+  (testing "plain content, CRLF line ends"
+    (let [t (str/replace (sse "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}"
+                              "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}"
+                              "data: [DONE]")
+                         "\n" "\r\n")]
+      (is (= "Hello" (get-in (provider/sse-parse-text t) ["choices" 0 "message" "content"])))))
+  (testing "malformed data lines and keep-alives are skipped"
+    (let [t (sse ": ping" "data: {not json" "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}")]
+      (is (= "ok" (get-in (provider/sse-parse-text t) ["choices" 0 "message" "content"])))))
+  (testing "an error chunk becomes an error body"
+    (let [t (sse "data: {\"error\":{\"message\":\"overloaded\"}}")]
+      (is (= "overloaded" (get-in (provider/sse-parse-text t) ["error" "message"])))))
+  (testing "an empty stream has no choices"
+    (is (= {"choices" []} (provider/sse-parse-text (sse ": ping" "data: [DONE]"))))))
+
+(deftest stream-hop-defaults
+  (testing "murakumo streams unless config says otherwise"
+    (is (true? (provider/stream-hop? "murakumo" nil nil)))
+    (is (false? (provider/stream-hop? "murakumo" {"stream" false} nil)))
+    (is (false? (provider/stream-hop? "murakumo" {"stream" true} {"stream" false}))))
+  (testing "other rails stay one-shot unless config opts in"
+    (is (false? (provider/stream-hop? "openrouter" nil nil)))
+    (is (false? (provider/stream-hop? "itonami-p2p" nil nil)))
+    (is (true? (provider/stream-hop? "openrouter" {"stream" true} nil)))
+    (is (true? (provider/stream-hop? "openrouter" nil {"stream" true}))))
+  (testing "resolve-hop carries the flag"
+    (is (true? (:stream? (provider/resolve-hop {} {"provider" "murakumo" "model" "m"}))))
+    (is (false? (:stream? (provider/resolve-hop {} {"provider" "openrouter" "model" "m"}))))))
+
+(defn- serve [handler cb]
+  (let [srv (.createServer http handler)]
+    (.listen srv 0 "127.0.0.1" (fn [] (cb srv (.-port (.address srv)))))))
+
+(deftest complete-hop-streams-over-http
+  (async done
+    (let [seen (atom nil)]
+      (serve (fn [^js req ^js res]
+               (let [chunks (atom "")]
+                 (.on req "data" (fn [c] (swap! chunks str c)))
+                 (.on req "end"
+                      (fn []
+                        (reset! seen {:accept (aget (.-headers req) "accept")
+                                      :body (js->clj (js/JSON.parse @chunks))})
+                        (.writeHead res 200 #js {"content-type" "text/event-stream"})
+                        (.write res ": keep-alive\n\n")
+                        (js/setTimeout
+                         (fn [] (.end res body-with-tool-call))
+                         50)))))
+             (fn [^js srv port]
+               (let [hop {:provider "murakumo" :model "mishima" :stream? true
+                          :base-url (str "http://127.0.0.1:" port "/v1") :timeout-s 20}]
+                 (-> (provider/complete-hop hop {} {:messages [{"role" "user" "content" "hi"}]})
+                     (p/then (fn [r]
+                               (is (true? (get-in @seen [:body "stream"])))
+                               (is (= "text/event-stream" (:accept @seen)))
+                               (is (= "terminal" (get-in r [:ok :message "tool_calls" 0 "function" "name"])))
+                               (is (= "tool_calls" (get-in r [:ok :finish-reason])))
+                               (is (= "mishima" (get-in r [:ok :model])))))
+                     (p/catch (fn [e] (is false (str "unexpected: " (.-message e)))))
+                     (p/finally (fn [] (.close srv) (done))))))))))
+
+(deftest complete-hop-one-shot-is-unchanged
+  (async done
+    (let [seen (atom nil)]
+      (serve (fn [^js req ^js res]
+               (let [chunks (atom "")]
+                 (.on req "data" (fn [c] (swap! chunks str c)))
+                 (.on req "end"
+                      (fn []
+                        (reset! seen (js->clj (js/JSON.parse @chunks)))
+                        (.writeHead res 200 #js {"content-type" "application/json"})
+                        (.end res "{\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}],\"model\":\"m\"}")))))
+             (fn [^js srv port]
+               (let [hop {:provider "openrouter" :model "m" :stream? false
+                          :base-url (str "http://127.0.0.1:" port "/v1") :timeout-s 20}]
+                 (-> (provider/complete-hop hop {} {:messages [{"role" "user" "content" "hi"}]})
+                     (p/then (fn [r]
+                               (is (not (contains? @seen "stream")))
+                               (is (= "ok" (get-in r [:ok :message "content"])))))
+                     (p/catch (fn [e] (is false (str "unexpected: " (.-message e)))))
+                     (p/finally (fn [] (.close srv) (done))))))))))
+
+(deftest complete-hop-streaming-falls-back-when-server-ignores-stream
+  (async done
+    (serve (fn [^js req ^js res]
+             (.on req "data" (fn [_]))
+             (.on req "end"
+                  (fn []
+                    (.writeHead res 200 #js {"content-type" "application/json"})
+                    (.end res "{\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"plain\"}}]}"))))
+           (fn [^js srv port]
+             (let [hop {:provider "murakumo" :model "m" :stream? true
+                        :base-url (str "http://127.0.0.1:" port "/v1") :timeout-s 20}]
+               (-> (provider/complete-hop hop {} {:messages [{"role" "user" "content" "hi"}]})
+                   (p/then (fn [r] (is (= "plain" (get-in r [:ok :message "content"])))))
+                   (p/catch (fn [e] (is false (str "unexpected: " (.-message e)))))
+                   (p/finally (fn [] (.close srv) (done)))))))))
+
+(deftest complete-hop-streams-a-long-reply
+  (async done
+    (serve (fn [^js req ^js res]
+             (.on req "data" (fn [_]))
+             (.on req "end"
+                  (fn []
+                    (.writeHead res 200 #js {"content-type" "text/event-stream"})
+                    (dotimes [i 6000]
+                      (.write res (str ": ka\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}]}\n\n")))
+                    (.end res "data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{}}]}\n\ndata: [DONE]\n\n"))))
+           (fn [^js srv port]
+             (let [hop {:provider "murakumo" :model "m" :stream? true
+                        :base-url (str "http://127.0.0.1:" port "/v1") :timeout-s 30}]
+               (-> (provider/complete-hop hop {} {:messages [{"role" "user" "content" "hi"}]})
+                   (p/then (fn [r]
+                             (is (= 6000 (count (get-in r [:ok :message "content"]))))
+                             (is (= "stop" (get-in r [:ok :finish-reason])))))
+                   (p/catch (fn [e] (is false (str "unexpected: " (.-message e)))))
+                   (p/finally (fn [] (.close srv) (done)))))))))
