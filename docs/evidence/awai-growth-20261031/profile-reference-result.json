@@ -1,0 +1,110 @@
+{
+  "schema": "awai.growth.compatibility-oracle.v1",
+  "results": [
+    {
+      "negative-controls": true,
+      "count-ok": true,
+      "check": {
+        "profile": "awai-growth-steward",
+        "problems": [],
+        "drift": []
+      },
+      "exposed-tools": [],
+      "no-jobs": true,
+      "policy-ok": true,
+      "ok": true,
+      "bundle-count": 8,
+      "profile": "awai-growth-steward"
+    },
+    {
+      "negative-controls": true,
+      "count-ok": true,
+      "check": {
+        "profile": "awai-growth-marketing",
+        "problems": [],
+        "drift": []
+      },
+      "exposed-tools": [],
+      "no-jobs": true,
+      "policy-ok": true,
+      "ok": true,
+      "bundle-count": 8,
+      "profile": "awai-growth-marketing"
+    },
+    {
+      "negative-controls": true,
+      "count-ok": true,
+      "check": {
+        "profile": "awai-growth-sales",
+        "problems": [],
+        "drift": []
+      },
+      "exposed-tools": [],
+      "no-jobs": true,
+      "policy-ok": true,
+      "ok": true,
+      "bundle-count": 8,
+      "profile": "awai-growth-sales"
+    },
+    {
+      "negative-controls": true,
+      "count-ok": true,
+      "check": {
+        "profile": "awai-growth-murakumo-adoption",
+        "problems": [],
+        "drift": []
+      },
+      "exposed-tools": [],
+      "no-jobs": true,
+      "policy-ok": true,
+      "ok": true,
+      "bundle-count": 8,
+      "profile": "awai-growth-murakumo-adoption"
+    },
+    {
+      "negative-controls": true,
+      "count-ok": true,
+      "check": {
+        "profile": "awai-growth-yataverse-adoption",
+        "problems": [],
+        "drift": []
+      },
+      "exposed-tools": [],
+      "no-jobs": true,
+      "policy-ok": true,
+      "ok": true,
+      "bundle-count": 8,
+      "profile": "awai-growth-yataverse-adoption"
+    },
+    {
+      "negative-controls": true,
+      "count-ok": true,
+      "check": {
+        "profile": "awai-growth-node-operations",
+        "problems": [],
+        "drift": []
+      },
+      "exposed-tools": [],
+      "no-jobs": true,
+      "policy-ok": true,
+      "ok": true,
+      "bundle-count": 8,
+      "profile": "awai-growth-node-operations"
+    },
+    {
+      "negative-controls": true,
+      "count-ok": true,
+      "check": {
+        "profile": "awai-growth-economy",
+        "problems": [],
+        "drift": []
+      },
+      "exposed-tools": [],
+      "no-jobs": true,
+      "policy-ok": true,
+      "ok": true,
+      "bundle-count": 8,
+      "profile": "awai-growth-economy"
+    }
+  ]
+}

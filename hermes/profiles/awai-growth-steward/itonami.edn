@@ -1,0 +1,33 @@
+{:itonami/schema "cloud.itonami.profile.v2"
+ :profile/id "awai-growth-steward"
+ :profile/description "Coordinate the demand-to-outcome loop"
+ :profile/hermes-compatible true
+ :agent/kind :steward
+ :org/world :awai :org/path [:etzhayyim :awai :cloud-itonami]
+ :org/github "kotoba-lang" :org/unit :awai-growth :awai/business :awai-network
+ :invocation :on-demand
+ :runtime {:engine :itonami-agent :scheduler :itonami}
+ :placement {:mode :local :order [:local] :inference-rail :murakumo}
+ :inference {:rails [:murakumo] :authorities ["api.murakumo.cloud"] :deny-hosts ["openrouter.ai"]}
+ :state {:workspace :host-local :results :cid-receipts :secrets :never-leave-host}
+ :ids {:repo "kotoba-lang/itonami-agent" :yakuwari/id "awai-growth-steward"}
+ :authority {:default-decision :blocked :source :yakuwari :ref "yakuwari.edn"}
+ :bundle {:cid "bafkreiajzu2lbwv6d4hkj6mlx7sk2gsvyachrquccuow5ya65rr4o62wcu" :files 8 :skills [] :dirs ["tasks" "policy"]}
+ :capabilities [{:capability :read_source :decision :autonomous :note "Only operator-supplied public source snapshots; no credentials or network access"}
+  {:capability :review_source :decision :autonomous :note "Evidence review only; no approval minting"}
+  {:capability :draft_artifact :decision :autonomous :note "Own host-local workspace only; draft is not publication"}
+  {:capability :record_local_receipt :decision :autonomous :note "Own job evidence only; no paid-work or settlement claim"}
+  {:capability :delegate_task :decision :blocked}
+  {:capability :external_messaging :decision :blocked}
+  {:capability :publish :decision :blocked}
+  {:capability :spend :decision :blocked}
+  {:capability :transfer_funds :decision :blocked}
+  {:capability :storage_upload :decision :blocked}
+  {:capability :delete_data :decision :blocked}
+  {:capability :manage_services :decision :blocked}
+  {:capability :git_push :decision :blocked}
+  {:capability :git_merge :decision :blocked}
+  {:capability :use_signing_identity :decision :blocked}
+  {:capability :export_private_keys :decision :blocked}
+  {:capability :enable_cron :decision :blocked}]
+ :cron? false}
