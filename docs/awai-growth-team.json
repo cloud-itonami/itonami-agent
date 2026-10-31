@@ -1,0 +1,113 @@
+{
+  "schema": "awai.growth.team.v1",
+  "trackingIssue": "AWAI-130",
+  "members": [
+    {
+      "profile": "awai-growth-steward",
+      "role": "steward",
+      "issue": "AWAI-130",
+      "sourceDirectory": "hermes/profiles/awai-growth-steward",
+      "targets": [
+        "murakumo",
+        "yataverse"
+      ],
+      "firstJob": "tasks/first-turn.md",
+      "bundleCid": "bafkreiajzu2lbwv6d4hkj6mlx7sk2gsvyachrquccuow5ya65rr4o62wcu",
+      "launchMode": "on-demand",
+      "activation": "blocked-native-profile-host-unverified",
+      "scheduleEnabled": false
+    },
+    {
+      "profile": "awai-growth-marketing",
+      "role": "marketing",
+      "issue": "AWAI-128",
+      "sourceDirectory": "hermes/profiles/awai-growth-marketing",
+      "targets": [
+        "murakumo",
+        "yataverse"
+      ],
+      "firstJob": "tasks/first-turn.md",
+      "bundleCid": "bafkreihtgaqlgf2egn4eid7swkk4rurgniahgnmeevhfbe3fetzw36dpty",
+      "launchMode": "on-demand",
+      "activation": "blocked-native-profile-host-unverified",
+      "scheduleEnabled": false
+    },
+    {
+      "profile": "awai-growth-sales",
+      "role": "sales",
+      "issue": "AWAI-129",
+      "sourceDirectory": "hermes/profiles/awai-growth-sales",
+      "targets": [
+        "murakumo",
+        "yataverse"
+      ],
+      "firstJob": "tasks/first-turn.md",
+      "bundleCid": "bafkreiadrk6ntpwgu4lc7ghdac2m4tc4oq2l5v3sdprnrbkdmuxy62kyuy",
+      "launchMode": "on-demand",
+      "activation": "blocked-native-profile-host-unverified",
+      "scheduleEnabled": false
+    },
+    {
+      "profile": "awai-growth-murakumo-adoption",
+      "role": "murakumo-adoption",
+      "issue": "AWAI-130",
+      "sourceDirectory": "hermes/profiles/awai-growth-murakumo-adoption",
+      "targets": [
+        "murakumo",
+        "yataverse"
+      ],
+      "firstJob": "tasks/first-turn.md",
+      "bundleCid": "bafkreiftqijvfd7pm4v4p6e6cpc5bbt3ukwmem62ralzy33qtpx3jvc2xq",
+      "launchMode": "on-demand",
+      "activation": "blocked-native-profile-host-unverified",
+      "scheduleEnabled": false
+    },
+    {
+      "profile": "awai-growth-yataverse-adoption",
+      "role": "yataverse-adoption",
+      "issue": "AWAI-130",
+      "sourceDirectory": "hermes/profiles/awai-growth-yataverse-adoption",
+      "targets": [
+        "murakumo",
+        "yataverse"
+      ],
+      "firstJob": "tasks/first-turn.md",
+      "bundleCid": "bafkreidm2csbab3pkju3wl5vrityruvyy7lnfpmgdfulatc3kahx5wd2oi",
+      "launchMode": "on-demand",
+      "activation": "blocked-native-profile-host-unverified",
+      "scheduleEnabled": false
+    },
+    {
+      "profile": "awai-growth-node-operations",
+      "role": "node-operations",
+      "issue": "AWAI-124",
+      "sourceDirectory": "hermes/profiles/awai-growth-node-operations",
+      "targets": [
+        "murakumo",
+        "yataverse"
+      ],
+      "firstJob": "tasks/first-turn.md",
+      "bundleCid": "bafkreiedqt2x5qeu45lbmxbv4mai7xbihhtvdi46zyxllohqgremfcw5pe",
+      "launchMode": "on-demand",
+      "activation": "blocked-native-profile-host-unverified",
+      "scheduleEnabled": false
+    },
+    {
+      "profile": "awai-growth-economy",
+      "role": "economy",
+      "issue": "AWAI-130",
+      "sourceDirectory": "hermes/profiles/awai-growth-economy",
+      "targets": [
+        "murakumo",
+        "yataverse"
+      ],
+      "firstJob": "tasks/first-turn.md",
+      "bundleCid": "bafkreiee2jllbl34t7icpd27drokwddpsas2ij3wbzqf5i4j4dy72wjxde",
+      "launchMode": "on-demand",
+      "activation": "blocked-native-profile-host-unverified",
+      "scheduleEnabled": false
+    }
+  ],
+  "authority": "Index only; no grants, deployment or scheduling",
+  "sourceRepository": "cloud-itonami/itonami-agent"
+}

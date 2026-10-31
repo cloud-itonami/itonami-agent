@@ -1,0 +1,37 @@
+{
+  "schema": "awai.growth.product-inventory.v1",
+  "observedOn": "2026-10-31",
+  "status": "source-inventory-only",
+  "runtimeQualified": false,
+  "targets": [
+    {
+      "id": "murakumo",
+      "role": "Itonami dapp target; inference/compute is a separate service role",
+      "source": {
+        "repo": "network-awai/cloud-murakumo",
+        "revision": "71820affc1d834cb57aea034387f9808ad2013bf"
+      },
+      "implementationOwner": "kotoba-lang/murakumo",
+      "firstOutcome": "A requested non-sensitive inference task accepted against a fixed quality and resource protocol",
+      "unknown": [
+        "current browser release and canonical broker builder provenance",
+        "native host admission and inference execution",
+        "current live endpoints and model digest"
+      ]
+    },
+    {
+      "id": "yataverse",
+      "role": "Itonami dapp target; verified bytes and custody are separate service roles",
+      "source": {
+        "repo": "kotoba-lang/yataverse",
+        "revision": "c875a39db9a2ddd79c9666284673696ae02fd9b9"
+      },
+      "firstOutcome": "An approved artifact write followed by independent CID-verified retrieval and a retention/restore check",
+      "unknown": [
+        "browser dapp release and broker integration",
+        "native replacement of the observed Node CLI",
+        "current live storage and independent durability"
+      ]
+    }
+  ]
+}

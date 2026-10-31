@@ -1,0 +1,21 @@
+{
+  "schema": "awai.growth.policy-generation.v1",
+  "date": "2026-10-31",
+  "mode": "native-check-compile-run",
+  "profileHostVerified": false,
+  "downloads": [],
+  "artifacts": {
+    "source": {
+      "bytes": 1360,
+      "sha256": "7304bea1aad1a66221eb53cd44c3f32c4c898e655082436212044115f822d9bf"
+    },
+    "nativeImage": {
+      "bytes": 51072,
+      "sha256": "811a74e73b5f3cccccf8f887d9e38cdc6d5791e4f11758e6a6fff1b998947faa"
+    },
+    "generatedPolicy": {
+      "bytes": 1214,
+      "sha256": "aaa089dacfa69a8e4070fdde3c56c4a607510a5002e91a491556352d97f25eb6"
+    }
+  }
+}

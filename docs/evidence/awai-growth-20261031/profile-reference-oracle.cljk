@@ -1,0 +1,33 @@
+;; One-off developer compatibility oracle, 2026-10-31. Not a gate/runtime.
+(ns awai-growth-profile-oracle
+  (:require [itonami.agent.profile :as profile]
+            [itonami.agent.host :as h]
+            [itonami.agent.tools :as tools]
+            [clojure.string :as str]))
+(def repo (or (h/env "AWAI_PROFILE_SOURCE") (js/process.cwd)))
+(def members (get (h/json-parse (h/slurp (h/join repo "docs/awai-growth-team.json"))) "members"))
+(def results
+  (mapv (fn [entry]
+    (let [name (get entry "profile")
+          prof (profile/load-profile* (h/join repo (get entry "sourceDirectory")) name {:secrets? false})
+          check (profile/check prof)
+          actual (profile/bundle-files (:home prof) {:dirs ["tasks" "policy"]})
+          policy (profile/read-edn-file (h/join (:home prof) "yakuwari.edn"))
+          declared (get-in prof [:itonami :capabilities])
+          deny (tools/execution-disabled-toolsets (:config prof) "cli")
+          exposed (tools/runtime-tool-names ["hermes-cli" "file" "terminal" "delegation" "cronjob"] deny true true true)
+          count-ok (= (count actual) (get-in prof [:itonami :bundle :files]))
+          policy-ok (= declared (:yakuwari/capabilities policy))
+          no-jobs (empty? (get-in prof [:jobs "jobs"]))
+          negative-provider (some #(= :config-provider (:drift %))
+            (:drift (profile/check (assoc-in prof [:config "model" "provider"] "openrouter"))))
+          negative-cid (some #(= :bundle-cid (:drift %))
+            (:drift (profile/check (assoc-in prof [:itonami :bundle :cid] "bwrong"))))
+          negative-tools (seq (tools/runtime-tool-names ["terminal" "file"] [] true true true))
+          controls-ok (boolean (and negative-provider negative-cid negative-tools))
+          ok (and (empty? (:problems check)) (empty? (:drift check))
+                  count-ok policy-ok no-jobs controls-ok (empty? exposed))]
+      {:profile name :ok ok :check check :bundle-count (count actual)
+       :count-ok count-ok :policy-ok policy-ok :negative-controls controls-ok :exposed-tools exposed :no-jobs no-jobs})) members))
+(println (h/json-str {:schema "awai.growth.compatibility-oracle.v1" :results results} 2))
+(when-not (every? :ok results) (set! (.-exitCode js/process) 1))
