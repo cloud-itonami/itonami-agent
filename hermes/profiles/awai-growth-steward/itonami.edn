@@ -4,13 +4,13 @@
  :profile/hermes-compatible true
  :agent/kind :steward
  :org/world :awai :org/path [:etzhayyim :awai :cloud-itonami]
- :org/github "kotoba-lang" :org/unit :awai-growth :awai/business :awai-network
+ :org/github "cloud-itonami" :org/unit :awai-growth :awai/business :awai-network
  :invocation :on-demand
  :runtime {:engine :itonami-agent :scheduler :itonami}
  :placement {:mode :local :order [:local] :inference-rail :murakumo}
  :inference {:rails [:murakumo] :authorities ["api.murakumo.cloud"] :deny-hosts ["openrouter.ai"]}
  :state {:workspace :host-local :results :cid-receipts :secrets :never-leave-host}
- :ids {:repo "kotoba-lang/itonami-agent" :yakuwari/id "awai-growth-steward"}
+ :ids {:repo "cloud-itonami/itonami-agent" :yakuwari/id "awai-growth-steward"}
  :authority {:default-decision :blocked :source :yakuwari :ref "yakuwari.edn"}
  :bundle {:cid "bafkreiajzu2lbwv6d4hkj6mlx7sk2gsvyachrquccuow5ya65rr4o62wcu" :files 8 :skills [] :dirs ["tasks" "policy"]}
  :capabilities [{:capability :read_source :decision :autonomous :note "Only operator-supplied public source snapshots; no credentials or network access"}

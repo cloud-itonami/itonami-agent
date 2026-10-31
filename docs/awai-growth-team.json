@@ -108,5 +108,6 @@
       "scheduleEnabled": false
     }
   ],
-  "authority": "Index only; no grants, deployment or scheduling"
+  "authority": "Index only; no grants, deployment or scheduling",
+  "sourceRepository": "cloud-itonami/itonami-agent"
 }

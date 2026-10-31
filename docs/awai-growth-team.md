@@ -6,6 +6,11 @@ Tracking: [AWAI-130](https://linear.app/kotobalabs/issue/AWAI-130),
 [JUN-18](https://linear.app/kotobalabs/issue/JUN-18).
 Date: 2026-10-31 JST.
 
+GitHub redirected the source push from `kotoba-lang/itonami-agent` to
+`cloud-itonami/itonami-agent`. The latter is the current repository owner.
+The existing local checkout is preserved; new profile source IDs use the
+current GitHub owner. Earlier Linear pointers to the former owner are historical.
+
 These are Itonami profiles. The existing `hermes/profiles/` source directory
 names the inherited file layout; these definitions belong only in the
 Itonami store, never the Hermes store. The machine-readable roster is
@@ -83,9 +88,9 @@ execution, live service availability and steady-state operation remain open.
 ## Owning-source discrepancies and activation blockers
 
 * `AGENTS.md` / the README describe the `.cljk`/kbb entry, while
-  `bin/itonami-agent` now selects native guests for a few routes and sends
+  `bin/itonami-agent:69–70` now selects native guests for a few routes and sends
   `profile`, `gateway` and other routes to `bin/itonami-agent-kbb`.
-  That launcher imports `nbb.classpath` and Node modules. The workspace's
+  That launcher (`bin/itonami-agent-kbb:7–9`) imports `nbb.classpath` and Node modules. The workspace's
   native-only runtime rule takes precedence; this team does not activate
   through that fallback.
 * This checkout has neither `bin/kexe-loader` nor `bin/guests`. Native `turn`
@@ -93,7 +98,7 @@ execution, live service availability and steady-state operation remain open.
   needs its pre-started `:llm/generate` host provider. A loader alone would
   not establish a profile-aware, authority-enforced live run.
 * The unrelated existing `itonami-compat` manifest declares Murakumo, but its
-  `config.yaml` selects OpenRouter. This conflicts with `AGENTS.md`'s Two
+  `config.yaml:2` selects OpenRouter. This conflicts with `AGENTS.md`'s Two
   CLIs rule. It was preserved and is not used as a deployment template.
 * The observed Yataverse source is a Node CLI/MCP implementation. Its
   verified-byte behavior is useful source evidence, not qualification of
