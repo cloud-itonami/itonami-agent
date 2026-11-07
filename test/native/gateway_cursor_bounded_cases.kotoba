@@ -1,0 +1,17 @@
+;; Functional fixture for cc-read-bounded. The trusted test host supplies a
+;; private directory containing regular files: small = "ok", cursor-limit =
+;; 1024 bytes, cursor-over = 1025 bytes, definition-limit = 8192 bytes,
+;; definition-over = 8193 bytes, and empty = zero bytes; missing is absent.
+;; Native execution requires a qualified FS2 host and has not yet been run.
+(ns itonami.gateway-cursor-bounded-cases (:export [test-cursor-bounded-reads]))
+
+(defn test-cursor-bounded-reads [root :string] :bool
+  (let [small (cc-read-bounded (str root "/small") 1024)
+        cursor-limit (cc-read-bounded (str root "/cursor-limit") 1024)
+        definition-limit (cc-read-bounded (str root "/definition-limit") 8192)]
+    (and (= (vector-count small) 2) (= (cp-cid small) (cp-cid (cp-bytes "ok")))
+         (= (vector-count cursor-limit) 1024) (= (vector-count definition-limit) 8192)
+         (= (vector-count (cc-read-bounded (str root "/cursor-over") 1024)) 0)
+         (= (vector-count (cc-read-bounded (str root "/definition-over") 8192)) 0)
+         (= (vector-count (cc-read-bounded (str root "/empty") 1024)) 0)
+         (= (vector-count (cc-read-bounded (str root "/missing") 1024)) 0))))

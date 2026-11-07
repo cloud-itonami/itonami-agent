@@ -1,0 +1,119 @@
+;; Opt-in cron job-node entry. Compose after gateway_job_node, gateway_cursor,
+;; and their native dependencies. The host supplies all paths and holds an
+;; exclusive, globally serialized writer/dispatch boundary across this check
+;; and the entire job lifetime. This does not acquire a lease fence, resource
+;; reservation, process supervisor or lock and is not authorization to run.
+;; Arguments 0..23 match cron-job-node-main; argument 24 is the private cursor
+;; path. Unknown marker or cursor state refuses. The opt-in serialized entry
+;; additionally takes a pre-provisioned host-owned lock at argument 25.
+(ns itonami.gateway-guarded-job-node (:export [cron-guarded-job-node-main cron-serialized-job-node-main]))
+
+(defn- cjg-read [path :string maximum :i64] :vector-i64
+  (let [size (cp-size path)]
+    (if (or (< size 1) (> size maximum)) (vector-alloc 0)
+      (let [b (cp-range path 0 size)]
+        (if (and (= (vector-count b) size) (= (cp-size path) size)) b (vector-alloc 0))))))
+
+;; The node receives a string. Its UTF-8 bytes must be exactly the source
+;; bytes whose CID was verified, including for multibyte characters.
+(defn- cjg-bytes-same? [a :vector-i64 b :vector-i64] :bool
+  (and (= (vector-count a) (vector-count b))
+       (loop [i 0]
+         (if (= i (vector-count a)) true
+           (and (= (vector-at a i) (vector-at b i)) (recur (+ i 1)))))))
+
+(defn- cjg-cursor-problem [pending :string intent :string head :string turn :string definition :vector-i64
+                           cursor :vector-i64 pin :string previous :i64 now :i64] :string
+  (cond (not (= pending "0")) "cron-guard/pending-unknown"
+        (not (= intent "0")) "cron-guard/intent-unknown"
+        (not (= head "0")) "cron-guard/head-intent-unknown"
+        (not (= turn "0")) "cron-guard/turn-intent-unknown"
+        (not (= (cc-plan-problem definition pin cursor now) "trigger/ok")) "cron-guard/plan-refused"
+        (not (= (cp-num cursor 0 "slot") previous)) "cron-guard/cursor-changed"
+        :else "cron-guard/ok"))
+
+;; Job inputs must remain distinct from the cursor and every recovery marker.
+;; Lexical checks do not replace host ownership or inode alias prevention.
+(defn- cjg-input-outside-cursor? [path :string cursor :string] :bool
+  (and (cp-safe-absolute? path) (not (cc-definition-overlap? path cursor))))
+
+(defn- cjg-input-outside-lock? [path :string lock :string] :bool
+  (and (cp-safe-absolute? path) (not (cc-path-overlap? path lock))))
+
+(defn- cjg-run [serialized :bool] :i64
+  (let [previous (jn-int (jn-arg 19)) pin (jn-arg 20) definition-path (jn-arg 21)
+        source-path (jn-arg 22) input-path (jn-arg 16) attempts (jn-arg 18)
+        cursor-path (jn-arg 24)]
+    (if (or (not (= (jn-arg 0) "run-cron")) (not (= (jn-arg 9) "clock"))
+            (if serialized (not (= (jn-arg 26) "")) (not (= (jn-arg 25) "")))
+            (and serialized (not (= (jn-arg 23) "capture-output")))
+            (and serialized (= (jn-arg 5) ""))
+            (not (jn-attempt-root? definition-path)) (not (jn-attempt-root? source-path))
+            (not (jn-attempt-root? input-path))
+            (not (cp-safe-absolute? cursor-path)) (not (cp-safe-absolute? definition-path))
+            (not (cp-safe-absolute? source-path)) (not (cp-safe-absolute? input-path))
+            (not (cp-safe-absolute? attempts))
+            (cc-definition-overlap? definition-path cursor-path)
+            (cc-definition-overlap? source-path cursor-path)
+            (cc-definition-overlap? input-path cursor-path)
+            (cc-definition-overlap? attempts cursor-path)
+            (not (cjg-input-outside-cursor? (jn-arg 6) cursor-path))
+            (not (cjg-input-outside-cursor? (jn-arg 11) cursor-path))
+            (not (cjg-input-outside-cursor? (jn-arg 12) cursor-path))
+            (and (not (= (jn-arg 17) "")) (not (cjg-input-outside-cursor? (jn-arg 17) cursor-path))))
+      (let [x (jn-say "cron-guard/input-refused")] 2)
+      (let [pending (cp-fs "D" (str cursor-path ".pending") "")
+            intent (cp-fs "D" (str cursor-path ".intent") "")
+            head (cp-fs "D" (str cursor-path ".head-intent") "")
+            turn (cp-fs "D" (str cursor-path ".turn-intent") "")
+            definition (cjg-read definition-path 8192) cursor (cjg-read cursor-path 1024)
+            now (ln-now "clock")
+            problem (cjg-cursor-problem pending intent head turn definition cursor pin previous now)]
+        (if (not (= problem "cron-guard/ok")) (let [x (jn-say problem)] 1)
+          (let [source (cjg-read source-path 8192) wrapper (cjg-read input-path 8192)
+                consume (cj-problem now previous pin definition (jn-arg 1) (jn-arg 2)
+                                    (jn-arg 3) (jn-arg 4) wrapper source)]
+            (if (not (= consume "consume/ok")) (let [x (jn-say consume)] 2)
+              (let [text (string-from-utf8 (bytes-from-vector-i64 source))
+                    wrapper-text (string-from-utf8 (bytes-from-vector-i64 wrapper))
+                    same (and (cjg-bytes-same? source (jn-bytes text))
+                              (cjg-bytes-same? wrapper (jn-bytes wrapper-text)))
+                    slot (next-cron-ms (gt-str definition "cron") previous (gt-num definition "offsetMinutes"))
+                    job (verified-cron-job-id true now previous slot pin definition)
+                    seed (if (and same serialized) (key-seed-fs2 (jn-arg 6)) (vector-alloc 0))
+                    signer (if (> (vector-count seed) 0) (node-did seed) "")
+                    marked (if (and same serialized) (and (jn-job-id? job) (not (= signer "")) (cc-turn-begin cursor-path pin cursor job slot (jn-arg 25) (jn-arg 17) (jn-arg 13) (jn-arg 5) signer)) same)]
+                (if (not same) (let [x (jn-say "cron-guard/source-encoding")] 2)
+                  (if marked (jn-run-with-verified-input text true wrapper-text true signer)
+                    (let [x (jn-say "cron-guard/turn-intent-unknown")] 1)))))))))))
+
+;; The lock is a stable, privately provisioned regular file outside every
+;; cursor/journal path, the attempt tree and all input paths, including the
+;; fleet token. All writers must use the same file without replacing it. This is cooperative host-local
+;; serialization only; a parent death or a detached child can release the
+;; lock before the entire workload stops. The host must qualify that boundary
+;; and resource limits before using it for builds, deployment or live jobs.
+(defn- cjg-lock-paths? [lock :string cursor :string definition :string source :string input :string attempts :string token :string] :bool
+  (and (cp-safe-absolute? lock) (cp-safe-absolute? cursor) (cp-safe-absolute? definition)
+       (cp-safe-absolute? source) (cp-safe-absolute? input) (cp-safe-absolute? attempts) (cp-safe-absolute? token)
+       (not (cc-definition-overlap? lock cursor)) (not (cc-path-overlap? lock definition))
+       (not (cc-path-overlap? lock source)) (not (cc-path-overlap? lock input))
+       (not (cc-path-overlap? lock attempts)) (not (cc-path-overlap? lock token))))
+
+(defn cron-guarded-job-node-main [] :i64 (cjg-run false))
+
+(defn cron-serialized-job-node-main [] :i64
+  (let [lock (jn-arg 25) cursor (jn-arg 24) definition (jn-arg 21) source (jn-arg 22)
+        input (jn-arg 16) attempts (jn-arg 18)
+        valid (and (= (jn-arg 26) "") (cjg-lock-paths? lock cursor definition source input attempts (jn-arg 17))
+                   (cjg-input-outside-lock? (jn-arg 6) lock)
+                   (cjg-input-outside-lock? (jn-arg 11) lock)
+                   (cjg-input-outside-lock? (jn-arg 12) lock))
+        meta (if valid (cp-fs "U" lock "") "")]
+    (if (not (and valid (= (cp-meta-field meta 0) "384") (= (cp-meta-field meta 3) "0")))
+      (let [x (jn-say "cron-lock/config-refused")] 2)
+      (if (not (= (typed-cap-call 35 :string :string (str lock "FLOCK_SEP")) "1"))
+        (let [x (jn-say "cron-lock/busy-or-unknown")] 1)
+        (let [result (cjg-run true)
+              unlocked (= (typed-cap-call 35 :string :string (str lock "UNLOCK_SEP")) "1")]
+          (if unlocked result (let [x (jn-say "cron-lock/unlock-unknown")] 1)))))))
