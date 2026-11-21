@@ -1,8 +1,12 @@
 # itonami-agent
 
 - **Selfhost only**: the required itonami-agent execution path is Kotoba/Amu
-  selfhost native kexe. Do not use Node, kbb, nbb or JVM for runtime, CI,
-  build, packaging, gates or fallback. An unported route remains blocked.
+  selfhost native kexe. Do not make Node, kbb, nbb or JVM part of that path's
+  runtime, build, packaging, gates or fallback. An unported route remains
+  blocked. Oracle-only jobs and hosted CI tooling follow the workspace language
+  table (the ban on JVM and nbb anywhere in CI was withdrawn, owner decision
+  2026-11-17, JUN-290); they are not required checks and never back the native
+  result.
 - `bin/itonami-agent` still sends unported routes to `bin/itonami-agent-kbb`.
   Treat that branch and the legacy `.cljk` launcher as migration inventory,
   not as a qualified selfhost path. AWAI-60 tracks its removal; AWAI-131
