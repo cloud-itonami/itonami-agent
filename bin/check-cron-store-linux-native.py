@@ -18,18 +18,17 @@ import time
 from pathlib import Path
 
 
-AMU_COMMIT = "a73bd0350ecdb73abde7548f7fbb101e72b73d64"
+AMU_COMMIT = "87ec570aff47a0a21b4876fcda4fa9d4e3b934fb"
 AMU_BINARY_PATH = "bin/amu-linux-x86_64"
-AMU_BINARY_SHA256 = "925fa6999fff4e48759fd1c355b32bf613e67d1497e8e8ab610c3890620f197b"
+AMU_BINARY_SHA256 = "237b61cce51d442aed83ba5006de2828424ed55ef201a622054444179722c812"
 AMU_RUNNER_SOURCE = "seed/x86_64-kx64-runner.kotoba"
 AMU_RUNNER_SHA256 = "c9f1fe1b5c1748450fb11b233cbdc9d9234880a60dc480c0387b173f60d905be"
 AMU_CANDIDATE_SOURCE = "seed/experimental/98-x86_64-project-fs-cli.kotoba"
-# Amu PR #1771 contains the scoped wire-35 unlink and experimental
-# project-profile admission needed by this consumer. The candidate compiler
-# reached F1=F2=F3 at this exact digest; pin it so consumer runs prove identity.
-AMU_CANDIDATE_COMPILER_SHA256 = "ea7cd6c04022c8adf12881ab404285652eb440573fd9829cf11396af4a829421"
-AMU_CANDIDATE_COMPILER_BYTES = 10310144
-AMU_CANDIDATE_RUNNER_SHA256 = "86c0929295446a27b92b44ce90e8e4e445a7b9293fb24e115dc133d93ebd6f92"
+# Amu's selfhost-native run 45617427645 qualified these experimental
+# project-profile digests with F1=F2=F3 and the scoped wire-35 runtime.
+AMU_CANDIDATE_COMPILER_SHA256 = "9929a6f6863787b142ce753f8650ab9f410f4176c5110e50cf2d7622749eeee2"
+AMU_CANDIDATE_COMPILER_BYTES = 10691072
+AMU_CANDIDATE_RUNNER_SHA256 = "57eb22599e420a8d7f5327fd7cf7df8490c27a816f05224c9b14395e090a76e5"
 KOTOBA_COMMIT = "14e84d230933e8aa638f3a416c4728d0c305305e"
 KOTOBA_JCS_PATH = "lib/org.ietf.jcs/kotoba/jcs/reader.kotoba"
 KOTOBA_JCS_SHA256 = "f8af2953904bd0a96e7b5c3b9e34151bcae3754e5358669adb8ac289acc0872f"
@@ -88,8 +87,8 @@ def run(name, argv, cwd, env, calls, timeout=900, allow_stderr=False):
 def derive_project_compiler(baseline, amu_repo, out, env, calls):
     manifest = git_blob(amu_repo, AMU_COMMIT, "seed/FULL-MANIFEST").decode("ascii")
     modules = [line for line in manifest.splitlines() if line and not line.startswith("#")]
-    if len(modules) != 60 or "seed/98-x86_64-project.kotoba" not in modules:
-        raise RuntimeError("pinned Amu FULL-MANIFEST does not match the 60-source candidate")
+    if len(modules) != 61 or "seed/98-x86_64-project.kotoba" not in modules:
+        raise RuntimeError("pinned Amu FULL-MANIFEST does not match the 61-source candidate")
     sources = out / "amu-full-candidate.kotoba"
     with sources.open("wb") as stream:
         for module in modules:
@@ -301,12 +300,10 @@ def main():
                             "resume-global", "", "", 0, out, calls)
     if b"resumed" not in resume_stdout or marker.exists():
         raise RuntimeError(f"global resume did not remove the active marker: {resume_stdout!r}")
-    pause_absent_scope = out / "pause-marker-absent-scope"
-    (pause_absent_scope / "d").mkdir(parents=True)
-    resume_absent_stdout = execute("runtime-global-resume-absent", runner, payload, pause_absent_scope,
+    resume_absent_stdout = execute("runtime-global-resume-absent", runner, payload, pause_scope,
                                    "resume-global", "", "", 0, out, calls)
-    if b"nothing to resume" not in resume_absent_stdout or (pause_absent_scope / "d/paused").exists():
-        raise RuntimeError(f"idempotent global resume did not report the absent marker: {resume_absent_stdout!r}")
+    if b"nothing to resume" not in resume_absent_stdout or marker.exists():
+        raise RuntimeError(f"second global resume did not leave the marker absent: {resume_absent_stdout!r}")
 
     source_revision = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"]).decode().strip()
     package = out / "package"
@@ -446,14 +443,11 @@ def main():
     if b"resumed" not in launcher_global_resume_stdout or launcher_global_marker.exists():
         raise RuntimeError(f"launcher global resume did not remove marker: {launcher_global_resume_stdout!r}")
 
-    launcher_global_absent = out / "launcher-global-absent-scope"
-    (launcher_global_absent / "d").mkdir(parents=True)
     launcher_global_absent_stdout = execute_launcher(
-        "launcher-global-resume-absent", package_launcher, launcher_global_absent,
+        "launcher-global-resume-absent", package_launcher, launcher_global_pause,
         "resume-global", "", "", 0, out, calls)
-    if (b"nothing to resume" not in launcher_global_absent_stdout
-            or (launcher_global_absent / "itonami/paused").exists()):
-        raise RuntimeError(f"launcher absent global resume was not idempotent: {launcher_global_absent_stdout!r}")
+    if b"nothing to resume" not in launcher_global_absent_stdout or launcher_global_marker.exists():
+        raise RuntimeError(f"second launcher global resume did not leave the marker absent: {launcher_global_absent_stdout!r}")
 
     list_scope = out / "list-scope"
     (list_scope / "d").mkdir(parents=True)
