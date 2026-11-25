@@ -16,8 +16,21 @@ a composer and a status bar.
   request id and offers **Check result**, which resends the same id so the
   Agent replays a finished turn instead of running it again.
 - The Agent owns the history; the app keeps only what is on screen.
+- **Worktrees**: a list of Git worktrees for the repositories the person curates,
+  from a snapshot printed by `scripts/worktree-snapshot.clj` (it wraps
+  `git worktree list --porcelain`). The snapshot is imported like the Autonomy
+  files and kept in memory only; the app never runs `git` (no shell
+  permission). Selecting a worktree shows its path, branch, HEAD and flags,
+  and copies its path to the clipboard — a local operation only.
+- **Items**: work items read from an `itonami.items.v1` JSON file the person
+  imports (in the same in-memory pattern; the file can be an Orca
+  orchestration export or written by hand). Statuses are **In progress** /
+  **Waiting** / **Needs you** / **Done**, filterable, searchable; a Needs-you
+  item shows its question and option labels for reading only — answering is
+  not done from this view. Orca CLI is not required to display either view.
 - The Rust side is a thin host (`awai_host_info` only).
 
+- Automations (scheduled, event-waiting, PR watch) are intentionally not part of this app.
 Tracking: [AWAI-3327](https://linear.app/kotobalabs/issue/AWAI-3327),
 [AWAI-3355](https://linear.app/kotobalabs/issue/AWAI-3355).
 
@@ -32,12 +45,15 @@ reads `app/`, and neither side falls back to the other.
 |---|---|
 | `src/itonami/app/core.cljc` | pure view-model over `itonami.otehon.profile` (also runs on Babashka) |
 | `src/itonami/app/chat.cljc` | request plans (same as Otehon `conversation/request-plan`, checked by `test/.../parity_test.clj`), response checks, transcript state |
+| `src/itonami/app/worktrees.cljc` | worktrees snapshot validation/normalization (bb + CLJS) |
+| `src/itonami/app/items.cljc` | items file validation/normalization (bb + CLJS) |
+| `scripts/worktree-snapshot.clj` | `git worktree list --porcelain` → `itonami.worktrees-snapshot.v1` JSON |
 | `src/itonami/app/main.cljs` | the desktop UI |
 | `public/agent-client.js` | declares the five Agent operations and calls the broker; nothing else |
 | `vendor/` | canonical `kotoba-client-runtime.js` / `kotoba-client-consent.css`, pinned by revision and SHA-256 in `PINS.json`; `npm run build` refuses a mismatch |
 | `public/` | `index.html`, `style.css` |
 | `scripts/bundle-profiles.mjs` | ships only `SOUL.md`, `config.yaml`, `profile.yaml`, `cron/jobs.json`, `itonami.edn`, `yakuwari.edn` per profile; refuses text that looks like a credential |
-| `src-tauri/` | Tauri 3.0.0-alpha.6 host, Android project in `gen/android` (minSdk 35, target 37) |
+| `src-tauri/` | Tauri 3.0.0-alpha.6 host, Android project in `gen/android` (minSdk 35, target 37), macOS bundle (`app` + `dmg`, unsigned dev build) |
 | `icon-src/icon.svg` | source of the launcher icons (`npx tauri icon`) |
 
 ## Build
@@ -61,6 +77,52 @@ before `build:android`, then check that the APK's SHA-256 changed.
 The APK lands in
 `src-tauri/gen/android/app/build/outputs/apk/universal/debug/`. Install with
 `adb install -r <apk>`.
+
+## Build (macOS)
+
+Needs Node, the Clojure CLI (JDK 21), Rust 1.95 (arm64 on Apple silicon) and
+Xcode with its Command Line Tools. No signing identity, notary or
+universal-target setup is involved in a development build:
+
+```
+npm ci
+npm run build:mac   # npm run build + tauri build --no-sign
+```
+
+The unsigned `.app` lands in `src-tauri/target/release/bundle/macos/`.
+`bundle.active` is on with `app` + `dmg` targets in `tauri.conf.json`, with
+`bundle.macOS.minimumSystemVersion: 14.0` and `hardenedRuntime: true`. No
+signing identity or entitlements are committed. Signing, notarization and a
+universal (Intel + Apple silicon) build are separate claims and are not
+verified here.
+
+## Worktrees snapshot
+
+```
+bb scripts/worktree-snapshot.clj OUT.json REPO...
+```
+
+`REPO...` go to `git -C <repo> worktree list --porcelain`; each repository's
+first non-bare worktree is its main one. OUT.json is an
+`itonami.worktrees-snapshot.v1` file (paths, branches, HEAD ids and flags
+only). It is private operational data: keep it out of the repository.
+
+## Items file
+
+An `itonami.items.v1` JSON file, imported in the Items tab:
+
+```json
+{"schema":"itonami.items.v1","items":[
+  {"id":"IT-1","title":"Add worktrees view","status":"In progress","assignee":"junks","updated":"2026-11-25"},
+  {"id":"IT-2","title":"Approve merge?","status":"Needs you",
+   "ask":{"question":"Approve the PR?","options":[{"id":"yes","label":"Approve"},{"label":"Hold"}]}}
+]}
+```
+
+`status` is one of `In progress`, `Waiting`, `Needs you`, `Done`; any other
+status, or a missing `id`, is dropped (and counted as dropped on import).
+`ask` is optional; a Needs-you item without a question shows that fact
+instead of an empty box. Imported items live in memory only.
 
 ## Autonomy (Org tab)
 

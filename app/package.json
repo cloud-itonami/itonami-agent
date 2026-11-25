@@ -6,10 +6,12 @@
   "scripts": {
     "build": "node scripts/copy-public.mjs && node scripts/bundle-profiles.mjs dist/profiles.json && clojure -M -m cljs.main -co build.edn -c",
     "test": "clojure -M:test -m cljs.main -co test.edn -c && node .cljs-out/test/test.cjs",
-    "test:bb": "bb -cp src:test:../otehon/src -e \"(require 'itonami.app.core-test 'itonami.app.chat-test 'itonami.app.autonomy-test 'itonami.app.devbots-test 'itonami.app.parity-test) (let [r (clojure.test/run-tests 'itonami.app.core-test 'itonami.app.chat-test 'itonami.app.autonomy-test 'itonami.app.devbots-test 'itonami.app.parity-test)] (System/exit (if (zero? (+ (:fail r) (:error r))) 0 1)))\"",
+    "test:bb": "bb -cp src:test:../otehon/src -e \"(require 'itonami.app.core-test 'itonami.app.chat-test 'itonami.app.autonomy-test 'itonami.app.devbots-test 'itonami.app.parity-test 'itonami.app.worktrees-test 'itonami.app.items-test) (let [r (clojure.test/run-tests 'itonami.app.core-test 'itonami.app.chat-test 'itonami.app.autonomy-test 'itonami.app.devbots-test 'itonami.app.parity-test 'itonami.app.worktrees-test 'itonami.app.items-test)] (System/exit (if (zero? (+ (:fail r) (:error r))) 0 1)))\"",
     "tauri": "tauri",
     "build:android": "npm run build && tauri android build --debug --apk --target aarch64",
-    "build:android:x86": "npm run build && tauri android build --debug --apk --target x86_64"
+    "build:android:x86": "npm run build && tauri android build --debug --apk --target x86_64",
+    "build:mac": "npm run build && tauri build --no-sign",
+    "snapshot:worktrees": "bb scripts/worktree-snapshot.clj"
   },
   "devDependencies": {
     "@tauri-apps/cli": "3.0.0-alpha.6"
