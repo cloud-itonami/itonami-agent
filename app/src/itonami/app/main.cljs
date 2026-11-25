@@ -11,7 +11,9 @@
             [clojure.string :as str]
             [itonami.app.core :as core]
             [itonami.app.chat :as chat]
-            [itonami.app.autonomy :as autonomy]))
+            [itonami.app.autonomy :as autonomy]
+            [itonami.app.worktrees :as worktrees]
+            [itonami.app.items :as items]))
 
 (def readers
   {:parse-edn reader/read-string
@@ -38,7 +40,18 @@
          :activity nil
          :sources {}
          :org-q ""
-         :circle nil}))
+         :circle nil
+         ;; Worktrees: a snapshot the person imported, kept in memory only.
+         :wt nil
+         :wt-source nil
+         :wt-q ""
+         :wt-selected nil
+         ;; Items: a file the person imported, kept in memory only.
+         :items nil
+         :items-source nil
+         :items-q ""
+         :items-status :all
+         :item-selected nil}))
 
 ;; ------------------------------------------------------------ dom helpers
 
@@ -447,14 +460,257 @@
                (el :ul {:class "bot-cards"} (for [[b st] (take 120 bots)] (bot-card b st)))
                (when (> (count bots) 120) (el :p {:class "row-sub"} "Showing 120. Pick a circle in Org to narrow.")))))))))
 
+;; ------------------------------------------------------------ worktrees
+
+(defn- basename [path]
+  (let [parts (str/split path #"/")]
+    (or (last (remove str/blank? parts)) path)))
+
+(defn- wt-badge-kind [w]
+  (case (worktrees/wt-status w) :main "ok" :worktree "unknown" :bare "unknown" :locked "held" :prunable "warn"))
+
+(defn- read-wt-file! [file]
+  (-> (.text file)
+      (.then (fn [text]
+               (let [v (try (js->clj (.parse js/JSON text)) (catch :default _ nil))
+                     parsed (if (worktrees/kind-of v) (worktrees/worktrees-from v) {:error "not an itonami.worktrees-snapshot.v1 file"})]
+                 (if (:error parsed)
+                   (set-state! assoc :notice (str (.-name file) ": " (:error parsed)))
+                   (do (set-state! #(-> % (assoc :wt parsed :wt-source (.-name file) :wt-selected nil :wt-q "" :view :worktree)
+                                        (assoc :notice (str "Imported " (count (:worktrees parsed)) " worktrees from " (.-name file)
+                                                              " (observed " (:observed-at parsed) ")"))))
+                       (let [shown (:notice @state)]
+                         (js/setTimeout #(when (= shown (:notice @state)) (set-state! assoc :notice nil)) 5000)))))))))
+
+(defn- worktrees-import-button []
+  (let [input (el :input {:type "file" :multiple true :accept "application/json,.json" :class "visually-hidden"})]
+    (.addEventListener input "change" (fn [_] (doseq [f (array-seq (.-files input))] (read-wt-file! f))))
+    (el :label {:class "btn primary file-btn"} "Import snapshot…" input)))
+
+(defn- wt-refresh! []
+  (let [{:keys [wt wt-source]} @state]
+    (when wt
+      (set-state! assoc :notice (str "Worktrees: " (count (:worktrees wt)) " from " (or wt-source "import")
+                                     " (observed " (:observed-at wt) ")")))))
+
+(defn- wt-row [w]
+  (let [head (:head w)
+        short (when head (subs head 0 (min 7 (count head))))
+        sub (str/join " · " (remove nil? [(get worktrees/status-labels (worktrees/wt-status w))
+                                          (:branch w)
+                                          short]))
+        selected? (= (:wt-selected @state) (:path w))]
+    (el :li {:class (str "row" (when selected? " selected"))}
+        (el :button {:class "row-main" :type "button" :aria-current (when selected? "true")
+                     :on-click #(set-state! assoc :wt-selected (:path w) :view :worktree :drawer? false)}
+            (el :span {:class "row-text"}
+                (el :span {:class "row-title"} (basename (:path w)))
+                (el :span {:class "row-sub"} sub))))))
+
+(defn- wt-list []
+  (let [rows (worktrees/filter-by (:worktrees (:wt @state)) (:wt-q @state))]
+    (el :ul {:class "list" :aria-label "Worktrees"} (map wt-row rows))))
+
+(defn- worktrees-pane []
+  (let [wt (:wt @state)
+        search (el :input {:class "search" :type "search" :placeholder "Search path or branch"
+                           :value (:wt-q @state) :aria-label "Search worktrees"})]
+    (.addEventListener search "input"
+                       (fn [_] (swap! state assoc :wt-q (.-value search))
+                         (when-let [n ($ "wt-list")] (.replaceChildren n (wt-list)))))
+    (el :div {:class "pane"}
+        (el :div {:class "pane-actions"}
+            (worktrees-import-button)
+            (el :button {:class "btn" :type "button" :disabled (nil? wt) :on-click wt-refresh!} "Refresh"))
+        (el :p {:class "row-sub sources"}
+            (str "Snapshot: " (if wt (str (or (:wt-source @state) "—") " · " (count (:worktrees wt)) " worktrees") "—")))
+        (if wt
+          (list search (el :div {:id "wt-list"} (wt-list)))
+          (el :p {:class "muted"} "Import a worktrees snapshot (scripts/worktree-snapshot.clj prints one from git worktree list). Files stay on this device.")))))
+
+(defn- wt-copy! [path]
+  (-> (.-clipboard js/navigator)
+      (.writeText path)
+      (.then (fn [_] (set-state! assoc :notice (str "Copied " path))))
+      (.catch (fn [e] (set-state! assoc :notice (str "Copy failed: " (.-message e)))))))
+
+(defn- wt-head [w]
+  (el :div {:class "detail-head"}
+      (el :div {}
+          (el :h2 {} (if w (basename (:path w)) "Worktrees"))
+          (when w (el :div {:class "badges"}
+                      (badge (wt-badge-kind w) (get worktrees/status-labels (worktrees/wt-status w))))))))
+
+(defn- wt-actions [w]
+  (el :div {:class "pane-actions"}
+      (el :button {:class "btn primary" :type "button" :on-click #(wt-copy! (:path w))} "Copy path")
+      (el :button {:class "btn" :type "button" :on-click wt-refresh!} "Refresh")))
+
+(defn- wt-flags [w]
+  (str/join " · " (remove nil? [(when (:bare? w) "bare")
+                               (when (:detached? w) "detached")
+                               (when (:locked? w) "locked")
+                               (when (:prunable? w) "prunable")
+                               (when (and (not (:bare? w)) (not (:locked? w)) (not (:prunable? w))) "ok")])))
+
+(defn- wt-facts [w]
+  (el :dl {:class "facts"}
+      (el :dt {} "Path") (el :dd {:class "mono"} (:path w))
+      (el :dt {} "Branch") (el :dd {} (or (:branch w) "—"))
+      (el :dt {} "HEAD") (el :dd {:class "mono"} (or (:head w) "—"))
+      (el :dt {} "Flags") (el :dd {} (wt-flags w))))
+
+(defn- wt-view []
+  (let [wt (:wt @state)
+        w (first (filter #(= (:wt-selected @state) (:path %)) (:worktrees wt)))]
+    (el :div {:class "detail"}
+        (wt-head w)
+        (if-not w
+          (el :p {:class "muted"} "Pick a worktree in the Worktrees tab.")
+          (list (wt-actions w)
+                (el :h3 {} "Details")
+                (wt-facts w)
+                (el :p {:class "row-sub"}
+                    (str "Snapshot from " (or (:wt-source @state) "import")
+                         " · observed " (or (:observed-at wt) "—")
+                         ". A reading, not a claim about the filesystem now; import a newer snapshot to refresh.")))))))
+
+;; ------------------------------------------------------------ items
+
+(defn- items-badge-kind [it] (case (:status it) :in-progress "unknown" :waiting "held" :needs-you "warn" :done "ok"))
+
+(defn- read-items-file! [file]
+  (-> (.text file)
+      (.then (fn [text]
+               (let [v (try (js->clj (.parse js/JSON text)) (catch :default _ nil))
+                     parsed (if (items/kind-of v) (items/items-from v) {:error "not an itonami.items.v1 file"})]
+                 (if (:error parsed)
+                   (set-state! assoc :notice (str (.-name file) ": " (:error parsed)))
+                   (do (set-state! #(-> % (assoc :items parsed :items-source (.-name file) :item-selected nil :items-q "" :items-status :all :view :item)))
+                                  (let [shown (str "Imported " (count (:items parsed)) " items from " (.-name file)
+                                                   (when (pos? (:dropped parsed)) (str " (" (:dropped parsed) " dropped)")))]
+                                    (set-state! assoc :notice shown))))
+                       (let [shown (:notice @state)]
+                         (js/setTimeout #(when (= shown (:notice @state)) (set-state! assoc :notice nil)) 5000)))))))
+
+(defn- items-import-button []
+  (let [input (el :input {:type "file" :multiple true :accept "application/json,.json" :class "visually-hidden"})]
+    (.addEventListener input "change" (fn [_] (doseq [f (array-seq (.-files input))] (read-items-file! f))))
+    (el :label {:class "btn primary file-btn"} "Import items…" input)))
+
+(defn- items-refresh! []
+  (let [{:keys [items items-source]} @state]
+    (when items
+      (let [sm (items/summary (:items items))]
+        (set-state! assoc :notice (str "Items: " (:total sm) " from " (or items-source "import")
+                                       " (in progress " (:in-progress sm) " · waiting " (:waiting sm)
+                                       " · needs you " (:needs-you sm) " · done " (:done sm) ")"))))))
+
+(defn- item-row [it]
+  (let [selected? (= (:item-selected @state) (:id it))]
+    (el :li {:class (str "row" (when selected? " selected"))}
+        (el :button {:class "row-main" :type "button" :aria-current (when selected? "true")
+                     :on-click #(set-state! assoc :item-selected (:id it) :view :item :drawer? false)}
+            (el :span {:class "row-text"}
+                (el :span {:class "row-title"} (:title it))
+                (el :span {:class "row-sub"}
+                    (str/join " · " (remove nil? [(:id it)
+                                                    (get items/status-labels (:status it))
+                                                    (:assignee it)]))))))))
+
+(defn- items-list []
+  (let [rows (items/filter-by (:items (:items @state)) (:items-status @state) (:items-q @state))]
+    (el :ul {:class "list" :aria-label "Items"} (map item-row rows))))
+
+(defn- items-pane []
+  (let [parsed (:items @state)
+        sm (when parsed (items/summary (:items parsed)))
+        search (el :input {:class "search" :type "search" :placeholder "Search id, title, assignee"
+                           :value (:items-q @state) :aria-label "Search items"})
+        chip (fn [k label n]
+               (el :button {:class (str "chip" (when (= (:items-status @state) k) " active")) :type "button"
+                            :aria-pressed (str (= (:items-status @state) k))
+                            :on-click #(set-state! assoc :items-status k)}
+                   (str label " " n)))]
+    (.addEventListener search "input"
+                       (fn [_] (swap! state assoc :items-q (.-value search))
+                         (when-let [n ($ "items-list")] (.replaceChildren n (items-list)))))
+    (el :div {:class "pane"}
+        (el :div {:class "pane-actions"}
+            (items-import-button)
+            (el :button {:class "btn" :type "button" :disabled (nil? parsed) :on-click items-refresh!} "Refresh"))
+        (el :p {:class "row-sub sources"}
+            (str "Items: " (if parsed (str (or (:items-source @state) "—") " · " (:total sm) " items") "—")))
+        (if parsed
+          (list search
+                (el :div {:class "filter-chips" :role "group" :aria-label "Filter by status"}
+                    (chip :all "All" (:total sm))
+                    (chip :in-progress "In progress" (:in-progress sm))
+                    (chip :waiting "Waiting" (:waiting sm))
+                    (chip :needs-you "Needs you" (:needs-you sm))
+                    (chip :done "Done" (:done sm)))
+                (el :div {:id "items-list"} (items-list)))
+          (el :p {:class "muted"} "Import an itonami.items.v1 JSON file. Files stay on this device; answering a Needs-you question is not done here.")))))
+
+(defn- item-head [it]
+  (el :div {:class "detail-head"}
+      (el :div {}
+          (el :h2 {} (if it (:title it) "Items"))
+          (when it (el :div {:class "badges"}
+                      (badge (items-badge-kind it) (get items/status-labels (:status it))))))))
+
+(defn- item-facts [it]
+  (el :dl {:class "facts"}
+      (el :dt {} "Id") (el :dd {} (:id it))
+      (el :dt {} "Assignee") (el :dd {} (or (:assignee it) "—"))
+      (el :dt {} "Updated") (el :dd {} (or (:updated it) "—"))))
+(defn- ask-box [ask]
+  (el :div {:class "ask-box"}
+      (el :p {} (:question ask))
+      (el :ul {:class "ask-options"}
+          (for [o (:options ask)]
+            (el :li {} (:label o))))
+      (el :p {:class "row-sub"} "Answers are not sent from this view. This screen only shows what is waiting.")))
+
+(defn- item-ask [it]
+  (if (= :needs-you (:status it))
+    (if (:ask it)
+      (el :div {:class "ask-wrap"}
+          (el :h3 {} "Ask (display only)")
+          (ask-box (:ask it)))
+      (el :p {:class "muted"} "Needs you, but the imported file carries no question. Import a file that includes one."))
+    nil))
+
+(defn- item-view []
+  (let [parsed (:items @state)
+        it (first (filter #(= (:item-selected @state) (:id %)) (:items parsed)))]
+    (el :div {:class "detail"}
+        (item-head it)
+        (if-not it
+          (el :p {:class "muted"} "Pick an item in the Items tab.")
+          (list (el :div {:class "pane-actions"}
+                    (el :button {:class "btn" :type "button" :on-click items-refresh!} "Refresh"))
+                (item-facts it)
+                (when (:summary it)
+                  (el :div {:class "summary"}
+                      (el :h3 {} "Summary")
+                      (el :p {} (:summary it))))
+                (item-ask it)
+                (el :p {:class "row-sub"}
+                    (str "From " (or (:items-source @state) "import")
+                         ". Statuses are shown as imported; import a newer file to refresh.")))))))
+
+
+;; ------------------------------------------------------------ sidebar
+
 (defn- sidebar []
   (let [tab (:tab @state)
         tab-btn (fn [k label] (el :button {:class (str "tab" (when (= tab k) " active")) :type "button"
                                            :role "tab" :aria-selected (str (= tab k))
                                            :on-click #(set-state! assoc :tab k)} label))]
     (el :div {:class "sidebar-inner"}
-        (el :div {:class "tabs" :role "tablist"} (tab-btn :sessions "Sessions") (tab-btn :bots "Bots") (tab-btn :org "Org"))
-        (case tab :bots (bots-pane) :org (org-pane) (sessions-pane)))))
+        (el :div {:class "tabs" :role "tablist"} (tab-btn :sessions "Sessions") (tab-btn :bots "Bots") (tab-btn :org "Org") (tab-btn :worktrees "Worktrees") (tab-btn :items "Items"))
+        (case tab :bots (bots-pane) :org (org-pane) :worktrees (worktrees-pane) :items (items-pane) (sessions-pane)))))
 
 (defn- message-node [{:keys [role text state note request]}]
   (case [role state]
@@ -524,8 +780,8 @@
                      :aria-expanded (str (:drawer? @state))
                      :on-click #(set-state! update :drawer? not)} "☰")
         (el :div {:class "title"}
-            (el :strong {} (cond (= :autonomy (:view @state)) "Autonomy" bot (bot-name bot) :else "Itonami"))
-            (when (and bot (not= :autonomy (:view @state))) (el :span {:class "muted"}
+            (el :strong {} (case (:view @state) :autonomy "Autonomy" :worktree "Worktree" :item "Item" :bot "Bot" (if bot (bot-name bot) "Itonami")))
+            (when (and bot (not (contains? #{:bot :autonomy :worktree :item} (:view @state)))) (el :span {:class "muted"}
                           (if (= session "default") "Bot Chat" (get titles session "Session")))))
         (when busy (el :span {:class "chip"} "Waiting for approval or the Agent…")))))
 
@@ -542,12 +798,14 @@
     (mount! "topbar" (topbar))
     (mount! "sidebar" (sidebar))
     (mount! "content" (cond (= view :autonomy) (autonomy-view)
+                            (= view :worktree) (wt-view)
+                            (= view :item) (item-view)
                             (and (= view :bot) bot) (bot-view)
                             :else (chat-view)))
     (mount! "notice" (if notice (el :p {:class "notice" :role "status"} notice) (el :span {})))
     (mount! "statusbar" (statusbar))
     (set! (.-disabled ($ "composer-send")) (boolean (or busy (nil? bot))))
-    (set! (.-hidden ($ "composer")) (contains? #{:bot :autonomy} view))
+    (set! (.-hidden ($ "composer")) (contains? #{:bot :autonomy :worktree :item} view))
     (when-let [log (.querySelector js/document ".transcript")]
       (set! (.-scrollTop log) (.-scrollHeight log)))))
 

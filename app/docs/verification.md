@@ -43,3 +43,16 @@ Source, browser, Android VM and physical acceptance are separate claims.
 - **Found while verifying.**
   - Three APK builds re-packaged old web assets: Cargo and Gradle did not notice the changed `dist/`, and one web build had actually failed. The README now gives the clean-rebuild steps, and the reported APK is the one built after them.
 - **Finding about the bots.** No receipt or observation newer than 2026-11-13 12:15Z was found on AwaiVol. As far as these records show, the bots have not been running on their own since then.
+
+# Verification — 2026-11-25, Worktrees view, Items view, macOS build
+
+- **Tests.** `npm test` (ClojureScript on Node 26): 31 tests, 208 assertions, 0 failures. `npm run test:bb` (Babashka): 32 tests, 217 assertions, 0 failures, including the new `worktrees_test` and `items_test` (reader-level, with negative controls: a blank path, an unknown item status and a missing id are refused, a blank ask question is not shown).
+- **Worktrees/Items data path.**
+  - `bb scripts/worktree-snapshot.clj /tmp/wt.json .` prints `2 worktrees from 1 repos` for this checkout (main + `com-junkawasaki/itonami-desktop-mac`).
+  - In a browser tab at 1280 px: importing `/tmp/wt.json` shows both rows (Main `/ worktree), selecting the second shows path/branch/HEAD/flags; "Copy path" copies to the clipboard; "Refresh" re-reports the count. Importing `/tmp/items.json` (4 items) shows all rows grouped by the status filter chips, and the Needs-you item shows its question and the two options as a read-only box ("Answers are not sent from this view"). `document.documentElement.scrollWidth` = `window.innerWidth` = 1280 on every screen — no horizontal overflow. Screenshots: exports under `/tmp/it1280-*.png` (not committed).
+- **macOS dev build (unsigned).** Tauri 3.0.0-alpha.6, Rust 1.95.0 (aarch64-apple-darwin), Xcode 26.6, `tauri build --no-sign` (also via `npm run build:mac`): 0 errors, 2 bundles —
+  - `src-tauri/target/release/bundle/macos/Itonami.app` (9.26 MiB, ad-hoc signature, no Developer identity, no notarization)
+  - `src-tauri/target/release/bundle/dmg/Itonami_0.1.0_aarch64.dmg` (3.35 MiB)
+  `bundle.active: true`, targets `app` + `dmg`, `bundle.macOS.minimumSystemVersion: 14.0`, `hardenedRuntime: true`; no identity or entitlements committed. The `.app` was `open`ed and its window titled "Itonami" appeared, then the process was quit.
+- **Chat/Bots unchanged.** The broker consent flow, Deny behaviour, no-retry, Check result replay, CSP and vendor pinning are untouched by this change (no file in `public/agent-client.js`, `vendor/`, or the chat path was modified).
+- **Not verified.** Signing, notarization, universal (Intel) build, physical device acceptance, and the new views on Android.
