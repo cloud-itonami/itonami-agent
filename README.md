@@ -31,6 +31,8 @@ operation. Otehon path only. See [app/README.md](app/README.md) and
 This repository is `cloud-itonami/itonami-agent` (moved from
 `kotoba-lang/itonami-agent` on 2026-11-18; the old URL redirects).
 
+The [peer API Protobuf ADR](docs/adr/0001-protobuf-for-peer-api.md) records the wire compatibility and native migration plan.
+
 ## Legacy CLI examples (unqualified)
 
 ```
