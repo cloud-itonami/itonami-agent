@@ -48,6 +48,8 @@ class Listener(http.server.BaseHTTPRequestHandler):
         mode = self.server.mode
         if mode == "slow":
             time.sleep(4)
+        elif mode == "delayed-completion":
+            time.sleep(16)
         response = {"model": MODEL, "choices": [{"index": 0,
             "message": {"role": "assistant", "content": DRAFT}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 63, "completion_tokens": 27, "total_tokens": 90}}
@@ -93,7 +95,7 @@ def run(launcher, env, profile, grant, approval, signature, output, auth):
             done, status = os.waitpid(pid, os.WNOHANG)
             if done:
                 break
-            if time.monotonic() - start > 22:
+            if time.monotonic() - start > 30:
                 os.killpg(pid, signal.SIGKILL)
                 os.waitpid(pid, 0)
                 raise AssertionError("launcher exceeded fixture deadline")
@@ -203,6 +205,8 @@ def main(amu_source, preflight_package, output):
             assert receipt is None or (receipt["classification"] != "pass" and receipt["draft"] is None), name
         if mode == "slow":
             assert elapsed < 4, "agent waited for delayed listener"
+        elif mode == "delayed-completion":
+            assert 16 <= elapsed < seconds, "completion did not fit the independently authorized deadline"
         cases.append({"case": name, "exit": code, "httpRequests": len(observed), "providerCalls": calls,
                       "elapsedMilliseconds": round(elapsed * 1000)})
         print(f"PASS {name} (exit {code}, HTTP {len(observed)})", flush=True)
@@ -240,7 +244,7 @@ def main(amu_source, preflight_package, output):
             ("invalid-grant", "KLG1", "KLG2"), ("wrong-grant-artifact", guest_sha, "0" * 64),
             ("wrong-endpoint", endpoint, "http://127.0.0.1:1"), ("wrong-grant-model", MODEL, "different-model"),
             ("zero-tokens", "tokens=96", "tokens=0"), ("excess-tokens", "tokens=96", "tokens=97"),
-            ("excess-deadline", "seconds=12", "seconds=16"),
+            ("excess-deadline", "seconds=12", "seconds=91"),
         ):
             case(name, change_grant=(old, new), reason="KLG1 scope or budget refused")
         write_json(registration, {**policy, "port": 1})
@@ -251,6 +255,7 @@ def main(amu_source, preflight_package, output):
         for mode in ("malformed", "wrong-model", "tool", "length", "context"):
             case(mode, mode=mode, expected=1, calls=1, requests=1)
         case("deadline", mode="slow", seconds=1, expected=124, calls=1, requests=1)
+        case("delayed-completion", mode="delayed-completion", seconds=25, expected=0, calls=1, requests=1)
     finally:
         fixture.shutdown()
         fixture.server_close()

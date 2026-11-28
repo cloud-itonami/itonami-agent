@@ -4,8 +4,9 @@
 using the native profile preflight. The package contains a fixed fictional
 request and a signed Kotoba guest built with KSL2. The native Amu broker
 admits one synchronous wire-11 generation for `inkling-2-mini-gyomu-qa`
-through `murakumo-qa-v1`. The deadline is 1–15 seconds, it reserves 96
-output tokens, and no tools are available. The guest requires a complete
+through `murakumo-qa-v1`. An independently signed deadline of 1–90 seconds
+applies only to this route. It reserves 96 output tokens and exposes zero
+tools. The guest requires a complete
 `stop` result with bounded UTF-8 text and observed usage. A finish reason of
 `length` or reported input usage above 512 tokens refuses the draft.
 
@@ -38,7 +39,9 @@ The gate's anonymous FD4 supplies a synthetic bearer to the native host.
 The listener is a local fixture that returns a known fictional draft. The
 gate verifies its UTF-8 bytes, finish reason and usage, then verifies refusal
 and counts HTTP requests for altered authority, budget, model and response
-cases. `completion/result/receipt.json` records the result as synthetic.
+cases. The fixture defaults to 12 seconds. It also checks a one-second
+timeout and a response delayed past 15 seconds under a signed 25-second
+grant. `completion/result/receipt.json` records the result as synthetic.
 See the [pinned Amu adapter and fixture contract](https://github.com/kotoba-lang/amu/blob/8429fd79ae71a3fe4a27487b87dfe0325f3a1035/docs/native-llm-wire-v1.md).
 
 ## Approved deployment and invocation
@@ -50,6 +53,9 @@ approved caller identity and expiry, and an independently signed run approval.
 Node Ops must provide the resident and model-weight SHA-256, exact loopback
 endpoint, observed direct-backend access denial, and the issuer's public
 verification key. Keep the resident and backend provenance with the QA run.
+Measure complete draft latency through the governed listener within the
+signed deadline during live QA. A first-token timing covers a different
+part of the turn.
 
 After approval, follow the pinned Amu registration boundary to set `mm-port`
 and `mm-credential` in a separate reviewed Amu checkout. Build the registered

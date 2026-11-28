@@ -125,7 +125,7 @@ prepare() {
       split("\n") as $g |
       $g[0:8] == ["KLG1", "artifact=" + $artifact, "wire=11", "schema=" + $schema,
         "profile=amu-program-llm-v1", "provider=murakumo-qa-v1", "endpoint=" + $endpoint, "model=" + $model]
-      and ($g[8] | test("^seconds=([1-9]|1[0-5])$")) and $g[9:] == ["tokens=96", ""]' \
+      and ($g[8] | test("^seconds=([1-9]|[1-8][0-9]|90)$")) and $g[9:] == ["tokens=96", ""]' \
     "$work/grant" >/dev/null 2>&1 || refuse 2 'KLG1 scope or budget refused'
 
   run=$(jq -r .run "$work/approval")
