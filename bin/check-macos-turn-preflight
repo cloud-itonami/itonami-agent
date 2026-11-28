@@ -27,11 +27,15 @@ run_case() {
   expected_stdout=$3
   expected_stderr=$4
   shift 4
+  : > "$out/expected-stdout"
+  : > "$out/expected-stderr"
+  [ -z "$expected_stdout" ] || printf '%s\n' "$expected_stdout" > "$out/expected-stdout"
+  [ -z "$expected_stderr" ] || printf '%s\n' "$expected_stderr" > "$out/expected-stderr"
   rc=0
   "$@" > "$out/stdout" 2> "$out/stderr" || rc=$?
   if [ "$rc" -ne "$expected_exit" ] ||
-     [ "$(cat "$out/stdout")" != "$expected_stdout" ] ||
-     [ "$(cat "$out/stderr")" != "$expected_stderr" ]; then
+     ! cmp -s "$out/expected-stdout" "$out/stdout" ||
+     ! cmp -s "$out/expected-stderr" "$out/stderr"; then
     printf '%s\n' "$name: FAIL (exit $rc, expected $expected_exit or output differed)" >&2
     exit 1
   fi
