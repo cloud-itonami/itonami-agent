@@ -1,0 +1,246 @@
+#!/bin/sh
+# Invoked by the installed Itonami launcher. The package is the trust root:
+# an operator installs the registration and issuer key, never a run caller.
+set -eu
+export PATH=/usr/bin:/bin LC_ALL=C
+umask 077
+
+here=${0%/*}
+. "$here/macos-hiring-qa-pins"
+pkg=$here/../hiring-qa
+amu=$pkg/amu/amu-cli.macho
+guest=$pkg/guest.macho
+key=$pkg/approval-key.pem
+profile=$1
+grant=$2
+approval=$3
+signature=$4
+output=$5
+root=${ITONAMI_DIR:-${HOME:-}/.itonami}
+
+refuse() {
+  printf 'Hiring QA: %s\n' "$2" >&2
+  exit "$1"
+}
+
+snapshot() {
+  [ -f "$1" ] && [ ! -L "$1" ] || return 1
+  dd if="$1" of="$2" bs="$(($3 + 1))" count=1 2>/dev/null || return 1
+  [ "$(wc -c < "$2")" -le "$3" ]
+}
+
+owner_protected() {
+  [ ! -L "$1" ] || return 1
+  owner=$(stat -f '%u' "$1") && perm=$(stat -f '%Lp' "$1") &&
+    [ "$owner" = 0 ] && [ "$((0$perm & 022))" -eq 0 ]
+}
+
+check_approved_package() {
+  for path in "$here" "$here/itonami-agent" "$here/turn-preflight" "$here/macos-hiring-qa-pins" "$0" \
+    "$pkg" "$pkg/amu" "$amu" "$pkg/amu/amu-full-root.macho" "$pkg/amu/kotoba-packager-root.macho" \
+    "$pkg/registration.json" "$key" "$guest" "$pkg/build.json" "$pkg/input.txt" "$pkg/input.kotoba" \
+    "$pkg/entry.kotoba" "$pkg/source.ksl"; do
+    owner_protected "$path" || return 1
+  done
+  dir=$(CDPATH= cd -- "$here/.." && pwd -P)
+  while [ "$dir" != / ]; do
+    owner_protected "$dir" || return 1
+    dir=${dir%/*}
+    dir=${dir:-/}
+  done
+}
+
+prepare() {
+  [ "$(uname -sm)" = 'Darwin arm64' ] || refuse 78 'macOS arm64 required'
+  [ "$profile" = "$hiring_profile" ] || refuse 2 'profile refused'
+  "$here/itonami-agent" turn preflight "$profile" > /dev/null || refuse 2 'profile preflight refused'
+  snapshot "$pkg/registration.json" "$work/registration" 2048 || refuse 78 'approved registration unavailable'
+  jq -e -s 'length == 1 and (.[0] |
+    def sha: type == "string" and test("\\A[a-f0-9]{64}\\z");
+    .schema == "itonami.hiring-qa-registration.v1" and
+    (.mode == "synthetic" or .mode == "approved") and
+    (.issuer | type == "string" and test("\\A[A-Za-z0-9._-]{1,64}\\z")) and
+    (.port | type == "number" and floor == . and . >= 1 and . <= 65535) and
+    (.launcherSha256 | sha) and (.keySha256 | sha) and
+    (if .mode == "approved" then
+       keys == ["issuer","keySha256","launcherSha256","mode","port","residentSha256","schema","weightsSha256"] and
+       (.residentSha256 | sha) and (.weightsSha256 | sha)
+     else keys == ["issuer","keySha256","launcherSha256","mode","port","schema"] end))' \
+    "$work/registration" >/dev/null 2>&1 || refuse 78 'registration invalid'
+  run_mode=$(jq -r .mode "$work/registration")
+  if [ "$run_mode" = approved ] && ! check_approved_package; then
+    refuse 78 'approved package must be protected by the host owner'
+  fi
+  launcher_pin=$(jq -r .launcherSha256 "$work/registration")
+  [ "$launcher_pin" != "$amu_cli_sha" ] && matches_pin "$amu" "$launcher_pin" &&
+    matches_pin "$pkg/amu/amu-full-root.macho" "$amu_compiler_sha" &&
+    matches_pin "$pkg/amu/kotoba-packager-root.macho" "$amu_packager_sha" &&
+    matches_pin "$key" "$(jq -r .keySha256 "$work/registration")" &&
+    /usr/bin/codesign --verify --strict "$amu" 2>/dev/null || refuse 78 'registered runtime pin mismatch'
+
+  snapshot "$pkg/build.json" "$work/build" 4096 || refuse 78 'build identity unavailable'
+  jq -e -s --arg amu "$amu_revision" --arg cli "$amu_cli_sha" --arg compiler "$amu_compiler_sha" \
+    --arg packager "$amu_packager_sha" --arg preflight "$preflight_sha" '
+    def sha: type == "string" and test("\\A[a-f0-9]{64}\\z");
+    length == 1 and (.[0] |
+      keys == ["agentRevision","amuRevision","artifacts","inputSha256","modules","sourceLockSha256"] and
+      (.agentRevision | test("\\A[a-f0-9]{40}\\z")) and .amuRevision == $amu and
+      (.inputSha256 | sha) and (.sourceLockSha256 | sha) and
+      (.modules | keys == ["entry","input"] and all(.[]; sha)) and
+      (.artifacts | keys == ["agentHost","agentLauncher","agentPins","amuCandidateLauncher","amuCompiler",
+        "amuPackager","guest","preflight"] and all(.[]; sha) and .amuCandidateLauncher == $cli and
+        .amuCompiler == $compiler and .amuPackager == $packager and .preflight == $preflight))' \
+    "$work/build" >/dev/null 2>&1 || refuse 78 'build identity mismatch'
+  matches_pin "$guest" "$(jq -er .artifacts.guest "$work/build")" &&
+    matches_pin "$here/itonami-agent" "$(jq -er .artifacts.agentLauncher "$work/build")" &&
+    matches_pin "$0" "$(jq -er .artifacts.agentHost "$work/build")" &&
+    matches_pin "$here/macos-hiring-qa-pins" "$(jq -er .artifacts.agentPins "$work/build")" &&
+    matches_pin "$pkg/input.txt" "$(jq -er .inputSha256 "$work/build")" &&
+    matches_pin "$pkg/source.ksl" "$(jq -er .sourceLockSha256 "$work/build")" &&
+    matches_pin "$pkg/entry.kotoba" "$(jq -er .modules.entry "$work/build")" &&
+    matches_pin "$pkg/input.kotoba" "$(jq -er .modules.input "$work/build")" &&
+    /usr/bin/codesign --verify --strict "$guest" 2>/dev/null || refuse 78 'build artifact pin mismatch'
+
+  snapshot "$grant" "$work/grant" 1024 && snapshot "$approval" "$work/approval" 2048 &&
+    snapshot "$signature" "$work/signature" 512 || refuse 2 'grant or approval unavailable'
+  /usr/bin/env -i /usr/bin/openssl dgst -sha256 -verify "$key" -signature "$work/signature" "$work/approval" \
+    >/dev/null 2>&1 || refuse 2 'approval signature refused'
+  policy_sha=$(sha256 "$work/registration")
+  grant_sha=$(sha256 "$work/grant")
+  now=$(date +%s)
+  jq -e -s --arg profile "$profile" --arg profile_sha "$profile_sha" --arg grant "$grant_sha" \
+    --arg build "$(sha256 "$work/build")" --arg policy "$policy_sha" --argjson now "$now" \
+    'length == 1 and (.[0] | .schema == "itonami.hiring-qa-approval.v1" and .decision == "approve" and
+    keys == ["buildSha256","decision","expiresAt","grantSha256","policySha256","profile","profileSha256","run","schema"] and
+    (.run | type == "string" and test("\\A[a-f0-9]{32}\\z")) and
+    .profile == $profile and .profileSha256 == $profile_sha and .buildSha256 == $build and
+    .policySha256 == $policy and .grantSha256 == $grant and
+    (.expiresAt | type == "number" and floor == . and . > $now and . <= ($now + 900)))' \
+    "$work/approval" >/dev/null 2>&1 || refuse 2 'approval scope or expiry refused'
+
+  port=$(jq -r .port "$work/registration")
+  endpoint=http://127.0.0.1:$port
+  jq -Rse --arg artifact "$(jq -r .artifacts.guest "$work/build")" --arg schema "$wire_schema" \
+    --arg endpoint "$endpoint" --arg model ":$hiring_model" '
+      split("\n") as $g |
+      $g[0:8] == ["KLG1", "artifact=" + $artifact, "wire=11", "schema=" + $schema,
+        "profile=amu-program-llm-v1", "provider=murakumo-qa-v1", "endpoint=" + $endpoint, "model=" + $model]
+      and ($g[8] | test("^seconds=([1-9]|1[0-5])$")) and $g[9:] == ["tokens=96", ""]' \
+    "$work/grant" >/dev/null 2>&1 || refuse 2 'KLG1 scope or budget refused'
+
+  run=$(jq -r .run "$work/approval")
+  seconds=$(sed -n 's/^seconds=//p' "$work/grant")
+  [ "$(($(date +%s) + seconds))" -le "$(jq -r .expiresAt "$work/approval")" ] ||
+    refuse 2 'approval expires before the granted deadline'
+  mkdir -p "$root/runs" && [ ! -L "$root/runs" ] && mkdir "$root/runs/hiring-qa-$run" 2>/dev/null ||
+    refuse 2 'approval already consumed or run store unavailable'
+  printf '%s\n' "$run_mode"
+}
+
+finish() {
+  classification=blocked
+  result=runtime-refused
+  retryable=null
+  finish_reason=''
+  input_tokens=null
+  output_tokens=null
+  draft_sha=''
+  draft_length=null
+  calls=$(sed -n 's/^amu: wire11 provider-calls=\([01]\)$/\1/p' "$work/stderr")
+  case "$calls" in 0|1) ;; *) calls=null ;; esac
+  case "$native_exit" in
+    124) result=deadline ;;
+    0)
+      classification=fail
+      result=invalid-native-frame
+      IFS= read -r frame_kind <&5 || frame_kind=''
+      case "$frame_kind" in
+        draft|rejected)
+          in='' out=''
+          IFS= read -r reason <&5 && IFS= read -r in <&5 && IFS= read -r out <&5 || reason=''
+          if printf '%s\n' "$reason $in $out" | grep -Eq '^(stop|length) (0|[1-9][0-9]{0,8}) (0|[1-9][0-9]{0,2})$'; then
+            finish_reason=$reason
+            input_tokens=$in
+            output_tokens=$out
+            result=completion-refused
+            if [ "$frame_kind" = draft ] && [ "$reason" = stop ] && [ "$calls" = 1 ] &&
+               [ "$in" -le 512 ] && [ "$out" -ge 1 ] && [ "$out" -le 96 ]; then
+              IFS= read -r length <&5 || length=''
+              if printf '%s\n' "$length" | grep -Eq '^[1-9][0-9]{0,3}$' && [ "$length" -le 8192 ]; then
+                header=$(printf 'draft\nstop\n%s\n%s\n%s\n' "$in" "$out" "$length" | wc -c)
+                if [ "$(wc -c < "$work/stdout")" -eq "$((header + length + 2))" ] &&
+                   tail -c 2 "$work/stdout" | cmp -s - "$work/success"; then
+                  dd if="$work/stdout" of="$work/draft" bs=1 skip="$header" count="$length" 2>/dev/null
+                  if jq -Rse 'test("[^[:space:]]") and (startswith("\ufeff") | not) and (test("\u0000") | not)' \
+                      "$work/draft" >/dev/null; then
+                    draft_sha=$(sha256 "$work/draft")
+                    draft_length=$length
+                    result=completion
+                    classification=pass
+                  fi
+                fi
+              fi
+            fi
+          fi
+          ;;
+        error)
+          retry=''
+          IFS= read -r code <&5 && IFS= read -r retry <&5 || code=''
+          case "$code:$retry" in
+            murakumo/http-error:true|murakumo/http-error:false|murakumo/invalid-response:false|murakumo/unavailable:true|provider-error:true|provider-error:false)
+              if printf 'error\n%s\n%s\n1\n' "$code" "$retry" | cmp -s - "$work/stdout"; then
+                result=$code
+                retryable=$retry
+              fi
+              ;;
+          esac
+          ;;
+      esac
+      ;;
+  esac
+
+  jq -n --slurpfile build "$work/build" --slurpfile reg "$work/registration" --slurpfile approval "$work/approval" \
+    --arg class "$classification" --arg result "$result" --arg finish "$finish_reason" \
+    --argjson retryable "$retryable" --argjson in "$input_tokens" --argjson out "$output_tokens" \
+    --arg draft "$draft_sha" --argjson length "$draft_length" --argjson calls "$calls" \
+    --argjson exit "$native_exit" --arg schema "$wire_schema" --arg model "$hiring_model" \
+    --arg approvalSha "$(sha256 "$work/approval")" --arg signatureSha "$(sha256 "$work/signature")" \
+    --argjson seconds "$(sed -n 's/^seconds=//p' "$work/grant")" '
+    $approval[0] as $a | $reg[0] as $r | $build[0] + {
+      schema:"itonami.hiring-qa-turn.v1", run:$a.run, profile:$a.profile, profileSha256:$a.profileSha256,
+      classification:$class, synthetic:($r.mode == "synthetic"), result:$result, nativeExit:$exit,
+      finishReason:($finish | select(length > 0) // null), retryable:$retryable,
+      usage:{inputTokens:$in, outputTokens:$out}, draft:(if $length == null then null else {sha256:$draft,bytes:$length} end),
+      approval:{decision:$a.decision, issuer:$r.issuer, keySha256:$r.keySha256, expiresAt:$a.expiresAt,
+        sha256:$approvalSha, signatureSha256:$signatureSha, buildSha256:$a.buildSha256},
+      grant:{format:"KLG1", wire:11, schemaSha256:$schema, sha256:$a.grantSha256, seconds:$seconds, outputTokens:96},
+      endpointPolicy:{sha256:$a.policySha256, origin:("http://127.0.0.1:" + ($r.port|tostring)),
+        path:"/v1/chat/completions", provider:"murakumo-qa-v1", model:$model, residentSha256:$r.residentSha256,
+        weightsSha256:$r.weightsSha256, tools:[], stream:false}, providerCalls:$calls,
+      artifacts:($build[0].artifacts + {amuRegisteredLauncher:$r.launcherSha256})}' > "$work/receipt"
+
+  if [ "$classification" = pass ]; then
+    run=$(jq -r .run "$work/approval")
+    printf '{:kind "awai.hiring-draft/1" :domain :hiring :request/id "%s" :sent? false\n :artifact {:type :job-announcement :body-sha256 "%s"}\n :checks [{:check :itonami/native-draft-integrity :result :pass}]\n :recruit {:status :unverified} :produced-by {:profile "awai-hiring-ops"}\n :open-points ["Recruit review and Hiring approval are pending."]}\n' \
+      "$run" "$draft_sha" > "$work/draft.edn"
+    mv "$work/draft" "$output/draft.txt"
+    mv "$work/draft.edn" "$output/draft.edn"
+  fi
+  mv "$work/receipt" "$output/receipt.json"
+  [ "$classification" = pass ] || refuse "${native_exit_nonzero:-1}" "$result"
+}
+
+case "$output" in /*) ;; *) refuse 2 'absolute new output directory required' ;; esac
+mkdir "$output" 4<&-
+work=$(mktemp -d "$output/.turn.XXXXXX" 4<&-)
+trap 'rm -rf "$work" 4<&-' EXIT
+mode=$(prepare 4<&-)
+native_exit=0
+if [ "$mode" = synthetic ]; then
+  "$amu" run-llm "$guest" --grant "$work/grant" > "$work/stdout" 2> "$work/stderr" || native_exit=$?
+else
+  "$amu" run-llm "$guest" --grant "$work/grant" 4<&- > "$work/stdout" 2> "$work/stderr" || native_exit=$?
+fi
+if [ "$native_exit" -ne 0 ]; then native_exit_nonzero=$native_exit; fi
+printf '0\n' > "$work/success"
+finish 4<&- 5< "$work/stdout"
