@@ -1,0 +1,1 @@
+Draft a short fictional announcement for a junior gardener at Example Orchard in Tokyo. Include duties and how to ask about the role. Use Japanese. Return plain text only.

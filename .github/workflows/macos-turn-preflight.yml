@@ -6,8 +6,14 @@ on:
       - "bin/itonami-agent"
       - "bin/build-macos-turn-preflight"
       - "bin/check-macos-turn-preflight"
+      - "bin/build-macos-hiring-qa"
+      - "bin/run-macos-hiring-qa"
+      - "bin/macos-hiring-qa-pins"
       - "itonami/profiles/awai-hiring-ops/itonami.edn"
       - "kotoba/agent_cli/turn_preflight.kotoba"
+      - "kotoba/agent_cli/hiring_qa.kotoba"
+      - "test/native/check_macos_hiring_qa.py"
+      - "test/native/hiring_qa_request.txt"
       - ".github/workflows/macos-turn-preflight.yml"
   workflow_dispatch:
 
@@ -39,3 +45,19 @@ jobs:
           git -C "$amu" checkout --detach FETCH_HEAD
       - name: Build and exercise the native profile preflight
         run: bin/check-macos-turn-preflight "$RUNNER_TEMP/amu" "$RUNNER_TEMP/itonami-turn-preflight"
+      - name: Stage the pinned Amu adapter fixture sources
+        run: |
+          set -eu
+          candidate="$RUNNER_TEMP/amu-adapter"
+          expected=8429fd79ae71a3fe4a27487b87dfe0325f3a1035
+          git init "$candidate"
+          git -C "$candidate" fetch --depth=1 https://github.com/kotoba-lang/amu.git "$expected"
+          test "$(git -C "$candidate" rev-parse FETCH_HEAD)" = "$expected"
+          git -C "$candidate" checkout --detach FETCH_HEAD
+          python3 -m venv "$RUNNER_TEMP/fixture-tools"
+          "$RUNNER_TEMP/fixture-tools/bin/pip" install --quiet basilisp==0.5.1
+          echo "$RUNNER_TEMP/fixture-tools/bin" >> "$GITHUB_PATH"
+      - name: Exercise native Hiring QA with an isolated synthetic listener
+        run: |
+          test/native/check_macos_hiring_qa.py "$RUNNER_TEMP/amu-adapter" \
+            "$RUNNER_TEMP/itonami-turn-preflight/first" "$RUNNER_TEMP/hiring-qa-gate"

@@ -10,13 +10,13 @@
 # ITONAMI_NOTEPAD_PAYLOAD. Other loader routes are migration inventory.
 
 set -e
-HERE=$(dirname "$0")
+case "$0" in */*) HERE=${0%/*} ;; *) HERE=. ;; esac
 LOADER=${KEXE_LOADER:-$HERE/kexe-loader}
 GUESTS=${KEXE_GUESTS:-$HERE/guests}
-ARCH=${ITONAMI_ARCH:-$(uname -m | sed 's/arm64/aarch64/;s/x86_64/x86_64/')}
 
 run_guest() {
   raw=$1; offset=$2; grants=$3; shift 3
+  ARCH=${ITONAMI_ARCH:-$(uname -m | sed 's/arm64/aarch64/;s/x86_64/x86_64/')}
   # KEXE_COMMAND: the guest return value is the process exit code and
   # the loader prints nothing extra (the CLI own stdout is the answer).
   KEXE_COMMAND=1 exec "$LOADER" "$GUESTS/$raw" "$offset" 0 "$ARCH" "$grants" -- "$@"
@@ -93,6 +93,7 @@ Selfhost routes:
   cron jobs status-global  (Linux x86_64; ITONAMI_DIR/paused)
   cron notepad <base> <verb> [key] [value]
   turn preflight awai-hiring-ops  (macOS arm64; validates ITONAMI_DIR profile pin)
+  turn hiring-qa awai-hiring-ops <grant> <approval.json> <approval.sig> <new-output-dir>
   kanban <base> <verb> [arguments]
   session-search <base> <query> [limit] [after] [before] [detail] [sort] [sid] [pbase]
   stt <file.wav>  (16 kHz mono 16-bit PCM WAV, 0.25 to 8 s; native Qwen3-ASR, minutes per file;
@@ -401,6 +402,15 @@ case "$1" in
         exit 2
       fi
       run_turn_preflight "$3"
+    fi
+    if [ "${2:-}" = hiring-qa ]; then
+      if [ "$#" -ne 7 ]; then
+        printf '%s\n' 'usage: itonami-agent turn hiring-qa awai-hiring-ops <grant> <approval.json> <approval.sig> <new-output-dir>' >&2
+        exit 2
+      fi
+      [ -x "$HERE/run-macos-hiring-qa" ] || blocked 'turn hiring-qa (native package missing)'
+      shift 2
+      exec "$HERE/run-macos-hiring-qa" "$@"
     fi
     blocked 'turn (native wire-11 provider unavailable)'
     ;;

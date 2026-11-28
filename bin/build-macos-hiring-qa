@@ -1,0 +1,72 @@
+#!/bin/sh
+set -eu
+export LC_ALL=C
+
+if [ "$#" -ne 3 ] || [ "$(uname -sm)" != 'Darwin arm64' ]; then
+  printf '%s\n' 'usage on Darwin arm64: build-macos-hiring-qa AMU_CHECKOUT PREFLIGHT_PACKAGE FRESH_ABSOLUTE_OUTPUT' >&2
+  exit 2
+fi
+repo=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
+. "$repo/bin/macos-hiring-qa-pins"
+amu=$(CDPATH= cd -- "$1" && pwd -P)
+preflight=$2/bin/turn-preflight
+out=$3
+case "$out" in /*) ;; *) exit 2 ;; esac
+if [ "$(git -C "$amu" rev-parse HEAD)" != "$amu_revision" ] || ! matches_pin "$preflight" "$preflight_sha"; then
+  printf '%s\n' 'Hiring QA build requires the pinned Amu candidate and preflight Mach-O' >&2
+  exit 2
+fi
+
+umask 077
+mkdir "$out"
+out=$(CDPATH= cd -- "$out" && pwd -P)
+pkg=$out/hiring-qa
+mkdir "$out/bin" "$pkg" "$pkg/amu"
+cp "$repo/bin/itonami-agent" "$repo/bin/macos-hiring-qa-pins" "$repo/bin/run-macos-hiring-qa" "$preflight" "$out/bin/"
+bootstrap=$amu/seed/bootstrap/aarch64-macos
+install_pin() {
+  cp "$bootstrap/$1" "$pkg/amu/$1"
+  if ! matches_pin "$pkg/amu/$1" "$2"; then
+    printf '%s\n' "Hiring QA build pin mismatch: $1" >&2
+    exit 2
+  fi
+  /usr/bin/codesign --verify --strict "$pkg/amu/$1"
+}
+install_pin amu-cli.macho "$amu_cli_sha"
+install_pin amu-full-root.macho "$amu_compiler_sha"
+install_pin kotoba-packager-root.macho "$amu_packager_sha"
+
+cp "$repo/kotoba/agent_cli/hiring_qa.kotoba" "$pkg/entry.kotoba"
+cp "$repo/test/native/hiring_qa_request.txt" "$pkg/input.txt"
+IFS= read -r input < "$pkg/input.txt"
+if [ "${#input}" -gt 512 ] || ! printf '%s\n' "$input" | grep -Eq '^[-A-Za-z0-9 ,.:()]+$' ||
+   ! printf '%s\n' "$input" | cmp -s - "$pkg/input.txt"; then
+  printf '%s\n' 'Hiring QA build requires a bounded, single-line fictional input' >&2
+  exit 2
+fi
+printf '%s\n' '(ns agent-cli.hiring-qa-input (:export [system prompt]))' \
+  '(defn system [] :string "Draft only. Use fictional data and no tools. Never publish or contact anyone.")' \
+  "(defn prompt [] :string \"$input\\n\")" > "$pkg/input.kotoba"
+
+entry_sha=$(sha256 "$pkg/entry.kotoba")
+module_sha=$(sha256 "$pkg/input.kotoba")
+printf 'KSL2\nentry %s/entry.kotoba\nmodule agent-cli.hiring-qa %s/entry.kotoba\nmodule agent-cli.hiring-qa-input %s/input.kotoba\nfile %s %s/entry.kotoba\nfile %s %s/input.kotoba\n' \
+  "$pkg" "$pkg" "$pkg" "$entry_sha" "$pkg" "$module_sha" "$pkg" > "$pkg/source.ksl"
+"$pkg/amu/amu-cli.macho" check "$pkg/entry.kotoba" --source-lock "$pkg/source.ksl" > /dev/null
+"$pkg/amu/amu-cli.macho" compile "$pkg/entry.kotoba" --source-lock "$pkg/source.ksl" \
+  --runtime-profile amu-program-llm-v1 -o "$pkg/guest.macho" > /dev/null
+/usr/bin/codesign --verify --strict "$pkg/guest.macho"
+
+/usr/bin/jq -n --arg agent "$(git -C "$repo" rev-parse HEAD)" --arg amu "$amu_revision" \
+  --arg input "$(sha256 "$pkg/input.txt")" --arg lock "$(sha256 "$pkg/source.ksl")" \
+  --arg entry "$entry_sha" --arg module "$module_sha" --arg guest "$(sha256 "$pkg/guest.macho")" \
+  --arg launcher "$(sha256 "$out/bin/itonami-agent")" --arg host "$(sha256 "$out/bin/run-macos-hiring-qa")" \
+  --arg pins "$(sha256 "$out/bin/macos-hiring-qa-pins")" \
+  --arg cli "$amu_cli_sha" --arg compiler "$amu_compiler_sha" --arg packager "$amu_packager_sha" \
+  --arg preflight "$preflight_sha" \
+  '{agentRevision:$agent, amuRevision:$amu, inputSha256:$input, sourceLockSha256:$lock,
+    modules:{entry:$entry,input:$module}, artifacts:{guest:$guest, agentLauncher:$launcher,
+    agentHost:$host, agentPins:$pins, amuCandidateLauncher:$cli, amuCompiler:$compiler, amuPackager:$packager,
+    preflight:$preflight}}' \
+  > "$pkg/build.json"
+cat "$pkg/build.json"

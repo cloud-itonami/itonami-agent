@@ -1,0 +1,19 @@
+# Sourced by the package builder and installed launcher host.
+amu_revision=8429fd79ae71a3fe4a27487b87dfe0325f3a1035
+amu_cli_sha=cfe2492f503464cb4f7f77db7e47d508f0614b44aeb4c8a508cc9d7d9cf24ab9
+amu_compiler_sha=04b233354fdd012b26fd5ab2fdd3349f387c6dff5fedfc449b940e2ef59c7c96
+amu_packager_sha=a4f9a0d24d7d9d63f67de3adf8292c2cb60953395156c5509e30af283e26bccb
+preflight_sha=97e3443dbb15b5b631ca6984b77e5be78b01ac34c05ccae83462132dd9be0cf9
+profile_sha=fc067293035d312546395bf737e6ebf2fd527853d34b72fa00fa3bcc56c1dac5
+wire_schema=768859620bef185169b794b3ca1dbabb0de8e96186c61e698e61418afd27a034
+hiring_model=inkling-2-mini-gyomu-qa
+hiring_profile=awai-hiring-ops
+
+sha256() {
+  hash=$(/usr/bin/env -i /usr/bin/shasum -a 256 < "$1") || return 1
+  printf '%s\n' "${hash%% *}"
+}
+
+matches_pin() {
+  [ -f "$1" ] && [ ! -L "$1" ] && [ "$(sha256 "$1")" = "$2" ]
+}

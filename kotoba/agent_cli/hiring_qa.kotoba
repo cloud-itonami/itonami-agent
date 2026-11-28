@@ -1,0 +1,51 @@
+;; The pinned Amu namespace capability list predates wire 11. The named
+;; typed call and amu-program-llm-v1 enforce the granted wire at runtime.
+(ns agent-cli.hiring-qa
+  (:require [agent-cli.hiring-qa-input :as input])
+  (:export [main])
+  (:schemas
+   {:kotoba.llm/generate-request
+    [:record :kotoba.llm/generate-request
+     [[:model :keyword] [:system :string] [:prompt :string]
+      [:max-output-tokens :i64] [:temperature-milli :i64]]]
+    :kotoba.llm/result
+    [:variant :kotoba.llm/result
+     [[:ok [:record :kotoba.llm/completion
+             [[:text :string] [:finish-reason :keyword]
+              [:usage [:record :kotoba.llm/usage
+                       [[:input-tokens :i64] [:output-tokens :i64]]]]]]]
+      [:error [:record :kotoba.llm/error
+                [[:code :keyword] [:message :string] [:retryable :bool]]]]]]}))
+
+(defn- emit [text :string] :string
+  (typed-cap-call :io/write :string :string text))
+
+(defn- number-line [n :i64] :string
+  (string-concat (string-from-i64 n) "\n"))
+
+(defn main [] :i64
+  (let [request (record-new [:ref :kotoba.llm/generate-request]
+                  :inkling-2-mini-gyomu-qa (input/system) (input/prompt) 96 0)
+        result (typed-cap-call :llm/generate
+                 [:ref :kotoba.llm/generate-request] [:ref :kotoba.llm/result] request)]
+    (match-variant result [:ref :kotoba.llm/result]
+      (:ok value
+        (let [text (:text value) size (string-byte-length text)
+              usage (:usage value) in (:input-tokens usage) out (:output-tokens usage)
+              finish (keyword-name (:finish-reason value))]
+          (if (and (= (:finish-reason value) :stop) (> size 0) (<= size 8192)
+                   (>= in 0) (<= in 512) (> out 0) (<= out 96))
+            (let [_ (emit (string-concat "draft\nstop\n" (string-concat (number-line in)
+                          (string-concat (number-line out) (string-concat (number-line size) text)))))]
+              0)
+            (let [_ (emit (string-concat "rejected\n" (string-concat finish (string-concat "\n"
+                          (string-concat (number-line in) (number-line out))))))]
+              1))))
+      (:error failure
+        (let [code (:code failure)
+              kind (cond (= code :murakumo/http-error) "murakumo/http-error"
+                         (= code :murakumo/invalid-response) "murakumo/invalid-response"
+                         (= code :murakumo/unavailable) "murakumo/unavailable"
+                         :else "provider-error")
+              _ (emit (string-concat "error\n" (string-concat kind (if (:retryable failure) "\ntrue\n" "\nfalse\n"))))]
+          1)))))

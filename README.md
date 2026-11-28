@@ -8,8 +8,9 @@ runtime, build, CI gate or fallback. See [AWAI-60](https://linear.app/kotobalabs
 `bin/itonami-agent` runs qualified native routes and refuses unported
 turns. On Apple Silicon, `turn preflight awai-hiring-ops` verifies the reviewed
 profile snapshot from `ITONAMI_DIR` with a pinned Amu Mach-O. Live turns await
-native wire-11 support and the dedicated Murakumo QA listener. See the
-[macOS preflight build and QA handoff](docs/macos-turn-preflight.md).
+an approved Murakumo registration. The dedicated Hiring QA route has native
+wire-11 coverage against an isolated synthetic listener. See the
+[macOS Hiring QA build and handoff](docs/macos-hiring-qa.md).
 The compatibility descriptions below document the legacy surface and do not
 establish selfhost qualification.
 

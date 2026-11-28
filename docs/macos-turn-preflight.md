@@ -36,6 +36,9 @@ call. Preflight has zero model calls, zero tool calls, and no draft output.
 
 ## Native turn dependency
 
+The original preflight pin produced the observations below. A newer immutable
+Amu adapter candidate now covers [the dedicated Hiring QA route](macos-hiring-qa.md).
+
 At the pinned Amu revision, both upstream `seed/tests/llm-v1-checker.kotoba`
 and `seed/tests/llm-v1-ref-checker.kotoba` pass the native checker. Three
 incompatible type variants fail with `E2115`. Both accepted fixtures fail
