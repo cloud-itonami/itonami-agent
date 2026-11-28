@@ -104,6 +104,8 @@ def run(launcher, env, profile, grant, approval, signature, output, auth):
 
 
 def main(amu_source, preflight_package, output):
+    dirty = subprocess.check_output(["git", "-C", amu_source, "status", "--porcelain", "--", "seed", "scripts/seed"])
+    assert not dirty, "the Amu fixture source checkout must match the pin"
     output.mkdir(mode=0o700)
     package = output / "package"
     subprocess.run([ROOT / "bin/build-macos-hiring-qa", amu_source, preflight_package, package],
@@ -178,8 +180,8 @@ def main(amu_source, preflight_package, output):
         fixture.mode = mode
         count = len(fixture.observations)
         code, stdout, stderr, elapsed = run(launcher, env, profile, issued, approval, signature, dest, auth)
-        assert code == expected and not stdout and (reason is None or reason.encode() in stderr), (name, code, stderr)
         assert bearer.encode() not in stdout + stderr and not fallback.exists(), name
+        assert code == expected and not stdout and (reason is None or reason.encode() in stderr), (name, code, expected)
         observed = fixture.observations[count:]
         assert observed == [(authentic, True)] * requests, (name, observed)
         draft_file = dest / "draft.txt"
