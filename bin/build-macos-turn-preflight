@@ -1,0 +1,88 @@
+#!/bin/sh
+# Build the isolated Darwin preflight using only the pinned Amu native CLI.
+set -eu
+
+if [ "$#" -ne 2 ]; then
+  printf '%s\n' "usage: $0 <amu-checkout> <fresh-absolute-output-directory>" >&2
+  exit 2
+fi
+if [ "$(uname -sm)" != 'Darwin arm64' ]; then
+  printf '%s\n' 'turn preflight build requires macOS arm64' >&2
+  exit 2
+fi
+
+repo=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
+amu=$(CDPATH= cd -- "$1" && pwd -P)
+out=$2
+case "$out" in
+  /*) ;;
+  *) printf '%s\n' 'turn preflight build requires an absolute output directory' >&2; exit 2 ;;
+esac
+
+amu_revision=87ec570aff47a0a21b4876fcda4fa9d4e3b934fb
+if [ "$(git -C "$amu" rev-parse HEAD)" != "$amu_revision" ]; then
+  printf '%s\n' 'turn preflight build requires the pinned Amu revision' >&2
+  exit 2
+fi
+cli_sha=016aaefcac44eff3408fb30283aa5ab1125fb0ff0298d56ea23df621d67fc837
+compiler_sha=2cf49c2346437a9c3bd85f29cd72b7947d3280c98bed091ef99a552707d22370
+packager_sha=7bf2c0c078550ff7d0e58474022d11b427eac0a9dafe6bdb15b3ea9947e281df
+sha_source_pin=40be511b6879d1c4c6a4b443b796ec1ef5cbe561d5c69c6ae52b8e62a96393d1
+
+sha256() {
+  digest=$(/usr/bin/env -i /usr/bin/shasum -a 256 < "$1") || return 1
+  printf '%s\n' "${digest%% *}"
+}
+
+stage_input() {
+  cp "$1" "$2"
+  if [ "$(sha256 "$2")" != "$3" ]; then
+    printf '%s\n' "turn preflight build: ${2##*/} pin mismatch" >&2
+    exit 2
+  fi
+}
+
+umask 077
+mkdir "$out"
+out=$(CDPATH= cd -- "$out" && pwd -P)
+mkdir "$out/amu" "$out/bin"
+bootstrap="$amu/seed/bootstrap/aarch64-macos"
+stage_input "$bootstrap/amu-cli.macho" "$out/amu/amu-cli.macho" "$cli_sha"
+stage_input "$bootstrap/amu-full-root.macho" "$out/amu/amu-full-root.macho" "$compiler_sha"
+stage_input "$bootstrap/kotoba-packager-root.macho" "$out/amu/kotoba-packager-root.macho" "$packager_sha"
+stage_input "$amu/seed/03-source-sha256.kotoba" "$out/03-source-sha256.kotoba" "$sha_source_pin"
+for image in "$out/amu/"*.macho; do
+  chmod 700 "$image"
+  /usr/bin/codesign --verify --strict "$image"
+done
+
+source="$out/turn-preflight.kotoba"
+lock="$out/source.ksl"
+guest="$out/bin/turn-preflight"
+launcher="$out/bin/itonami-agent"
+entry="$repo/kotoba/agent_cli/turn_preflight.kotoba"
+cat "$entry" "$out/03-source-sha256.kotoba" > "$source"
+source_sha=$(sha256 "$source")
+printf 'KSL2\nentry %s\nmodule agent-cli.turn-preflight %s\nfile %s %s\n' \
+  "$source" "$source" "$source_sha" "$source" > "$lock"
+"$out/amu/amu-cli.macho" compile "$source" --source-lock "$lock" \
+  --runtime-profile amu-command-fs35 -o "$guest" > /dev/null
+/usr/bin/codesign --verify --strict "$guest"
+cp "$repo/bin/itonami-agent" "$launcher"
+chmod 700 "$launcher"
+
+{
+  printf 'format=itonami.macos-turn-preflight-build.v1\n'
+  printf 'source_revision=%s\n' "$(git -C "$repo" rev-parse HEAD)"
+  printf 'amu_revision=%s\n' "$amu_revision"
+  printf 'amu_cli_sha256=%s\n' "$cli_sha"
+  printf 'amu_compiler_sha256=%s\n' "$compiler_sha"
+  printf 'amu_packager_sha256=%s\n' "$packager_sha"
+  printf 'amu_sha_source_sha256=%s\n' "$sha_source_pin"
+  printf 'guest_source_sha256=%s\n' "$(sha256 "$entry")"
+  printf 'locked_source_sha256=%s\n' "$source_sha"
+  printf 'guest_sha256=%s\n' "$(sha256 "$guest")"
+  printf 'launcher_sha256=%s\n' "$(sha256 "$launcher")"
+  printf 'runtime_profile=amu-command-fs35\n'
+} > "$out/build-receipt.txt"
+cat "$out/build-receipt.txt"
