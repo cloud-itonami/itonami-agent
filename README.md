@@ -5,11 +5,11 @@ The required runtime is selfhost only. The legacy `.cljk`/kbb implementation
 remains in the repository as migration inventory; it is not an approved
 runtime, build, CI gate or fallback. See [AWAI-60](https://linear.app/kotobalabs/issue/AWAI-60).
 
-The current `bin/itonami-agent` runs a few routes as native guests but sends
-unported routes to `bin/itonami-agent-kbb`. Those routes are not yet qualified
-for the required runtime. In particular, the native `turn` guest does not
-load and enforce an Itonami profile by itself; the profile-aware host and
-first live turns are tracked in [AWAI-131](https://linear.app/kotobalabs/issue/AWAI-131).
+`bin/itonami-agent` runs qualified native routes and refuses unported
+turns. On Apple Silicon, `turn preflight awai-hiring-ops` verifies the reviewed
+profile snapshot from `ITONAMI_DIR` with a pinned Amu Mach-O. Live turns await
+native wire-11 support and the dedicated Murakumo QA listener. See the
+[macOS preflight build and QA handoff](docs/macos-turn-preflight.md).
 The compatibility descriptions below document the legacy surface and do not
 establish selfhost qualification.
 

@@ -1,0 +1,41 @@
+name: itonami turn preflight macOS native
+
+on:
+  pull_request:
+    paths:
+      - "bin/itonami-agent"
+      - "bin/build-macos-turn-preflight"
+      - "bin/check-macos-turn-preflight"
+      - "itonami/profiles/awai-hiring-ops/itonami.edn"
+      - "kotoba/agent_cli/turn_preflight.kotoba"
+      - ".github/workflows/macos-turn-preflight.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64-turn-preflight:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - name: Fetch exact Itonami and Amu sources
+        env:
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -eu
+          git init "$GITHUB_WORKSPACE"
+          if [ -n "$PR_NUMBER" ]; then
+            SOURCE_REF="refs/pull/$PR_NUMBER/head"
+          else
+            SOURCE_REF="$GITHUB_SHA"
+          fi
+          git fetch --depth=1 "https://github.com/$REPOSITORY.git" "$SOURCE_REF"
+          git checkout --detach FETCH_HEAD
+          amu="$RUNNER_TEMP/amu"
+          git init "$amu"
+          git -C "$amu" fetch --depth=1 https://github.com/kotoba-lang/amu.git 87ec570aff47a0a21b4876fcda4fa9d4e3b934fb
+          git -C "$amu" checkout --detach FETCH_HEAD
+      - name: Build and exercise the native profile preflight
+        run: bin/check-macos-turn-preflight "$RUNNER_TEMP/amu" "$RUNNER_TEMP/itonami-turn-preflight"

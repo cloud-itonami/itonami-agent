@@ -1,0 +1,96 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 2 ]; then
+  printf '%s\n' "usage: $0 <amu-checkout> <fresh-absolute-output-directory>" >&2
+  exit 2
+fi
+
+repo=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
+amu=$(CDPATH= cd -- "$1" && pwd -P)
+out=$2
+case "$out" in
+  /*) ;;
+  *) printf '%s\n' 'turn preflight gate requires an absolute output directory' >&2; exit 2 ;;
+esac
+umask 077
+mkdir "$out"
+"$repo/bin/build-macos-turn-preflight" "$amu" "$out/first"
+"$repo/bin/build-macos-turn-preflight" "$amu" "$out/rebuild" > /dev/null
+cmp "$out/first/bin/turn-preflight" "$out/rebuild/bin/turn-preflight"
+cmp "$out/first/build-receipt.txt" "$out/rebuild/build-receipt.txt"
+printf '%s\n' 'reproducible-build: PASS'
+
+run_case() {
+  name=$1
+  expected_exit=$2
+  expected_stdout=$3
+  expected_stderr=$4
+  shift 4
+  : > "$out/expected-stdout"
+  : > "$out/expected-stderr"
+  [ -z "$expected_stdout" ] || printf '%s\n' "$expected_stdout" > "$out/expected-stdout"
+  [ -z "$expected_stderr" ] || printf '%s\n' "$expected_stderr" > "$out/expected-stderr"
+  rc=0
+  "$@" > "$out/stdout" 2> "$out/stderr" || rc=$?
+  if [ "$rc" -ne "$expected_exit" ] ||
+     ! cmp -s "$out/expected-stdout" "$out/stdout" ||
+     ! cmp -s "$out/expected-stderr" "$out/stderr"; then
+    printf '%s\n' "$name: FAIL (exit $rc, expected $expected_exit or output differed)" >&2
+    exit 1
+  fi
+  printf '%s\n' "$name: PASS (exit $rc)"
+}
+
+launcher="$out/first/bin/itonami-agent"
+profile=awai-hiring-ops
+profile_dir="profiles/$profile"
+original="$repo/itonami/$profile_dir/itonami.edn"
+scope="$out/fixture"
+mkdir -p "$scope/$profile_dir"
+fixture="$scope/$profile_dir/itonami.edn"
+export ITONAMI_DIR="$scope"
+
+# Leave an unmistakable diagnostic if a legacy loader ever runs.
+printf '%s\n' '#!/bin/sh' 'printf "unexpected legacy loader\n" >&2' 'exit 99' > "$out/loader"
+chmod 700 "$out/loader"
+export KEXE_LOADER="$out/loader"
+
+success='turn preflight: awai-hiring-ops profile pin verified; inference blocked'
+profile_refused='turn preflight: profile missing or pin mismatch'
+cp "$original" "$fixture"
+run_case approved-profile 0 "$success" '' "$launcher" turn preflight "$profile"
+run_case unauthorized-profile 2 '' 'turn preflight: unsupported profile' "$launcher" turn preflight '../awai-hiring-ops'
+sed 's/profile\.v2/profile.v3/' "$original" > "$fixture"
+run_case changed-profile 2 '' "$profile_refused" "$launcher" turn preflight "$profile"
+cp "$original" "$fixture"
+printf '%s\n' '{}' >> "$fixture"
+run_case trailing-data 2 '' "$profile_refused" "$launcher" turn preflight "$profile"
+rm "$fixture"
+run_case missing-profile 2 '' "$profile_refused" "$launcher" turn preflight "$profile"
+ln -s "$original" "$fixture"
+run_case symlink-profile 2 '' "$profile_refused" "$launcher" turn preflight "$profile"
+rm "$fixture"
+mkdir "$fixture"
+run_case directory-profile 2 '' "$profile_refused" "$launcher" turn preflight "$profile"
+rmdir "$fixture"
+mkfifo "$fixture"
+run_case fifo-profile 2 '' "$profile_refused" "$launcher" turn preflight "$profile"
+rm "$fixture"
+dd if=/dev/zero of="$fixture" bs=1048576 count=2 2> /dev/null
+run_case oversized-profile 2 '' "$profile_refused" "$launcher" turn preflight "$profile"
+
+blocked_tail='is blocked pending Kotoba/Amu selfhost port'
+run_case blocked-turn 78 '' "itonami-agent: route 'turn (native wire-11 provider unavailable)' $blocked_tail" \
+  "$launcher" turn "$scope" qa-fixture 'Draft a fictional interview rubric'
+run_case blocked-turn-loop 78 '' "itonami-agent: route 'turn-loop (native wire-11 provider unavailable)' $blocked_tail" \
+  "$launcher" turn-loop "$scope" qa-fixture 'Draft a fictional interview rubric'
+
+guest="$out/first/bin/turn-preflight"
+mv "$guest" "$out/original-guest"
+run_case missing-artifact 78 '' "itonami-agent: route 'turn preflight (native artifact missing)' $blocked_tail" \
+  "$launcher" turn preflight "$profile"
+cp "$out/loader" "$guest"
+run_case changed-artifact 78 '' "itonami-agent: route 'turn preflight (native artifact pin mismatch)' $blocked_tail" \
+  "$launcher" turn preflight "$profile"
+mv "$out/original-guest" "$guest"

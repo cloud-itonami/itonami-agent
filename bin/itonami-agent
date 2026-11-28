@@ -5,8 +5,6 @@
 # Legacy loader guest manifest (unqualified migration inventory):
 #   kanban-cli         67512 0 3,7,34,35,37,38   (7 = clock for heartbeat)
 #   session-search-cli 62564 0 3,34,35,37,38
-#   turn-cli            18544 0 3,34,35,37,38,11
-#   turn-loop-cli       61004 0 3,34,35,37,38,11
 #
 # Native notepad artifacts: ITONAMI_NOTEPAD_RUNNER and
 # ITONAMI_NOTEPAD_PAYLOAD. Other loader routes are migration inventory.
@@ -94,15 +92,39 @@ Selfhost routes:
   cron jobs resume-global  (Linux x86_64; ITONAMI_DIR/paused)
   cron jobs status-global  (Linux x86_64; ITONAMI_DIR/paused)
   cron notepad <base> <verb> [key] [value]
+  turn preflight awai-hiring-ops  (macOS arm64; validates ITONAMI_DIR profile pin)
   kanban <base> <verb> [arguments]
   session-search <base> <query> [limit] [after] [before] [detail] [sort] [sid] [pbase]
-  turn <base> <job-id> <task>
-  turn-loop <base> <job-id> <task>
   stt <file.wav>  (16 kHz mono 16-bit PCM WAV, 0.25 to 8 s; native Qwen3-ASR, minutes per file;
                    needs ITONAMI_STT_GUESTS and ITONAMI_STT_MODEL, see bin/itonami-transcribe)
 
 Other routes are blocked until their Kotoba/Amu selfhost port is qualified.
 EOF
+}
+
+run_turn_preflight() {
+  if [ "$(/usr/bin/uname -s)" != Darwin ] || [ "$(/usr/bin/uname -m)" != arm64 ]; then
+    blocked 'turn preflight (native artifact is macOS arm64 only)'
+  fi
+  turn_program="$HERE/turn-preflight"
+  if [ ! -f "$turn_program" ] || [ ! -x "$turn_program" ] || [ -L "$turn_program" ]; then
+    blocked 'turn preflight (native artifact missing)'
+  fi
+  turn_digest=$(/usr/bin/env -i /usr/bin/shasum -a 256 < "$turn_program") || blocked 'turn preflight (native artifact unreadable)'
+  if [ "${turn_digest%% *}" != 97e3443dbb15b5b631ca6984b77e5be78b01ac34c05ccae83462132dd9be0cf9 ]; then
+    blocked 'turn preflight (native artifact pin mismatch)'
+  fi
+  turn_root=${ITONAMI_DIR:-${HOME:-}/.itonami}
+  case "$turn_root" in
+    /*) ;;
+    *) printf '%s\n' 'turn preflight: ITONAMI_DIR must be absolute' >&2; exit 2 ;;
+  esac
+  if [ ! -d "$turn_root" ]; then
+    printf '%s\n' 'turn preflight: ITONAMI_DIR is unavailable' >&2
+    exit 2
+  fi
+  # Wire 35 can read only beneath this FD. The guest supplies the fixed path.
+  exec "$turn_program" "$1" 3< "$turn_root"
 }
 
 run_cron_jobs_linux() {
@@ -373,14 +395,17 @@ case "$1" in
     run_guest session-search-cli.raw 62564 3,34,35,37,38 "$base" "$query" "$limit" "$after" "$before" "$detail" "$sort" "$sid" "$pbase"
     ;;
   turn)
-    shift
-    # argv: <base> <job-id> <task>  (guest order matches)
-    run_guest turn-cli.raw 18544 3,34,35,37,38,11 "$@"
+    if [ "${2:-}" = preflight ]; then
+      if [ "$#" -ne 3 ]; then
+        printf '%s\n' 'usage: itonami-agent turn preflight awai-hiring-ops' >&2
+        exit 2
+      fi
+      run_turn_preflight "$3"
+    fi
+    blocked 'turn (native wire-11 provider unavailable)'
     ;;
   turn-loop)
-    shift
-    # argv: <base> <job-id> <task>
-    run_guest turn-loop.raw 61004 3,34,35,37,38,11 "$@"
+    blocked 'turn-loop (native wire-11 provider unavailable)'
     ;;
   stt)
     shift
